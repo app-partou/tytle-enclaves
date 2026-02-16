@@ -1,0 +1,23 @@
+{
+  "name": "@tytle-enclaves/parent",
+  "version": "0.1.0",
+  "description": "Parent server — routes requests from Fargate to Nitro Enclaves via vsock",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  },
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=20"
+  }
+}
