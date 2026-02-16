@@ -2,6 +2,8 @@
 export interface AllowedHost {
   hostname: string;
   vsockProxyPort: number;
+  /** Whether to use TLS (default: true). Set to false for HTTP-only hosts. */
+  tls?: boolean;
 }
 
 /** Configuration for a specific enclave service. */

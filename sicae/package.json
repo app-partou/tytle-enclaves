@@ -1,0 +1,24 @@
+{
+  "name": "@tytle-enclaves/sicae",
+  "version": "0.1.0",
+  "description": "SICAE Portuguese business CAE code lookup enclave — runs inside AWS Nitro Enclave",
+  "type": "module",
+  "main": "dist/enclave.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/enclave.js"
+  },
+  "dependencies": {
+    "@tytle-enclaves/shared": "file:../shared",
+    "@tytle-enclaves/native": "file:../native",
+    "cbor": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  },
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

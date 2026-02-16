@@ -118,6 +118,85 @@ export async function proxyFetch(
 }
 
 /**
+ * Make a plain HTTP request through a vsock-proxy tunnel (no TLS).
+ *
+ * Same as proxyFetch but skips the TLS handshake — writes raw HTTP directly
+ * to the VsockDuplex stream. Use for HTTP-only hosts (e.g., www.sicae.pt).
+ *
+ * WARNING: Without TLS the host can read and modify traffic in transit.
+ * Only appropriate for public, non-sensitive data.
+ */
+export async function proxyFetchPlain(
+  vsockPort: number,
+  hostname: string,
+  method: string,
+  path: string,
+  headers: Record<string, string>,
+  body?: string,
+  timeoutMs: number = 25_000,
+): Promise<HttpResponse> {
+  return new Promise<HttpResponse>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`proxyFetchPlain timeout after ${timeoutMs}ms to ${hostname}${path}`));
+    }, timeoutMs);
+
+    try {
+      // Connect to host's vsock-proxy (no TLS — write raw HTTP)
+      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
+      const duplex = new VsockDuplex(vsockRaw);
+
+      // Build and send HTTP request directly over the vsock tunnel
+      const reqHeaders = {
+        ...headers,
+        Host: hostname,
+        Connection: 'close',
+      };
+
+      let httpReq = `${method} ${path} HTTP/1.1\r\n`;
+      for (const [key, value] of Object.entries(reqHeaders)) {
+        httpReq += `${key}: ${value}\r\n`;
+      }
+
+      if (body) {
+        httpReq += `Content-Length: ${Buffer.byteLength(body, 'utf-8')}\r\n`;
+      }
+      httpReq += '\r\n';
+
+      if (body) {
+        httpReq += body;
+      }
+
+      duplex.write(httpReq);
+
+      // Collect response
+      const chunks: Buffer[] = [];
+      duplex.on('data', (chunk: Buffer) => {
+        chunks.push(chunk);
+      });
+
+      duplex.on('end', () => {
+        clearTimeout(timer);
+        try {
+          const raw = Buffer.concat(chunks);
+          const response = parseHttpResponse(raw);
+          resolve(response);
+        } catch (err) {
+          reject(err);
+        }
+      });
+
+      duplex.on('error', (err: Error) => {
+        clearTimeout(timer);
+        reject(new Error(`Plain HTTP error to ${hostname}: ${err.message}`));
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
+  });
+}
+
+/**
  * Parse raw HTTP/1.1 response into structured object.
  * Operates on Buffer to correctly handle chunked encoding with multi-byte characters.
  * Headers are ASCII, so safe to split as string. Body is decoded after de-chunking.

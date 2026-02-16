@@ -7,7 +7,7 @@
  * to call.
  */
 
-import { proxyFetch } from './httpProxy.js';
+import { proxyFetch, proxyFetchPlain } from './httpProxy.js';
 import { attest } from './attestor.js';
 import type { EnclaveConfig, EnclaveRequest, EnclaveResponse } from './types.js';
 
@@ -37,7 +37,8 @@ export function createRequestHandler(
       const path = parsedUrl.pathname + parsedUrl.search;
       const apiEndpoint = `${hostname}${parsedUrl.pathname}`;
 
-      const response = await proxyFetch(
+      const fetch = allowed.tls !== false ? proxyFetch : proxyFetchPlain;
+      const response = await fetch(
         allowed.vsockProxyPort,
         hostname,
         request.method,
