@@ -2,7 +2,7 @@
 
 Public, auditable source code for Tytle's AWS Nitro Enclave applications.
 
-Each subdirectory contains the source for one enclave service. Each service has its own Dockerfile, builds to its own EIF (Enclave Image Format), and produces its own PCR0 — the cryptographic hash that proves exactly which code is running inside the hardware-isolated enclave.
+Each service directory contains a thin config that defines which API hosts the enclave is allowed to call. The generic enclave infrastructure lives in `shared/`. Each service builds to its own EIF (Enclave Image Format) with its own PCR0 — the cryptographic hash that proves exactly which code (including the allowlist) is running inside the hardware-isolated enclave.
 
 ## Architecture
 
@@ -13,12 +13,13 @@ Fargate (ai-agent-server)
 Parent Server (EC2 host, port 5001)     <- generic router
     |  vsock (CID 16, port 5000)
     v
-VIES Nitro Enclave                       <- this repo
-    |  1. vsock to CID 3:8443 -> vsock-proxy -> ec.europa.eu:443
-    |  2. TLS handshake inside enclave (host can't MITM)
-    |  3. SOAP POST / REST GET
-    |  4. SHA-256 hash response
-    |  5. NSM attestation via /dev/nsm ioctl
+Nitro Enclave                            <- this repo
+    |  1. Validate URL against allowlist
+    |  2. vsock to CID 3:port -> vsock-proxy -> remote:443
+    |  3. TLS handshake inside enclave (host can't MITM)
+    |  4. HTTP request/response
+    |  5. SHA-256 hash response
+    |  6. NSM attestation via /dev/nsm ioctl
     v
 Response + {nsmDocument, pcrs, nonce, ...}
 ```
@@ -26,10 +27,29 @@ Response + {nsmDocument, pcrs, nonce, ...}
 ## Directory Structure
 
 ```
+shared/          Generic attested HTTPS fetch (enclave core)
 native/          Shared Rust napi-rs addon (vsock + NSM ioctl)
-vies/            VIES/HMRC VAT validation enclave
 parent/          Generic parent server (routes requests to enclaves)
+vies/            VIES/HMRC VAT validation enclave (config only)
 ```
+
+### Adding a New Enclave Service
+
+Each service is just a config file + Dockerfile. Example for SICAE:
+
+```typescript
+// sicae/src/enclave.ts
+import { startEnclave } from '@tytle-enclaves/shared';
+
+startEnclave({
+  name: 'sicae',
+  hosts: [
+    { hostname: 'www.sicae.pt', vsockProxyPort: 8445 },
+  ],
+});
+```
+
+Copy `vies/Dockerfile` as a starting point, update paths from `vies/` to `sicae/`.
 
 ## Per-Service Isolation
 
@@ -41,7 +61,7 @@ parent/          Generic parent server (routes requests to enclaves)
 | URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `api.stripe.com` |
 | vsock-proxy ports | 8443, 8444 | 8445 |
 
-Each enclave image contains ONLY its service's code. PCR0 proves exactly which code ran. A VIES attestation's PCR0 can only match the VIES enclave image.
+Each enclave image contains ONLY shared core + its service config. PCR0 proves exactly which code ran. A VIES attestation's PCR0 can only match the VIES enclave image.
 
 ## Building
 

@@ -1,3 +1,17 @@
+/** Allowlisted host entry with its vsock-proxy port. */
+export interface AllowedHost {
+  hostname: string;
+  vsockProxyPort: number;
+}
+
+/** Configuration for a specific enclave service. */
+export interface EnclaveConfig {
+  /** Short name for logging (e.g., 'vies', 'sicae', 'stripe') */
+  name: string;
+  /** Hosts this enclave is allowed to call. Baked into the image → reflected in PCR0. */
+  hosts: AllowedHost[];
+}
+
 /** Request from parent server to enclave via vsock. */
 export interface EnclaveRequest {
   id: string;
@@ -29,10 +43,4 @@ export interface EnclaveResponse {
     };
     nonce: string;
   };
-}
-
-/** Allowlisted host entry with its vsock-proxy port. */
-export interface AllowedHost {
-  hostname: string;
-  vsockProxyPort: number;
 }

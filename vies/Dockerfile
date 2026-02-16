@@ -26,7 +26,31 @@ COPY native/Cargo.toml native/build.rs ./
 COPY native/src/ ./src/
 RUN npm run build
 
-# Stage 2: Node.js builder
+# Stage 2: Build shared library
+FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab AS shared-builder
+
+WORKDIR /shared
+
+# Install shared deps (strip native file: dep — installed manually)
+COPY shared/package.json ./package.json.orig
+COPY shared/package-lock.json* ./
+RUN node -e " \
+  const pkg = JSON.parse(require('fs').readFileSync('package.json.orig','utf8')); \
+  delete pkg.dependencies?.['@tytle-enclaves/native']; \
+  require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
+RUN npm install
+
+# Copy native addon into shared's node_modules
+COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
+COPY --from=rust-builder /build/native/*.node ./node_modules/@tytle-enclaves/native/
+
+# Restore original package.json and build
+RUN cp package.json.orig package.json && rm package.json.orig
+COPY shared/tsconfig.json ./
+COPY shared/src/ ./src/
+RUN npx tsc
+
+# Stage 3: Build vies enclave
 FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab AS node-builder
 
 RUN apk add --no-cache \
@@ -35,39 +59,41 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Install ALL dependencies (including devDeps for TypeScript compilation)
-# Strip the file: native dep (installed manually below)
+# Install vies deps (strip native + shared file: deps — installed manually)
 COPY vies/package.json ./package.json.orig
 COPY vies/package-lock.json* ./
 RUN node -e " \
   const pkg = JSON.parse(require('fs').readFileSync('package.json.orig','utf8')); \
   delete pkg.dependencies?.['@tytle-enclaves/native']; \
+  delete pkg.dependencies?.['@tytle-enclaves/shared']; \
   require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
 RUN npm install
 
-# Copy native addon AFTER npm install — only the runtime files napi-rs generates
-# (index.js, index.d.ts, *.node) plus package.json. Excludes Rust source/build artifacts.
+# Copy native addon
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
 COPY --from=rust-builder /build/native/*.node ./node_modules/@tytle-enclaves/native/
-# Restore original package.json (needed for TypeScript to resolve the import)
+
+# Copy pre-built shared library (dist + package.json for module resolution)
+COPY --from=shared-builder /shared/dist ./node_modules/@tytle-enclaves/shared/dist/
+COPY --from=shared-builder /shared/package.json ./node_modules/@tytle-enclaves/shared/
+
+# Restore original package.json
 RUN cp package.json.orig package.json && rm package.json.orig
 
-# Build TypeScript (typescript is now available via devDependencies)
+# Build vies TypeScript
 COPY vies/tsconfig.json ./
 COPY vies/src/ ./src/
 RUN npx tsc
 
 # Prune devDependencies for minimal runtime image.
-# IMPORTANT: Rewrite the file:../native dep to '*' before pruning —
-# ../native doesn't exist in this Docker stage, and npm prune would
-# error or remove the addon when it can't resolve the file: path.
 RUN node -e " \
   const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8')); \
   if (pkg.dependencies?.['@tytle-enclaves/native']) pkg.dependencies['@tytle-enclaves/native'] = '*'; \
+  if (pkg.dependencies?.['@tytle-enclaves/shared']) pkg.dependencies['@tytle-enclaves/shared'] = '*'; \
   require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
 RUN npm prune --production
 
-# Stage 3: Minimal runtime
+# Stage 4: Minimal runtime
 FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab
 
 RUN apk add --no-cache ca-certificates=20241010-r0
@@ -75,7 +101,6 @@ RUN apk add --no-cache ca-certificates=20241010-r0
 WORKDIR /app
 COPY --from=node-builder /app/dist ./dist
 COPY --from=node-builder /app/node_modules ./node_modules
-# Copy original package.json from context (builder's copy was rewritten for npm prune)
 COPY vies/package.json ./
 
 # Fixed UID — avoids /etc/passwd differences across builds

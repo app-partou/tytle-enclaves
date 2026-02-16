@@ -1,15 +1,14 @@
 {
-  "name": "@tytle-enclaves/vies",
+  "name": "@tytle-enclaves/shared",
   "version": "0.1.0",
-  "description": "VIES/HMRC VAT validation enclave — runs inside AWS Nitro Enclave",
+  "description": "Generic attested HTTPS fetch — shared enclave core",
   "type": "module",
-  "main": "dist/enclave.js",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/enclave.js"
+    "build": "tsc"
   },
   "dependencies": {
-    "@tytle-enclaves/shared": "file:../shared",
     "@tytle-enclaves/native": "file:../native",
     "cbor": "^9.0.2"
   },
