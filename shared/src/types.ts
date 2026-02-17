@@ -2,6 +2,8 @@
 export interface AllowedHost {
   hostname: string;
   vsockProxyPort: number;
+  /** Whether to use TLS (default: true). Set to false for HTTP-only hosts. */
+  tls?: boolean;
 }
 
 /** Configuration for a specific enclave service. */
@@ -10,6 +12,8 @@ export interface EnclaveConfig {
   name: string;
   /** Hosts this enclave is allowed to call. Baked into the image → reflected in PCR0. */
   hosts: AllowedHost[];
+  /** Override the generic proxy handler with a custom request handler. */
+  customHandler?: (request: EnclaveRequest) => Promise<EnclaveResponse>;
 }
 
 /** Request from parent server to enclave via vsock. */

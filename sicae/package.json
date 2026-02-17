@@ -1,7 +1,7 @@
 {
-  "name": "@tytle-enclaves/vies",
+  "name": "@tytle-enclaves/sicae",
   "version": "0.1.0",
-  "description": "VIES/HMRC VAT validation enclave — runs inside AWS Nitro Enclave",
+  "description": "SICAE Portuguese business CAE code lookup enclave — runs inside AWS Nitro Enclave",
   "type": "module",
   "main": "dist/enclave.js",
   "scripts": {

@@ -13,6 +13,7 @@ import type { EnclaveRoute } from './types.js';
 
 /** Read CID from env, fall back to default. Set by CDK user data in production. */
 const VIES_CID = parseInt(process.env.VIES_CID || '16', 10);
+const SICAE_CID = parseInt(process.env.SICAE_CID || '17', 10);
 
 /** Routing table: hostname → enclave CID + port. */
 const ROUTES: EnclaveRoute[] = [
@@ -21,8 +22,13 @@ const ROUTES: EnclaveRoute[] = [
     port: 5000,
     hosts: ['ec.europa.eu', 'api.service.hmrc.gov.uk'],
   },
+  {
+    cid: SICAE_CID,
+    port: 5000,
+    hosts: ['www.sicae.pt'],
+  },
   // Future: Stripe enclave
-  // { cid: parseInt(process.env.STRIPE_CID || '17', 10), port: 5000, hosts: ['api.stripe.com'] },
+  // { cid: parseInt(process.env.STRIPE_CID || '18', 10), port: 5000, hosts: ['api.stripe.com'] },
 ];
 
 /**

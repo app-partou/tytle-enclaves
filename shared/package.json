@@ -6,15 +6,18 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc"
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
     "@tytle-enclaves/native": "file:../native",
-    "cbor": "^9.0.2"
+    "cbor": "9.0.2"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
-    "typescript": "^5.4.0"
+    "@types/node": "20.19.33",
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
   },
   "license": "AGPL-3.0",
   "engines": {

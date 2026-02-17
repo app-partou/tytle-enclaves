@@ -27,15 +27,16 @@ Response + {nsmDocument, pcrs, nonce, ...}
 ## Directory Structure
 
 ```
-shared/          Generic attested HTTPS fetch (enclave core)
+shared/          Generic attested HTTP/HTTPS fetch (enclave core)
 native/          Shared Rust napi-rs addon (vsock + NSM ioctl)
 parent/          Generic parent server (routes requests to enclaves)
 vies/            VIES/HMRC VAT validation enclave (config only)
+sicae/           SICAE Portuguese business CAE code lookup enclave (config only)
 ```
 
 ### Adding a New Enclave Service
 
-Each service is just a config file + Dockerfile. Example for SICAE:
+Each service is just a config file + Dockerfile. See `sicae/` for a complete example, including HTTP-only (no TLS) support via `tls: false`:
 
 ```typescript
 // sicae/src/enclave.ts
@@ -44,22 +45,27 @@ import { startEnclave } from '@tytle-enclaves/shared';
 startEnclave({
   name: 'sicae',
   hosts: [
-    { hostname: 'www.sicae.pt', vsockProxyPort: 8445 },
+    { hostname: 'www.sicae.pt', vsockProxyPort: 8445, tls: false },
   ],
 });
 ```
 
-Copy `vies/Dockerfile` as a starting point, update paths from `vies/` to `sicae/`.
+Copy `vies/Dockerfile` as a starting point, update paths from `vies/` to your service name.
+
+### HTTP-Only Hosts
+
+Set `tls: false` on an `AllowedHost` to skip TLS and send plain HTTP over the vsock tunnel. Without TLS, the EC2 host can read and modify traffic in transit. The NSM attestation still proves which code ran, but cannot guarantee response integrity. Only use for public, non-sensitive data (e.g., SICAE business CAE codes).
 
 ## Per-Service Isolation
 
-| Property | VIES Enclave | Future Stripe Enclave |
-|----------|-------------|----------------------|
-| CID | 16 | 17 |
-| ECR tag | `vies` | `stripe` |
-| PCR0 SSM | `/tytle/{env}/enclave/vies/pcr0` | `/tytle/{env}/enclave/stripe/pcr0` |
-| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `api.stripe.com` |
-| vsock-proxy ports | 8443, 8444 | 8445 |
+| Property | VIES Enclave | SICAE Enclave | Future Stripe Enclave |
+|----------|-------------|---------------|----------------------|
+| CID | 16 | 17 | 18 |
+| ECR tag | `vies` | `sicae` | `stripe` |
+| PCR0 SSM | `/tytle/{env}/enclave/vies/pcr0` | `/tytle/{env}/enclave/sicae/pcr0` | `/tytle/{env}/enclave/stripe/pcr0` |
+| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `www.sicae.pt` | `api.stripe.com` |
+| Transport | HTTPS (TLS) | HTTP (plain) | HTTPS (TLS) |
+| vsock-proxy ports | 8443, 8444 | 8445 | 8446 |
 
 Each enclave image contains ONLY shared core + its service config. PCR0 proves exactly which code ran. A VIES attestation's PCR0 can only match the VIES enclave image.
 
@@ -78,6 +84,13 @@ docker buildx build \
   --platform linux/amd64 \
   -t tytle-enclave-vies:latest \
   -f Dockerfile ..
+```
+
+### SICAE Enclave
+
+```bash
+cd sicae
+./build.sh [tag] [ecr-uri]
 ```
 
 ### Parent Server

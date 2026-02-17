@@ -9,12 +9,12 @@ license = "AGPL-3.0"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "2", features = ["full"] }
-napi-derive = "2"
-libc = "0.2"
+napi = { version = "=2.16.17", features = ["full"] }
+napi-derive = "=2.16.13"
+libc = "=0.2.182"
 
 [build-dependencies]
-napi-build = "2"
+napi-build = "=2.1.4"
 
 [profile.release]
 lto = true

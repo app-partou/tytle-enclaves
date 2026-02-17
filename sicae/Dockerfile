@@ -1,9 +1,12 @@
 # syntax=docker/dockerfile:1
 #
-# VIES/HMRC VAT Validation Enclave — Reproducible Build
+# SICAE Portuguese Business CAE Code Lookup Enclave — Reproducible Build
 #
 # This Dockerfile is public. PCR0 = hash of the resulting EIF.
 # Anyone can reproduce the build and verify PCR0 matches the NSM attestation.
+#
+# NOTE: SICAE uses plain HTTP (no TLS). The attestation proves code identity,
+# but the host can read/modify traffic. Acceptable for public CAE data.
 #
 # CRITICAL: All base images pinned by digest. All system packages pinned by version.
 # npm ci with lockfile. SOURCE_DATE_EPOCH + BuildKit rewrite-timestamp for determinism.
@@ -58,7 +61,7 @@ COPY shared/tsconfig.json ./
 COPY shared/src/ ./src/
 RUN npx tsc
 
-# Stage 3: Build vies enclave
+# Stage 3: Build sicae enclave
 FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab AS node-builder
 
 RUN apk add --no-cache \
@@ -67,10 +70,10 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Install vies deps (strip native + shared file: deps — installed manually)
+# Install sicae deps (strip native + shared file: deps — installed manually)
 # Strip file: deps from both package.json and lockfile so npm ci works.
-COPY vies/package.json ./package.json.orig
-COPY vies/package-lock.json ./package-lock.json.orig
+COPY sicae/package.json ./package.json.orig
+COPY sicae/package-lock.json ./package-lock.json.orig
 RUN node -e " \
   const fs = require('fs'); \
   const pkg = JSON.parse(fs.readFileSync('package.json.orig','utf8')); \
@@ -95,9 +98,9 @@ COPY --from=shared-builder /shared/package.json ./node_modules/@tytle-enclaves/s
 # Restore original package.json
 RUN cp package.json.orig package.json && rm package.json.orig
 
-# Build vies TypeScript
-COPY vies/tsconfig.json ./
-COPY vies/src/ ./src/
+# Build sicae TypeScript
+COPY sicae/tsconfig.json ./
+COPY sicae/src/ ./src/
 RUN npx tsc
 
 # Prune devDependencies for minimal runtime image.
@@ -116,7 +119,7 @@ RUN apk add --no-cache ca-certificates=20241010-r0
 WORKDIR /app
 COPY --from=node-builder /app/dist ./dist
 COPY --from=node-builder /app/node_modules ./node_modules
-COPY vies/package.json ./
+COPY sicae/package.json ./
 
 # Fixed UID — avoids /etc/passwd differences across builds
 USER 1000
