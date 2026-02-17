@@ -6,16 +6,19 @@
   "main": "dist/enclave.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/enclave.js"
+    "start": "node dist/enclave.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "dependencies": {
-    "@tytle-enclaves/shared": "file:../shared",
     "@tytle-enclaves/native": "file:../native",
+    "@tytle-enclaves/shared": "file:../shared",
     "cbor": "9.0.2"
   },
   "devDependencies": {
     "@types/node": "20.19.33",
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
   },
   "license": "AGPL-3.0",
   "engines": {
