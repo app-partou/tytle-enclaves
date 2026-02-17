@@ -72,8 +72,15 @@ function parseHmrcResponse(json: string, status: number): {
   name?: string;
   address?: string;
 } {
+  // 404 = VAT number not found (definitive invalid)
   if (status === 404) {
     return { valid: false };
+  }
+
+  // Non-200 statuses (500, 429, 503, etc.) are service errors — throw so the
+  // enclave returns a 502 instead of silently marking the VAT as invalid.
+  if (status !== 200) {
+    throw new Error(`HMRC returned unexpected status ${status}`);
   }
 
   try {
@@ -91,7 +98,7 @@ function parseHmrcResponse(json: string, status: number): {
       address,
     };
   } catch {
-    return { valid: false };
+    throw new Error('HMRC returned invalid JSON response');
   }
 }
 
