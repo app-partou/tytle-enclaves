@@ -11,11 +11,11 @@
   "dependencies": {
     "@tytle-enclaves/shared": "file:../shared",
     "@tytle-enclaves/native": "file:../native",
-    "cbor": "^9.0.2"
+    "cbor": "9.0.2"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
-    "typescript": "^5.4.0"
+    "@types/node": "20.19.33",
+    "typescript": "5.9.3"
   },
   "license": "AGPL-3.0",
   "engines": {

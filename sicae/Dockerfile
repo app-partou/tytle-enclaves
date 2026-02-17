@@ -25,7 +25,7 @@ WORKDIR /build/native
 COPY native/package.json native/package-lock.json* ./
 RUN npm ci
 
-COPY native/Cargo.toml native/build.rs ./
+COPY native/Cargo.toml native/Cargo.lock native/build.rs ./
 COPY native/src/ ./src/
 RUN npm run build
 
@@ -35,13 +35,21 @@ FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b065
 WORKDIR /shared
 
 # Install shared deps (strip native file: dep — installed manually)
+# Strip file: deps from both package.json and lockfile so npm ci works.
 COPY shared/package.json ./package.json.orig
-COPY shared/package-lock.json* ./
+COPY shared/package-lock.json ./package-lock.json.orig
 RUN node -e " \
-  const pkg = JSON.parse(require('fs').readFileSync('package.json.orig','utf8')); \
+  const fs = require('fs'); \
+  const pkg = JSON.parse(fs.readFileSync('package.json.orig','utf8')); \
   delete pkg.dependencies?.['@tytle-enclaves/native']; \
-  require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
-RUN npm install
+  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2)); \
+  const lock = JSON.parse(fs.readFileSync('package-lock.json.orig','utf8')); \
+  delete lock.packages?.['../native']; \
+  delete lock.packages?.['node_modules/@tytle-enclaves/native']; \
+  const root = lock.packages?.['']; \
+  if (root?.dependencies) delete root.dependencies['@tytle-enclaves/native']; \
+  fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2));"
+RUN npm ci
 
 # Copy native addon into shared's node_modules
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
@@ -63,14 +71,21 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 # Install sicae deps (strip native + shared file: deps — installed manually)
+# Strip file: deps from both package.json and lockfile so npm ci works.
 COPY sicae/package.json ./package.json.orig
-COPY sicae/package-lock.json* ./
+COPY sicae/package-lock.json ./package-lock.json.orig
 RUN node -e " \
-  const pkg = JSON.parse(require('fs').readFileSync('package.json.orig','utf8')); \
+  const fs = require('fs'); \
+  const pkg = JSON.parse(fs.readFileSync('package.json.orig','utf8')); \
   delete pkg.dependencies?.['@tytle-enclaves/native']; \
   delete pkg.dependencies?.['@tytle-enclaves/shared']; \
-  require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
-RUN npm install
+  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2)); \
+  const lock = JSON.parse(fs.readFileSync('package-lock.json.orig','utf8')); \
+  for (const k of ['../native','../shared','node_modules/@tytle-enclaves/native','node_modules/@tytle-enclaves/shared']) delete lock.packages?.[k]; \
+  const root = lock.packages?.['']; \
+  if (root?.dependencies) { delete root.dependencies['@tytle-enclaves/native']; delete root.dependencies['@tytle-enclaves/shared']; } \
+  fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2));"
+RUN npm ci
 
 # Copy native addon
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
