@@ -14,49 +14,8 @@
  * 7. Return response with attestation + human-readable headers
  */
 
-import crypto from 'node:crypto';
-import { proxyFetchPlain, attest } from '@tytle-enclaves/shared';
+import { proxyFetchPlain, attest, encodeFieldElements, SICAE_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
-
-// =============================================================================
-// BN254 Field Element Encoding
-// =============================================================================
-
-const BN254_MODULUS = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
-
-function bigintToBytes32(val: bigint): Buffer {
-  const hex = val.toString(16).padStart(64, '0');
-  return Buffer.from(hex, 'hex');
-}
-
-function shortStringToFe(s: string): Buffer {
-  const fe = BigInt('0x' + Buffer.from(s, 'utf8').toString('hex'));
-  return bigintToBytes32(fe);
-}
-
-function sha256ToFieldElement(s: string): Buffer {
-  const hash = crypto.createHash('sha256').update(s, 'utf8').digest('hex');
-  const fe = BigInt('0x' + hash) % BN254_MODULUS;
-  return bigintToBytes32(fe);
-}
-
-function encodeSicaeOutput(
-  nif: string,
-  name: string,
-  cae1Code: string,
-  cae1Desc: string,
-  cae2Code: string | null,
-  cae2Desc: string | null,
-): Buffer {
-  return Buffer.concat([
-    shortStringToFe(nif),                                    // [0..31]
-    sha256ToFieldElement(name),                              // [32..63]
-    shortStringToFe(cae1Code),                               // [64..95]
-    sha256ToFieldElement(cae1Desc),                          // [96..127]
-    cae2Code ? shortStringToFe(cae2Code) : Buffer.alloc(32), // [128..159]
-    cae2Desc ? sha256ToFieldElement(cae2Desc) : Buffer.alloc(32), // [160..191]
-  ]); // 192 bytes total
-}
 
 // =============================================================================
 // SICAE Lookup Types
@@ -334,14 +293,14 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       const cae2Code = sicaeResult.caeSecondary.length > 0 ? sicaeResult.caeSecondary[0].code : null;
       const cae2Desc = sicaeResult.caeSecondary.length > 0 ? sicaeResult.caeSecondary[0].description : null;
 
-      const encodedBytes = encodeSicaeOutput(
+      const encodedBytes = encodeFieldElements(SICAE_SCHEMA, {
         nif,
-        sicaeResult.officialName,
-        sicaeResult.caePrimary,
-        sicaeResult.caePrimaryDescription,
+        name: sicaeResult.officialName,
+        cae1Code: sicaeResult.caePrimary,
+        cae1Desc: sicaeResult.caePrimaryDescription,
         cae2Code,
         cae2Desc,
-      );
+      });
 
       const rawBody = encodedBytes.toString('base64');
 
