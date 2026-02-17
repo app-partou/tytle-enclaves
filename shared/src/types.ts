@@ -12,6 +12,8 @@ export interface EnclaveConfig {
   name: string;
   /** Hosts this enclave is allowed to call. Baked into the image → reflected in PCR0. */
   hosts: AllowedHost[];
+  /** Override the generic proxy handler with a custom request handler. */
+  customHandler?: (request: EnclaveRequest) => Promise<EnclaveResponse>;
 }
 
 /** Request from parent server to enclave via vsock. */

@@ -24,7 +24,7 @@ const VSOCK_PORT = 5000;
  * Never returns (runs until the enclave is terminated).
  */
 export function startEnclave(config: EnclaveConfig): void {
-  const handleRequest = createRequestHandler(config);
+  const handleRequest = config.customHandler || createRequestHandler(config);
 
   const main = async (): Promise<void> => {
     console.log(`[enclave:${config.name}] Starting on vsock port ${VSOCK_PORT}`);
