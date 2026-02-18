@@ -9,6 +9,7 @@ export {
   BN254_MODULUS,
   SICAE_SCHEMA,
   VIES_SCHEMA,
+  STRIPE_PAYMENT_SCHEMA,
 } from './bn254Codec.js';
 export type { EnclaveConfig, AllowedHost, EnclaveRequest, EnclaveResponse } from './types.js';
 export type { AttestationDocument } from './attestor.js';
