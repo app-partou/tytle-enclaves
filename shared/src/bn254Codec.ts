@@ -26,6 +26,8 @@ export type FieldEncoding = 'shortString' | 'sha256' | 'uint';
 export interface FieldDef {
   name: string;
   encoding: FieldEncoding;
+  /** JS type hint for typed decoding. Default: 'string' */
+  jsType?: 'string' | 'number' | 'boolean';
 }
 
 // =============================================================================
@@ -33,20 +35,29 @@ export interface FieldDef {
 // =============================================================================
 
 export const SICAE_SCHEMA: FieldDef[] = [
-  { name: 'nif',       encoding: 'shortString' },
-  { name: 'name',      encoding: 'sha256' },
-  { name: 'cae1Code',  encoding: 'shortString' },
-  { name: 'cae1Desc',  encoding: 'sha256' },
-  { name: 'cae2Code',  encoding: 'shortString' },
-  { name: 'cae2Desc',  encoding: 'sha256' },
+  { name: 'nif',       encoding: 'shortString', jsType: 'string' },
+  { name: 'name',      encoding: 'sha256',      jsType: 'string' },
+  { name: 'cae1Code',  encoding: 'shortString', jsType: 'string' },
+  { name: 'cae1Desc',  encoding: 'sha256',      jsType: 'string' },
+  { name: 'cae2Code',  encoding: 'shortString', jsType: 'string' },
+  { name: 'cae2Desc',  encoding: 'sha256',      jsType: 'string' },
 ];
 
 export const VIES_SCHEMA: FieldDef[] = [
-  { name: 'countryCode', encoding: 'shortString' },
-  { name: 'vatNumber',   encoding: 'shortString' },
-  { name: 'valid',       encoding: 'uint' },
-  { name: 'name',        encoding: 'sha256' },
-  { name: 'address',     encoding: 'sha256' },
+  { name: 'countryCode', encoding: 'shortString', jsType: 'string' },
+  { name: 'vatNumber',   encoding: 'shortString', jsType: 'string' },
+  { name: 'valid',       encoding: 'uint',        jsType: 'boolean' },
+  { name: 'name',        encoding: 'sha256',      jsType: 'string' },
+  { name: 'address',     encoding: 'sha256',      jsType: 'string' },
+];
+
+export const STRIPE_PAYMENT_SCHEMA: FieldDef[] = [
+  { name: 'operation',  encoding: 'shortString', jsType: 'string' },
+  { name: 'accountId',  encoding: 'shortString', jsType: 'string' },
+  { name: 'objectType', encoding: 'shortString', jsType: 'string' },
+  { name: 'dataHash',   encoding: 'sha256',      jsType: 'string' },
+  { name: 'totalCount', encoding: 'uint',        jsType: 'number' },
+  { name: 'hasMore',    encoding: 'uint',        jsType: 'boolean' },
 ];
 
 // =============================================================================
