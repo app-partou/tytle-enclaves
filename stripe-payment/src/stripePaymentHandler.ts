@@ -39,7 +39,8 @@ type StripeOperation =
   | 'list_customers'
   | 'list_invoices'
   | 'get_payment_intent'
-  | 'get_account';
+  | 'get_account'
+  | 'get_charge';
 
 const OPERATION_PATH_MAP: Record<StripeOperation, string> = {
   list_charges: '/v1/charges',
@@ -47,6 +48,7 @@ const OPERATION_PATH_MAP: Record<StripeOperation, string> = {
   list_invoices: '/v1/invoices',
   get_payment_intent: '/v1/payment_intents',
   get_account: '/v1/accounts',
+  get_charge: '/v1/charges',
 };
 
 /** Expected Stripe `object` field for response validation */
@@ -56,7 +58,11 @@ const OPERATION_OBJECT_TYPE: Record<StripeOperation, string> = {
   list_invoices: 'list',
   get_payment_intent: 'payment_intent',
   get_account: 'account',
+  get_charge: 'charge',
 };
+
+/** Operations that require a resourceId to fetch a single object */
+const SINGLE_RESOURCE_OPS = new Set<string>(['get_payment_intent', 'get_account', 'get_charge']);
 
 const VALID_OPERATIONS = new Set<string>(Object.keys(OPERATION_PATH_MAP));
 
@@ -118,11 +124,22 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         };
       }
 
+      // Validate single-resource operations require resourceId
+      if (SINGLE_RESOURCE_OPS.has(operation) && !resourceId) {
+        return {
+          success: false,
+          status: 400,
+          headers: {},
+          rawBody: '',
+          error: `${operation} requires resourceId`,
+        };
+      }
+
       // 2. Build Stripe REST path
       let path = OPERATION_PATH_MAP[operation];
 
       // For single-resource operations, append resourceId
-      if ((operation === 'get_payment_intent' || operation === 'get_account') && resourceId) {
+      if (SINGLE_RESOURCE_OPS.has(operation) && resourceId) {
         path = `${path}/${encodeURIComponent(resourceId)}`;
       }
 
@@ -153,8 +170,21 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         headers,
       );
 
-      if (response.status !== 200) {
-        throw new Error(`Stripe API returned status ${response.status}: ${response.body.substring(0, 500)}`);
+      // Skip attestation for transient error responses (rate limits, auth errors, server errors).
+      // BUT attest definitive responses like 404 (entity not found is a valid answer).
+      if (response.status >= 400 && response.status !== 404) {
+        console.warn(`[stripe-payment-handler] Stripe API returned ${response.status} for ${operation}`);
+        return {
+          success: true,
+          status: response.status,
+          headers: response.headers,
+          rawBody: response.body,
+          // No attestation — transient errors not worth attesting
+        };
+      }
+
+      if (response.status !== 200 && response.status !== 404) {
+        throw new Error(`Stripe API returned unexpected status ${response.status}`);
       }
 
       // 5. Parse and validate response
@@ -188,12 +218,16 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
       const rawBody = encodedBytes.toString('base64');
 
       // 7. Attest
+      // Strip Authorization header — the requestHash must be reproducible
+      // by external verifiers who don't have the API key.
+      const { Authorization: _stripped, ...attestHeaders } = headers;
+
       const attestation = await attest(
         apiEndpoint,
         'GET',
         rawBody,
         `https://${cfg.hostname}${path}`,
-        { operation, stripeAccount: stripeAccount || '' },
+        attestHeaders,
       );
 
       // 8. Return with human-readable headers
@@ -213,13 +247,15 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         attestation,
       };
     } catch (err: any) {
-      console.error(`[stripe-payment-handler] Error: ${err.message}`);
+      // Sanitize error message — proxyFetch errors can include request details
+      const safeMessage = err.message?.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]') || 'Unknown error';
+      console.error(`[stripe-payment-handler] Error: ${safeMessage}`);
       return {
         success: false,
         status: 502,
         headers: {},
         rawBody: '',
-        error: err.message,
+        error: safeMessage,
       };
     }
   };

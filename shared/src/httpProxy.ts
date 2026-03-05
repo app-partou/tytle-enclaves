@@ -46,14 +46,18 @@ export async function proxyFetch(
   timeoutMs: number = 25_000,
 ): Promise<HttpResponse> {
   return new Promise<HttpResponse>((resolve, reject) => {
+    let duplex: VsockDuplex | null = null;
+
     const timer = setTimeout(() => {
+      // Destroy the underlying socket to prevent FD leak on timeout
+      duplex?.destroy();
       reject(new Error(`proxyFetch timeout after ${timeoutMs}ms to ${hostname}${path}`));
     }, timeoutMs);
 
     try {
       // Step 1: Connect to host's vsock-proxy
       const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
-      const duplex = new VsockDuplex(vsockRaw);
+      duplex = new VsockDuplex(vsockRaw);
 
       // Step 2: TLS handshake over vsock tunnel
       const tlsSocket = tls.connect(
@@ -73,7 +77,9 @@ export async function proxyFetch(
 
           let httpReq = `${method} ${path} HTTP/1.1\r\n`;
           for (const [key, value] of Object.entries(reqHeaders)) {
-            httpReq += `${key}: ${value}\r\n`;
+            // Sanitize header keys and values to prevent CRLF injection
+            const safeKey = key.replace(/[\r\n]/g, '');
+            httpReq += `${safeKey}: ${value.replace(/[\r\n]/g, '')}\r\n`;
           }
 
           if (body) {
@@ -136,14 +142,18 @@ export async function proxyFetchPlain(
   timeoutMs: number = 25_000,
 ): Promise<HttpResponse> {
   return new Promise<HttpResponse>((resolve, reject) => {
+    let duplex: VsockDuplex | null = null;
+
     const timer = setTimeout(() => {
+      // Destroy the underlying socket to prevent FD leak on timeout
+      duplex?.destroy();
       reject(new Error(`proxyFetchPlain timeout after ${timeoutMs}ms to ${hostname}${path}`));
     }, timeoutMs);
 
     try {
       // Connect to host's vsock-proxy (no TLS — write raw HTTP)
       const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
-      const duplex = new VsockDuplex(vsockRaw);
+      duplex = new VsockDuplex(vsockRaw);
 
       // Build and send HTTP request directly over the vsock tunnel
       const reqHeaders = {
@@ -154,7 +164,9 @@ export async function proxyFetchPlain(
 
       let httpReq = `${method} ${path} HTTP/1.1\r\n`;
       for (const [key, value] of Object.entries(reqHeaders)) {
-        httpReq += `${key}: ${value}\r\n`;
+        // Sanitize header keys and values to prevent CRLF injection
+        const safeKey = key.replace(/[\r\n]/g, '');
+        httpReq += `${safeKey}: ${value.replace(/[\r\n]/g, '')}\r\n`;
       }
 
       if (body) {
