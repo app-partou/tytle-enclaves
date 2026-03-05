@@ -172,7 +172,6 @@ function extractPcrs(coseSign1Bytes: Buffer): {
       pcr2: getPcr(2),
     };
   } catch (err: any) {
-    console.error(`[attestor] Failed to extract PCRs: ${err.message}`);
-    return { pcr0: '', pcr1: '', pcr2: '' };
+    throw new Error(`Failed to extract PCRs from COSE_Sign1 document: ${err.message}`);
   }
 }

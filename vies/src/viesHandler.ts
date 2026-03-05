@@ -17,7 +17,7 @@
  *   [128..159] address      sha256 (0 if absent)
  */
 
-import { proxyFetch, attest, encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '@tytle-enclaves/shared';
+import { proxyFetch, errorResponse, encodeBn254AndAttest, VIES_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
 
 // =============================================================================
@@ -124,23 +124,16 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
         countryCode = body.countryCode;
         vatNumber = body.vatNumber;
       } catch {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: 'Invalid request body — expected JSON with { countryCode, vatNumber }',
-        };
+        return errorResponse(400, 'Invalid request body — expected JSON with { countryCode, vatNumber }');
       }
 
       if (!countryCode || !vatNumber) {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: 'Both countryCode and vatNumber are required',
-        };
+        return errorResponse(400, 'Both countryCode and vatNumber are required');
+      }
+
+      // Validate countryCode format: 2-letter ISO alpha code
+      if (!/^[A-Z]{2}$/.test(countryCode)) {
+        return errorResponse(400, `Invalid countryCode: "${countryCode}" — must be 2-letter uppercase ISO code`);
       }
 
       // Route to VIES or HMRC
@@ -198,31 +191,21 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
         address = parsed.address;
       }
 
-      // Encode as BN254 field elements
-      const encodedBytes = encodeFieldElements(VIES_SCHEMA, {
-        countryCode,
-        vatNumber,
-        valid: valid ? 1 : 0,
-        name: name || null,
-        address: address || null,
-      });
-
-      const rawBody = encodedBytes.toString('base64');
-      const bn254Hash = hashFieldElements(encodedBytes);
-
-      // Attest the encoded bytes (BN254 hash in NSM user_data)
-      const attestation = await attest(
-        apiEndpoint,
-        countryCode === 'GB' ? 'GET' : 'POST',
-        rawBody,
-        countryCode === 'GB'
-          ? `https://${cfg.hmrcHostname}/organisations/vat/check-vat-number/lookup/${vatNumber}`
-          : `https://${cfg.viesHostname}/taxation_customs/vies/services/checkVatService`,
-        { countryCode, vatNumber },
-        bn254Hash,
+      // Encode as BN254 field elements + attest
+      const isHmrc = countryCode === 'GB';
+      const result = await encodeBn254AndAttest(
+        VIES_SCHEMA,
+        { countryCode, vatNumber, valid: valid ? 1 : 0, name: name || null, address: address || null },
+        {
+          apiEndpoint,
+          method: isHmrc ? 'GET' : 'POST',
+          url: isHmrc
+            ? `https://${cfg.hmrcHostname}/organisations/vat/check-vat-number/lookup/${vatNumber}`
+            : `https://${cfg.viesHostname}/taxation_customs/vies/services/checkVatService`,
+          requestHeaders: { countryCode, vatNumber },
+        },
       );
 
-      // Return with human-readable headers + BN254 data
       return {
         success: true,
         status: 200,
@@ -233,12 +216,9 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
           'x-vies-name': name || '',
           'x-vies-address': address || '',
         },
-        rawBody,
-        attestation: {
-          ...attestation,
-          bn254Hash,
-        },
-        bn254: rawBody,
+        rawBody: result.rawBody,
+        attestation: result.attestation,
+        bn254: result.rawBody,
         bn254Headers: {
           'x-vies-name': name || '',
           'x-vies-address': address || '',
@@ -246,13 +226,7 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
       };
     } catch (err: any) {
       console.error(`[vies-handler] Error: ${err.message}`);
-      return {
-        success: false,
-        status: 502,
-        headers: {},
-        rawBody: '',
-        error: err.message,
-      };
+      return errorResponse(502, err.message);
     }
   };
 }

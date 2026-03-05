@@ -22,6 +22,17 @@ vi.mock('@tytle-enclaves/shared', () => ({
   VIES_SCHEMA,
   proxyFetch: mockProxyFetch,
   attest: mockAttest,
+  errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
+    ({ success: false, status, headers, rawBody: '', error }),
+  encodeBn254AndAttest: async (
+    schema: any, values: any, args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
+  ) => {
+    const encodedBytes = encodeFieldElements(schema, values);
+    const rawBody = encodedBytes.toString('base64');
+    const bn254Hash = hashFieldElements(encodedBytes);
+    const attestation = await mockAttest(args.apiEndpoint, args.method, rawBody, args.url, args.requestHeaders, bn254Hash);
+    return { rawBody, bn254Hash, attestation: { ...attestation, bn254Hash } };
+  },
 }));
 
 import { createViesHandler } from '../viesHandler.js';
@@ -262,7 +273,7 @@ describe('VIES SOAP path (non-GB)', () => {
     expect(result.status).toBe(502);
   });
 
-  it('escapes XML special characters in input', async () => {
+  it('escapes XML special characters in vatNumber', async () => {
     mockProxyFetch.mockResolvedValueOnce({
       status: 200,
       headers: {},
@@ -270,14 +281,24 @@ describe('VIES SOAP path (non-GB)', () => {
     });
 
     await handler(makeRequest(JSON.stringify({
-      countryCode: 'P&T',
-      vatNumber: '<script>',
+      countryCode: 'PT',
+      vatNumber: '<script>&"test',
     })));
 
     const soapBody = mockProxyFetch.mock.calls[0][5] as string;
-    expect(soapBody).toContain('P&amp;T');
-    expect(soapBody).toContain('&lt;script&gt;');
+    expect(soapBody).toContain('&lt;script&gt;&amp;&quot;test');
     expect(soapBody).not.toContain('<script>');
+  });
+
+  it('rejects invalid countryCode format', async () => {
+    const result = await handler(makeRequest(JSON.stringify({
+      countryCode: 'P&T',
+      vatNumber: '123456789',
+    })));
+
+    expect(result.success).toBe(false);
+    expect(result.status).toBe(400);
+    expect(result.error).toContain('Invalid countryCode');
   });
 
   it('handles VIES response with no name/address', async () => {

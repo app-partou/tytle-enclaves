@@ -118,6 +118,7 @@ export async function proxyFetch(
       });
     } catch (err) {
       clearTimeout(timer);
+      duplex?.destroy();
       reject(err);
     }
   });
@@ -203,6 +204,7 @@ export async function proxyFetchPlain(
       });
     } catch (err) {
       clearTimeout(timer);
+      duplex?.destroy();
       reject(err);
     }
   });
@@ -275,6 +277,9 @@ function decodeChunked(raw: Buffer): Buffer {
     const chunkSize = parseInt(chunkSizeHex, 16);
 
     if (chunkSize === 0) break; // Terminal chunk
+    if (!Number.isFinite(chunkSize) || chunkSize < 0) {
+      throw new Error(`Invalid chunk size: "${chunkSizeHex}"`);
+    }
 
     const chunkStart = lineEnd + 2;
     const chunkEnd = chunkStart + chunkSize;

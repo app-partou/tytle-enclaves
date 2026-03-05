@@ -27,7 +27,7 @@
  */
 
 import crypto from 'node:crypto';
-import { proxyFetch, attest, encodeFieldElements, hashFieldElements, STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
+import { proxyFetch, errorResponse, encodeBn254AndAttest, STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
 
 // =============================================================================
@@ -95,44 +95,20 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         queryParams = body.queryParams;
         resourceId = body.resourceId;
       } catch {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: 'Invalid request body — expected JSON with { operation, apiKey }',
-        };
+        return errorResponse(400, 'Invalid request body — expected JSON with { operation, apiKey }');
       }
 
       if (!operation || !VALID_OPERATIONS.has(operation)) {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: `Invalid operation: "${operation}". Supported: ${[...VALID_OPERATIONS].join(', ')}`,
-        };
+        return errorResponse(400, `Invalid operation: "${operation}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
       }
 
       if (!apiKey) {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: 'apiKey is required',
-        };
+        return errorResponse(400, 'apiKey is required');
       }
 
       // Validate single-resource operations require resourceId
       if (SINGLE_RESOURCE_OPS.has(operation) && !resourceId) {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: `${operation} requires resourceId`,
-        };
+        return errorResponse(400, `${operation} requires resourceId`);
       }
 
       // 2. Build Stripe REST path
@@ -200,39 +176,23 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         throw new Error(`Unexpected Stripe object type: expected "${expectedType}", got "${jsonData.object}"`);
       }
 
-      // 6. Encode as BN254 field elements
+      // 6. Encode as BN254 field elements + attest
       const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
       const isListOp = expectedType === 'list';
       const totalCount = isListOp ? (jsonData.data?.length ?? 0) : 0;
       const hasMore = isListOp ? (jsonData.has_more ? 1 : 0) : 0;
 
-      const encodedBytes = encodeFieldElements(STRIPE_PAYMENT_SCHEMA, {
-        operation,
-        accountId: stripeAccount || null,
-        objectType: jsonData.object,
-        dataHash,
-        totalCount,
-        hasMore,
-      });
-
-      const rawBody = encodedBytes.toString('base64');
-      const bn254Hash = hashFieldElements(encodedBytes);
-
-      // 7. Attest (BN254 hash in NSM user_data)
       // Strip Authorization header — the requestHash must be reproducible
       // by external verifiers who don't have the API key.
       const { Authorization: _stripped, ...attestHeaders } = headers;
 
-      const attestation = await attest(
-        apiEndpoint,
-        'GET',
-        rawBody,
-        `https://${cfg.hostname}${path}`,
-        attestHeaders,
-        bn254Hash,
+      const result = await encodeBn254AndAttest(
+        STRIPE_PAYMENT_SCHEMA,
+        { operation, accountId: stripeAccount || null, objectType: jsonData.object, dataHash, totalCount, hasMore },
+        { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: attestHeaders },
       );
 
-      // 8. Return with human-readable headers + BN254 data
+      // 7. Return with human-readable headers + BN254 data
       return {
         success: true,
         status: 200,
@@ -243,29 +203,19 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
           'x-stripe-data-hash': dataHash,
           'x-stripe-total-count': String(totalCount),
           'x-stripe-has-more': String(hasMore),
-          'x-stripe-response-body': response.body,
         },
-        rawBody,
-        attestation: {
-          ...attestation,
-          bn254Hash,
-        },
-        bn254: rawBody,
+        rawBody: result.rawBody,
+        attestation: result.attestation,
+        bn254: result.rawBody,
         bn254Headers: {
-          'x-stripe-data-hash': attestation.responseHash,
+          'x-stripe-data-hash': result.attestation.responseHash,
         },
       };
     } catch (err: any) {
       // Sanitize error message — proxyFetch errors can include request details
       const safeMessage = err.message?.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]') || 'Unknown error';
       console.error(`[stripe-payment-handler] Error: ${safeMessage}`);
-      return {
-        success: false,
-        status: 502,
-        headers: {},
-        rawBody: '',
-        error: safeMessage,
-      };
+      return errorResponse(502, safeMessage);
     }
   };
 }

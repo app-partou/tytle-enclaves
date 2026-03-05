@@ -14,7 +14,7 @@
  * 7. Return response with attestation + human-readable headers
  */
 
-import { proxyFetchPlain, attest, encodeFieldElements, hashFieldElements, SICAE_SCHEMA } from '@tytle-enclaves/shared';
+import { proxyFetchPlain, errorResponse, encodeBn254AndAttest, SICAE_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
 
 // =============================================================================
@@ -180,23 +180,11 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
         const body = JSON.parse(request.body || '{}');
         nif = body.nif;
       } catch {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: 'Invalid request body — expected JSON with { nif: string }',
-        };
+        return errorResponse(400, 'Invalid request body — expected JSON with { nif: string }');
       }
 
       if (!nif || !/^\d{9}$/.test(nif)) {
-        return {
-          success: false,
-          status: 400,
-          headers: {},
-          rawBody: '',
-          error: `Invalid NIF: "${nif}" — must be exactly 9 digits`,
-        };
+        return errorResponse(400, `Invalid NIF: "${nif}" — must be exactly 9 digits`);
       }
 
       // Step 1: GET page to extract ASP.NET tokens
@@ -213,13 +201,7 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       );
 
       if (getResponse.status !== 200) {
-        return {
-          success: false,
-          status: getResponse.status,
-          headers: {},
-          rawBody: '',
-          error: `SICAE GET failed: ${getResponse.status}`,
-        };
+        return errorResponse(getResponse.status, `SICAE GET failed: ${getResponse.status}`);
       }
 
       const pageHtml = getResponse.body;
@@ -227,13 +209,13 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       // Extract __VIEWSTATE
       const vsMatch = pageHtml.match(/id="__VIEWSTATE"\s+value="([^"]*)"/);
       if (!vsMatch) {
-        return { success: false, status: 502, headers: {}, rawBody: '', error: 'Could not extract __VIEWSTATE' };
+        return errorResponse(502, 'Could not extract __VIEWSTATE');
       }
 
       // Extract __EVENTVALIDATION
       const evMatch = pageHtml.match(/id="__EVENTVALIDATION"\s+value="([^"]*)"/);
       if (!evMatch) {
-        return { success: false, status: 502, headers: {}, rawBody: '', error: 'Could not extract __EVENTVALIDATION' };
+        return errorResponse(502, 'Could not extract __EVENTVALIDATION');
       }
 
       // Extract session cookie
@@ -280,43 +262,20 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       }
 
       if (!sicaeResult) {
-        return {
-          success: false,
-          status: 404,
-          headers: { 'x-sicae-nif': nif },
-          rawBody: '',
-          error: `No CAE found for NIF ${nif}`,
-        };
+        return errorResponse(404, `No CAE found for NIF ${nif}`, { 'x-sicae-nif': nif });
       }
 
-      // Step 3: Encode as BN254 field elements
+      // Step 3: Encode as BN254 field elements + attest
       const cae2Code = sicaeResult.caeSecondary.length > 0 ? sicaeResult.caeSecondary[0].code : null;
       const cae2Desc = sicaeResult.caeSecondary.length > 0 ? sicaeResult.caeSecondary[0].description : null;
 
-      const encodedBytes = encodeFieldElements(SICAE_SCHEMA, {
-        nif,
-        name: sicaeResult.officialName,
-        cae1Code: sicaeResult.caePrimary,
-        cae1Desc: sicaeResult.caePrimaryDescription,
-        cae2Code,
-        cae2Desc,
-      });
-
-      const rawBody = encodedBytes.toString('base64');
-      const bn254Hash = hashFieldElements(encodedBytes);
-
-      // Step 4: Attest the encoded bytes (BN254 hash in NSM user_data)
       const apiEndpoint = `${cfg.hostname}/Consulta.aspx`;
-      const attestation = await attest(
-        apiEndpoint,
-        'POST',
-        rawBody,
-        `http://${cfg.hostname}/Consulta.aspx`,
-        { nif },
-        bn254Hash,
+      const result = await encodeBn254AndAttest(
+        SICAE_SCHEMA,
+        { nif, name: sicaeResult.officialName, cae1Code: sicaeResult.caePrimary, cae1Desc: sicaeResult.caePrimaryDescription, cae2Code, cae2Desc },
+        { apiEndpoint, method: 'POST', url: `http://${cfg.hostname}/Consulta.aspx`, requestHeaders: { nif } },
       );
 
-      // Return with human-readable values in headers + BN254 data
       return {
         success: true,
         status: 200,
@@ -328,12 +287,9 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
           'x-sicae-cae2-code': cae2Code || '',
           'x-sicae-cae2-desc': cae2Desc || '',
         },
-        rawBody,
-        attestation: {
-          ...attestation,
-          bn254Hash,
-        },
-        bn254: rawBody,
+        rawBody: result.rawBody,
+        attestation: result.attestation,
+        bn254: result.rawBody,
         bn254Headers: {
           'x-sicae-name': sicaeResult.officialName,
           'x-sicae-cae1-desc': sicaeResult.caePrimaryDescription,
@@ -342,13 +298,7 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       };
     } catch (err: any) {
       console.error(`[sicae-handler] Error: ${err.message}`);
-      return {
-        success: false,
-        status: 502,
-        headers: {},
-        rawBody: '',
-        error: err.message,
-      };
+      return errorResponse(502, err.message);
     }
   };
 }

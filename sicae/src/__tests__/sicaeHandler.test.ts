@@ -22,6 +22,17 @@ vi.mock('@tytle-enclaves/shared', () => ({
   SICAE_SCHEMA,
   proxyFetchPlain: mockProxyFetchPlain,
   attest: mockAttest,
+  errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
+    ({ success: false, status, headers, rawBody: '', error }),
+  encodeBn254AndAttest: async (
+    schema: any, values: any, args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
+  ) => {
+    const encodedBytes = encodeFieldElements(schema, values);
+    const rawBody = encodedBytes.toString('base64');
+    const bn254Hash = hashFieldElements(encodedBytes);
+    const attestation = await mockAttest(args.apiEndpoint, args.method, rawBody, args.url, args.requestHeaders, bn254Hash);
+    return { rawBody, bn254Hash, attestation: { ...attestation, bn254Hash } };
+  },
 }));
 
 import { createSicaeHandler } from '../sicaeHandler.js';
