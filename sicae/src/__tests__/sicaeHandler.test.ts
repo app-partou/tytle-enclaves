@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Import real codec directly (bypasses barrel re-export that pulls in native)
-import { encodeFieldElements, SICAE_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
+import { encodeFieldElements, hashFieldElements, SICAE_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
 
 // vi.hoisted runs before vi.mock hoisting — safe to reference in factory
 const { mockProxyFetchPlain, mockAttest } = vi.hoisted(() => ({
@@ -18,6 +18,7 @@ const { mockProxyFetchPlain, mockAttest } = vi.hoisted(() => ({
 // Mock @tytle-enclaves/shared — provide real codec + mocked proxyFetchPlain/attest
 vi.mock('@tytle-enclaves/shared', () => ({
   encodeFieldElements,
+  hashFieldElements,
   SICAE_SCHEMA,
   proxyFetchPlain: mockProxyFetchPlain,
   attest: mockAttest,
@@ -358,5 +359,57 @@ describe('BN254 encoding output', () => {
 
     expect(result.success).toBe(false);
     expect(result.rawBody).toBe('');
+  });
+});
+
+describe('BN254 attestation chain', () => {
+  it('passes bn254Hash as 6th argument to attest()', async () => {
+    mockSicaeFlow(RESULT_513032525);
+
+    await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
+
+    expect(mockAttest).toHaveBeenCalledTimes(1);
+    const attestArgs = mockAttest.mock.calls[0];
+    // 6th argument should be BN254 hash (hex string, 64 chars)
+    expect(attestArgs[5]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('returns bn254 and bn254Headers in response', async () => {
+    mockSicaeFlow(RESULT_513032525);
+
+    const result = await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
+
+    expect(result.bn254).toBe(result.rawBody);
+    expect(result.bn254Headers).toBeDefined();
+    expect(result.bn254Headers!['x-sicae-name']).toBe('GREEN OPPORTUNITY LDA');
+  });
+
+  it('includes bn254Hash in attestation object', async () => {
+    mockSicaeFlow(RESULT_513032525);
+
+    const result = await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
+
+    expect(result.attestation).toBeDefined();
+    expect((result.attestation as any).bn254Hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('bn254Hash matches SHA-256 of encoded field elements', async () => {
+    mockSicaeFlow(RESULT_513032525);
+
+    const result = await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
+
+    // Reproduce encoding using the same values the handler parsed from HTML.
+    // Use the response headers as ground truth (they contain the parsed values).
+    const expectedEncoded = encodeFieldElements(SICAE_SCHEMA, {
+      nif: '513032525',
+      name: result.headers['x-sicae-name'],
+      cae1Code: result.headers['x-sicae-cae1-code'],
+      cae1Desc: result.headers['x-sicae-cae1-desc'],
+      cae2Code: result.headers['x-sicae-cae2-code'] || null,
+      cae2Desc: result.headers['x-sicae-cae2-desc'] || null,
+    });
+    const expectedHash = hashFieldElements(expectedEncoded);
+
+    expect((result.attestation as any).bn254Hash).toBe(expectedHash);
   });
 });

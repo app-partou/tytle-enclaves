@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Import real codec directly (bypasses barrel re-export that pulls in native)
-import { encodeFieldElements, VIES_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
+import { encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
 
 // vi.hoisted runs before vi.mock hoisting — safe to reference in factory
 const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
@@ -18,6 +18,7 @@ const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
 // Mock @tytle-enclaves/shared — provide real codec + mocked proxyFetch/attest
 vi.mock('@tytle-enclaves/shared', () => ({
   encodeFieldElements,
+  hashFieldElements,
   VIES_SCHEMA,
   proxyFetch: mockProxyFetch,
   attest: mockAttest,
@@ -446,5 +447,72 @@ describe('BN254 encoding output', () => {
     const r2 = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
 
     expect(r1.rawBody).toBe(r2.rawBody);
+  });
+});
+
+describe('BN254 attestation chain', () => {
+  it('passes bn254Hash as 6th argument to attest()', async () => {
+    mockProxyFetch.mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA 123'),
+    });
+
+    await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+
+    expect(mockAttest).toHaveBeenCalledTimes(1);
+    const attestArgs = mockAttest.mock.calls[0];
+    // 6th argument should be BN254 hash (hex string, 64 chars)
+    expect(attestArgs[5]).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('returns bn254 and bn254Headers in response', async () => {
+    mockProxyFetch.mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA 123'),
+    });
+
+    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+
+    expect(result.bn254).toBe(result.rawBody);
+    expect(result.bn254Headers).toBeDefined();
+    expect(result.bn254Headers!['x-vies-name']).toBe('TYTLE LDA');
+    expect(result.bn254Headers!['x-vies-address']).toBe('RUA 123');
+  });
+
+  it('includes bn254Hash in attestation object', async () => {
+    mockProxyFetch.mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      body: viesSoapValid('PT', '507172230', 'TEST', 'ADDR'),
+    });
+
+    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+
+    expect(result.attestation).toBeDefined();
+    expect((result.attestation as any).bn254Hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('bn254Hash matches SHA-256 of encoded field elements', async () => {
+    mockProxyFetch.mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA 123'),
+    });
+
+    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+
+    // Reproduce encoding independently
+    const expectedEncoded = encodeFieldElements(VIES_SCHEMA, {
+      countryCode: 'PT',
+      vatNumber: '507172230',
+      valid: 1,
+      name: 'TYTLE LDA',
+      address: 'RUA 123',
+    });
+    const expectedHash = hashFieldElements(expectedEncoded);
+
+    expect((result.attestation as any).bn254Hash).toBe(expectedHash);
   });
 });
