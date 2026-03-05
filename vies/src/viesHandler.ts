@@ -17,7 +17,7 @@
  *   [128..159] address      sha256 (0 if absent)
  */
 
-import { proxyFetch, attest, encodeFieldElements, VIES_SCHEMA } from '@tytle-enclaves/shared';
+import { proxyFetch, attest, encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
 
 // =============================================================================
@@ -208,8 +208,9 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
       });
 
       const rawBody = encodedBytes.toString('base64');
+      const bn254Hash = hashFieldElements(encodedBytes);
 
-      // Attest the encoded bytes
+      // Attest the encoded bytes (BN254 hash in NSM user_data)
       const attestation = await attest(
         apiEndpoint,
         countryCode === 'GB' ? 'GET' : 'POST',
@@ -218,9 +219,10 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
           ? `https://${cfg.hmrcHostname}/organisations/vat/check-vat-number/lookup/${vatNumber}`
           : `https://${cfg.viesHostname}/taxation_customs/vies/services/checkVatService`,
         { countryCode, vatNumber },
+        bn254Hash,
       );
 
-      // Return with human-readable headers
+      // Return with human-readable headers + BN254 data
       return {
         success: true,
         status: 200,
@@ -232,7 +234,15 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
           'x-vies-address': address || '',
         },
         rawBody,
-        attestation,
+        attestation: {
+          ...attestation,
+          bn254Hash,
+        },
+        bn254: rawBody,
+        bn254Headers: {
+          'x-vies-name': name || '',
+          'x-vies-address': address || '',
+        },
       };
     } catch (err: any) {
       console.error(`[vies-handler] Error: ${err.message}`);

@@ -4,6 +4,7 @@ export { proxyFetch, proxyFetchPlain } from './httpProxy.js';
 export { attest } from './attestor.js';
 export {
   encodeFieldElements,
+  hashFieldElements,
   schemaByteLength,
   bigintToBytes32,
   BN254_MODULUS,

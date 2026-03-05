@@ -27,7 +27,7 @@
  */
 
 import crypto from 'node:crypto';
-import { proxyFetch, attest, encodeFieldElements, STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
+import { proxyFetch, attest, encodeFieldElements, hashFieldElements, STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
 
 // =============================================================================
@@ -216,8 +216,9 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
       });
 
       const rawBody = encodedBytes.toString('base64');
+      const bn254Hash = hashFieldElements(encodedBytes);
 
-      // 7. Attest
+      // 7. Attest (BN254 hash in NSM user_data)
       // Strip Authorization header — the requestHash must be reproducible
       // by external verifiers who don't have the API key.
       const { Authorization: _stripped, ...attestHeaders } = headers;
@@ -228,9 +229,10 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         rawBody,
         `https://${cfg.hostname}${path}`,
         attestHeaders,
+        bn254Hash,
       );
 
-      // 8. Return with human-readable headers
+      // 8. Return with human-readable headers + BN254 data
       return {
         success: true,
         status: 200,
@@ -244,7 +246,14 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
           'x-stripe-response-body': response.body,
         },
         rawBody,
-        attestation,
+        attestation: {
+          ...attestation,
+          bn254Hash,
+        },
+        bn254: rawBody,
+        bn254Headers: {
+          'x-stripe-data-hash': attestation.responseHash,
+        },
       };
     } catch (err: any) {
       // Sanitize error message — proxyFetch errors can include request details

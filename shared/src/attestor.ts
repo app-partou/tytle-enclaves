@@ -39,6 +39,7 @@ export interface AttestationDocument {
  * @param rawBody - Raw response body
  * @param url - Full request URL
  * @param requestHeaders - Request headers (for request hash)
+ * @param userDataHex - Optional hex string for NSM user_data (e.g., SHA-256 of BN254 field elements)
  */
 export async function attest(
   apiEndpoint: string,
@@ -46,6 +47,7 @@ export async function attest(
   rawBody: string,
   url: string,
   requestHeaders: Record<string, string>,
+  userDataHex?: string,
 ): Promise<AttestationDocument> {
   const timestamp = Math.floor(Date.now() / 1000);
   const attestationId = `enc-${crypto.randomUUID()}`;
@@ -68,8 +70,8 @@ export async function attest(
     .update(`${responseHash}${apiEndpoint}${timestamp}`)
     .digest('hex');
 
-  // Request NSM attestation with the nonce
-  const { nsmDocument, pcrs } = await requestNsmAttestation(nonce);
+  // Request NSM attestation with the nonce and optional user_data
+  const { nsmDocument, pcrs } = await requestNsmAttestation(nonce, userDataHex);
 
   return {
     attestationId,
@@ -88,9 +90,10 @@ export async function attest(
  * Request an NSM attestation document from /dev/nsm.
  *
  * @param nonceHex - Hex-encoded nonce to include in attestation
+ * @param userDataHex - Optional hex-encoded user_data (e.g., SHA-256 of BN254 field elements)
  * @returns Base64 NSM document and extracted PCR values
  */
-async function requestNsmAttestation(nonceHex: string): Promise<{
+async function requestNsmAttestation(nonceHex: string, userDataHex?: string): Promise<{
   nsmDocument: string;
   pcrs: { pcr0: string; pcr1: string; pcr2: string };
 }> {
@@ -98,7 +101,7 @@ async function requestNsmAttestation(nonceHex: string): Promise<{
   const request = cbor.encode({
     Attestation: {
       nonce: Buffer.from(nonceHex, 'hex'),
-      user_data: null,
+      user_data: userDataHex ? Buffer.from(userDataHex, 'hex') : null,
       public_key: null,
     },
   });

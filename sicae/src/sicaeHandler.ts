@@ -14,7 +14,7 @@
  * 7. Return response with attestation + human-readable headers
  */
 
-import { proxyFetchPlain, attest, encodeFieldElements, SICAE_SCHEMA } from '@tytle-enclaves/shared';
+import { proxyFetchPlain, attest, encodeFieldElements, hashFieldElements, SICAE_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
 
 // =============================================================================
@@ -303,8 +303,9 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       });
 
       const rawBody = encodedBytes.toString('base64');
+      const bn254Hash = hashFieldElements(encodedBytes);
 
-      // Step 4: Attest the encoded bytes
+      // Step 4: Attest the encoded bytes (BN254 hash in NSM user_data)
       const apiEndpoint = `${cfg.hostname}/Consulta.aspx`;
       const attestation = await attest(
         apiEndpoint,
@@ -312,9 +313,10 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
         rawBody,
         `http://${cfg.hostname}/Consulta.aspx`,
         { nif },
+        bn254Hash,
       );
 
-      // Return with human-readable values in headers (unattested metadata)
+      // Return with human-readable values in headers + BN254 data
       return {
         success: true,
         status: 200,
@@ -327,7 +329,16 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
           'x-sicae-cae2-desc': cae2Desc || '',
         },
         rawBody,
-        attestation,
+        attestation: {
+          ...attestation,
+          bn254Hash,
+        },
+        bn254: rawBody,
+        bn254Headers: {
+          'x-sicae-name': sicaeResult.officialName,
+          'x-sicae-cae1-desc': sicaeResult.caePrimaryDescription,
+          'x-sicae-cae2-desc': cae2Desc || '',
+        },
       };
     } catch (err: any) {
       console.error(`[sicae-handler] Error: ${err.message}`);

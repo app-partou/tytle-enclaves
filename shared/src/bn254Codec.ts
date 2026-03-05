@@ -136,3 +136,12 @@ export function encodeFieldElements(
 export function schemaByteLength(schema: FieldDef[]): number {
   return schema.length * 32;
 }
+
+/**
+ * SHA-256 hash of the encoded field elements.
+ * This goes into NSM user_data to cryptographically bind the BN254
+ * encoding to the hardware attestation.
+ */
+export function hashFieldElements(encoded: Buffer): string {
+  return crypto.createHash('sha256').update(encoded).digest('hex');
+}
