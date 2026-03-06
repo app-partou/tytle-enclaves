@@ -177,8 +177,10 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
           soapBody,
         );
 
-        // Check for SOAP faults
-        if (response.body.includes('Fault') || response.status !== 200) {
+        // Check for SOAP faults (match XML tag, not substring — avoids
+        // false positives on company names containing "Fault")
+        const hasSoapFault = /<(?:\w+:)?Fault[\s>\/]/.test(response.body);
+        if (hasSoapFault || response.status !== 200) {
           // Extract fault string for error reporting
           const faultMatch = response.body.match(/<(?:\w+:)?faultstring>([^<]*)<\/(?:\w+:)?faultstring>/);
           const faultCode = faultMatch?.[1] || `HTTP ${response.status}`;
