@@ -171,6 +171,38 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         throw new Error('Stripe API returned invalid JSON');
       }
 
+      // 404 = resource not found — a valid, definitive answer. Attest it without
+      // object type validation (Stripe 404s return {error: {...}}, not {object: ...}).
+      if (response.status === 404) {
+        const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
+
+        const { Authorization: _stripped, ...attestHeaders } = headers;
+        const result = await encodeBn254AndAttest(
+          STRIPE_PAYMENT_SCHEMA,
+          { operation, accountId: stripeAccount || null, objectType: 'not_found', dataHash, totalCount: 0, hasMore: 0 },
+          { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: attestHeaders },
+        );
+
+        return {
+          success: true,
+          status: 404,
+          headers: {
+            'x-stripe-operation': operation,
+            'x-stripe-account-id': stripeAccount || '',
+            'x-stripe-object-type': 'not_found',
+            'x-stripe-data-hash': dataHash,
+            'x-stripe-total-count': '0',
+            'x-stripe-has-more': '0',
+          },
+          rawBody: result.rawBody,
+          attestation: result.attestation,
+          bn254: result.rawBody,
+          bn254Headers: {
+            'x-stripe-data-hash': result.attestation.responseHash,
+          },
+        };
+      }
+
       const expectedType = OPERATION_OBJECT_TYPE[operation];
       if (jsonData.object !== expectedType) {
         throw new Error(`Unexpected Stripe object type: expected "${expectedType}", got "${jsonData.object}"`);

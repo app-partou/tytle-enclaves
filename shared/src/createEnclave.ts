@@ -13,6 +13,9 @@ import type { EnclaveConfig, EnclaveRequest, EnclaveResponse } from './types.js'
 
 const VSOCK_PORT = 5000;
 
+/** Maximum time to handle a single connection (prevents stuck handlers from blocking the accept loop) */
+const CONNECTION_TIMEOUT_MS = 60_000;
+
 /**
  * Start the enclave accept loop.
  *
@@ -61,14 +64,22 @@ async function handleConnection(
   handleRequest: (req: EnclaveRequest) => Promise<EnclaveResponse>,
 ): Promise<void> {
   try {
-    const request = await readMessage<EnclaveRequest>(conn);
-    console.log(`[enclave:${name}] Request ${request.id}: ${request.method} ${request.url}`);
+    // Wrap the entire connection handler in a timeout to prevent stuck connections
+    // from blocking the sequential accept loop indefinitely.
+    const result = await withTimeout(
+      async () => {
+        const request = await readMessage<EnclaveRequest>(conn);
+        console.log(`[enclave:${name}] Request ${request.id}: ${request.method} ${request.url}`);
 
-    const response = await handleRequest(request);
-    await writeMessage(conn, response);
+        const response = await handleRequest(request);
+        await writeMessage(conn, response);
 
-    console.log(
-      `[enclave:${name}] Request ${request.id}: ${response.success ? 'OK' : 'FAILED'} (status ${response.status})`,
+        console.log(
+          `[enclave:${name}] Request ${request.id}: ${response.success ? 'OK' : 'FAILED'} (status ${response.status})`,
+        );
+      },
+      CONNECTION_TIMEOUT_MS,
+      `Connection handler timed out after ${CONNECTION_TIMEOUT_MS}ms`,
     );
   } catch (err: any) {
     console.error(`[enclave:${name}] Connection error: ${err.message}`);
@@ -91,6 +102,20 @@ async function handleConnection(
       // Ignore close errors
     }
   }
+}
+
+async function withTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    fn().then(
+      (result) => { clearTimeout(timer); resolve(result); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
 }
 
 function sleep(ms: number): Promise<void> {
