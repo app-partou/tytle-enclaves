@@ -262,7 +262,16 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       }
 
       if (!sicaeResult) {
-        return errorResponse(404, `No CAE found for NIF ${nif}`, { 'x-sicae-nif': nif });
+        // "NIF not found" is a valid, definitive answer — not an enclave error.
+        // Use success: true so executeViaEnclave() passes the 404 status through
+        // to the provider instead of throwing and falling back to unattested.
+        return {
+          success: true,
+          status: 404,
+          headers: { 'x-sicae-nif': nif },
+          rawBody: '',
+          error: `No CAE found for NIF ${nif}`,
+        };
       }
 
       // Step 3: Encode as BN254 field elements + attest
