@@ -38,5 +38,11 @@ export interface EnclaveResponse {
       pcr2: string;
     };
     nonce: string;
+    /** SHA-256 of BN254 field elements (included in NSM user_data) */
+    bn254Hash?: string;
   };
+  /** BN254 field elements as base64 (from custom handler encoding) */
+  bn254?: string;
+  /** Human-readable values for sha256 fields (from custom handler) */
+  bn254Headers?: Record<string, string>;
 }

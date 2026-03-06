@@ -114,6 +114,7 @@ export async function proxyFetch(
 
       tlsSocket.on('error', (err: Error) => {
         clearTimeout(timer);
+        duplex?.destroy();
         reject(new Error(`TLS error to ${hostname}: ${err.message}`));
       });
     } catch (err) {
