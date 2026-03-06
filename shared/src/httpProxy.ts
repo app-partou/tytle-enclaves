@@ -201,6 +201,7 @@ export async function proxyFetchPlain(
 
       duplex.on('error', (err: Error) => {
         clearTimeout(timer);
+        duplex?.destroy();
         reject(new Error(`Plain HTTP error to ${hostname}: ${err.message}`));
       });
     } catch (err) {
