@@ -64,10 +64,11 @@ export async function attest(
     .update(`${url}|${apiMethod}|${JSON.stringify(requestHeaders)}`)
     .digest('hex');
 
-  // Compute nonce: SHA-256(responseHash + apiEndpoint + timestamp)
+  // Compute nonce: SHA-256(responseHash|apiEndpoint|timestamp)
+  // Pipe delimiter prevents domain collisions from field concatenation
   const nonce = crypto
     .createHash('sha256')
-    .update(`${responseHash}${apiEndpoint}${timestamp}`)
+    .update(`${responseHash}|${apiEndpoint}|${timestamp}`)
     .digest('hex');
 
   // Request NSM attestation with the nonce and optional user_data

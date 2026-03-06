@@ -7,7 +7,7 @@ How to independently verify that a Tytle enclave attestation is authentic.
 Every API call made through a Tytle enclave produces an NSM (Nitro Security Module) attestation document. This document contains:
 
 - **PCR0**: Hash of the enclave image (code identity)
-- **Nonce**: SHA-256(responseHash + apiEndpoint + timestamp) — ties the attestation to a specific response
+- **Nonce**: SHA-256(responseHash|apiEndpoint|timestamp) — ties the attestation to a specific response
 - **COSE_Sign1 signature**: Signed by AWS Nitro hardware, verifiable against the Nitro root CA
 
 Because this repository is public, anyone can reproduce the build, compute the expected PCR0, and verify it matches the attestation.
@@ -70,7 +70,7 @@ The `nsm_document` field in the attestation is a Base64-encoded COSE_Sign1 struc
 The nonce ties the attestation to a specific response:
 
 ```
-nonce = SHA-256(responseHash + apiEndpoint + timestamp)
+nonce = SHA-256(responseHash|apiEndpoint|timestamp)
 ```
 
 Where:
