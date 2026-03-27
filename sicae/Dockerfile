@@ -35,7 +35,7 @@ FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153
 WORKDIR /shared
 
 # Install shared deps (strip native file: dep — installed manually)
-# Strip file: deps from both package.json and lockfile so npm ci works.
+# Strip file: deps from both package.json and lockfile before install.
 COPY shared/package.json ./package.json.orig
 COPY shared/package-lock.json ./package-lock.json.orig
 RUN node -e " \
@@ -49,7 +49,7 @@ RUN node -e " \
   const root = lock.packages?.['']; \
   if (root?.dependencies) delete root.dependencies['@tytle-enclaves/native']; \
   fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2));"
-RUN npm ci
+RUN npm install
 
 # Copy native addon into shared's node_modules
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
@@ -71,7 +71,7 @@ RUN apk add --no-cache \
 WORKDIR /app
 
 # Install sicae deps (strip native + shared file: deps — installed manually)
-# Strip file: deps from both package.json and lockfile so npm ci works.
+# Strip file: deps from both package.json and lockfile before install.
 COPY sicae/package.json ./package.json.orig
 COPY sicae/package-lock.json ./package-lock.json.orig
 RUN node -e " \
@@ -85,7 +85,7 @@ RUN node -e " \
   const root = lock.packages?.['']; \
   if (root?.dependencies) { delete root.dependencies['@tytle-enclaves/native']; delete root.dependencies['@tytle-enclaves/shared']; } \
   fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2));"
-RUN npm ci
+RUN npm install
 
 # Copy native addon
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
