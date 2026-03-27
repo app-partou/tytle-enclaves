@@ -78,8 +78,8 @@ RUN npx tsc
 RUN node -e " \
   const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8')); \
   pkg.dependencies = pkg.dependencies || {}; \
-  pkg.dependencies['@tytle-enclaves/native'] = '*'; \
-  pkg.dependencies['@tytle-enclaves/shared'] = '*'; \
+  pkg.dependencies['@tytle-enclaves/native'] = 'file:./node_modules/@tytle-enclaves/native'; \
+  pkg.dependencies['@tytle-enclaves/shared'] = 'file:./node_modules/@tytle-enclaves/shared'; \
   require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
 RUN npm prune --production
 
