@@ -38,6 +38,7 @@ vi.mock('@tytle-enclaves/shared', () => ({
 import { createSicaeHandler } from '../sicaeHandler.js';
 
 interface EnclaveRequest {
+  id: string;
   url: string;
   method: string;
   headers: Record<string, string>;
@@ -51,6 +52,7 @@ const handler = createSicaeHandler({
 
 function makeRequest(body: string): EnclaveRequest {
   return {
+    id: 'test-request-id',
     url: 'http://www.sicae.pt/Consulta.aspx',
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

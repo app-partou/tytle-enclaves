@@ -38,6 +38,7 @@ vi.mock('@tytle-enclaves/shared', () => ({
 import { createViesHandler } from '../viesHandler.js';
 
 interface EnclaveRequest {
+  id: string;
   url: string;
   method: string;
   headers: Record<string, string>;
@@ -53,6 +54,7 @@ const handler = createViesHandler({
 
 function makeRequest(body: string): EnclaveRequest {
   return {
+    id: 'test-request-id',
     url: 'https://ec.europa.eu/taxation_customs/vies/services/checkVatService',
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
