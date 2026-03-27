@@ -1,0 +1,25 @@
+{
+  "name": "@tytle-enclaves/vies",
+  "version": "0.1.0",
+  "description": "VIES/HMRC VAT validation enclave — runs inside AWS Nitro Enclave",
+  "type": "module",
+  "main": "dist/enclave.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/enclave.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "cbor": "9.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.33",
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
+  },
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=20"
+  }
+}

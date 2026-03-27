@@ -34,29 +34,14 @@ FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153
 
 WORKDIR /shared
 
-# Install shared deps (strip native file: dep — installed manually)
-# Strip file: deps from both package.json and lockfile before install.
-COPY shared/package.json ./package.json.orig
-COPY shared/package-lock.json ./package-lock.json.orig
-RUN node -e " \
-  const fs = require('fs'); \
-  const pkg = JSON.parse(fs.readFileSync('package.json.orig','utf8')); \
-  delete pkg.dependencies?.['@tytle-enclaves/native']; \
-  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2)); \
-  const lock = JSON.parse(fs.readFileSync('package-lock.json.orig','utf8')); \
-  delete lock.packages?.['../native']; \
-  delete lock.packages?.['node_modules/@tytle-enclaves/native']; \
-  const root = lock.packages?.['']; \
-  if (root?.dependencies) delete root.dependencies['@tytle-enclaves/native']; \
-  fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2));"
-RUN npm install
+# Install shared deps from pre-stripped docker lockfile (deterministic)
+COPY shared/package.docker.json ./package.json
+COPY shared/package-lock.docker.json ./package-lock.json
+RUN npm ci
 
 # Copy native addon into shared's node_modules
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
 COPY --from=rust-builder /build/native/*.node ./node_modules/@tytle-enclaves/native/
-
-# Restore original package.json and build
-RUN cp package.json.orig package.json && rm package.json.orig
 COPY shared/tsconfig.json ./
 COPY shared/src/ ./src/
 RUN npx tsc
@@ -70,22 +55,10 @@ RUN apk add --no-cache \
 
 WORKDIR /app
 
-# Install sicae deps (strip native + shared file: deps — installed manually)
-# Strip file: deps from both package.json and lockfile before install.
-COPY sicae/package.json ./package.json.orig
-COPY sicae/package-lock.json ./package-lock.json.orig
-RUN node -e " \
-  const fs = require('fs'); \
-  const pkg = JSON.parse(fs.readFileSync('package.json.orig','utf8')); \
-  delete pkg.dependencies?.['@tytle-enclaves/native']; \
-  delete pkg.dependencies?.['@tytle-enclaves/shared']; \
-  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2)); \
-  const lock = JSON.parse(fs.readFileSync('package-lock.json.orig','utf8')); \
-  for (const k of ['../native','../shared','node_modules/@tytle-enclaves/native','node_modules/@tytle-enclaves/shared']) delete lock.packages?.[k]; \
-  const root = lock.packages?.['']; \
-  if (root?.dependencies) { delete root.dependencies['@tytle-enclaves/native']; delete root.dependencies['@tytle-enclaves/shared']; } \
-  fs.writeFileSync('package-lock.json', JSON.stringify(lock, null, 2));"
-RUN npm install
+# Install sicae deps from pre-stripped docker lockfile (deterministic)
+COPY sicae/package.docker.json ./package.json
+COPY sicae/package-lock.docker.json ./package-lock.json
+RUN npm ci
 
 # Copy native addon
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
@@ -95,19 +68,18 @@ COPY --from=rust-builder /build/native/*.node ./node_modules/@tytle-enclaves/nat
 COPY --from=shared-builder /shared/dist ./node_modules/@tytle-enclaves/shared/dist/
 COPY --from=shared-builder /shared/package.json ./node_modules/@tytle-enclaves/shared/
 
-# Restore original package.json
-RUN cp package.json.orig package.json && rm package.json.orig
-
 # Build sicae TypeScript
 COPY sicae/tsconfig.json ./
 COPY sicae/src/ ./src/
 RUN npx tsc
 
 # Prune devDependencies for minimal runtime image.
+# Add workspace packages to deps so npm prune keeps them.
 RUN node -e " \
   const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8')); \
-  if (pkg.dependencies?.['@tytle-enclaves/native']) pkg.dependencies['@tytle-enclaves/native'] = '*'; \
-  if (pkg.dependencies?.['@tytle-enclaves/shared']) pkg.dependencies['@tytle-enclaves/shared'] = '*'; \
+  pkg.dependencies = pkg.dependencies || {}; \
+  pkg.dependencies['@tytle-enclaves/native'] = '*'; \
+  pkg.dependencies['@tytle-enclaves/shared'] = '*'; \
   require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));"
 RUN npm prune --production
 
