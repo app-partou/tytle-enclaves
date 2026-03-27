@@ -11,12 +11,12 @@
 # Stage 1: Rust builder for native addon (vsock + NSM ioctl)
 # Pin by digest for reproducibility — update via:
 #   docker pull rust:1.83-alpine && docker inspect --format='{{index .RepoDigests 0}}' rust:1.83-alpine
-FROM rust:1.83-alpine@sha256:de862e9e9e8e8e3e45db3de7ef7b3ad8d47a1e2df50a4ad5fd848ca80aeb89b3 AS rust-builder
+FROM rust:1.83-alpine@sha256:0ac946ed7597a9f053a1be2ce38c09aa88b3d7079a91ea491493615294b1f699 AS rust-builder
 
 RUN apk add --no-cache \
-    musl-dev=1.2.5-r8 \
-    nodejs=20.18.1-r0 \
-    npm=10.9.0-r0
+    musl-dev=1.2.5-r9 \
+    nodejs=22.15.1-r0 \
+    npm=10.9.1-r0
 
 WORKDIR /build/native
 COPY native/package.json native/package-lock.json* ./
@@ -27,7 +27,7 @@ COPY native/src/ ./src/
 RUN npm run build
 
 # Stage 2: Build shared library
-FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab AS shared-builder
+FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c AS shared-builder
 
 WORKDIR /shared
 
@@ -59,11 +59,11 @@ COPY shared/src/ ./src/
 RUN npx tsc
 
 # Stage 3: Build stripe-payment enclave
-FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab AS node-builder
+FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c AS node-builder
 
 RUN apk add --no-cache \
-    openssl=3.3.2-r4 \
-    ca-certificates=20241010-r0
+    openssl=3.5.5-r0 \
+    ca-certificates=20251003-r0
 
 WORKDIR /app
 
@@ -109,9 +109,9 @@ RUN node -e " \
 RUN npm prune --production
 
 # Stage 4: Minimal runtime
-FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab
+FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c
 
-RUN apk add --no-cache ca-certificates=20241010-r0
+RUN apk add --no-cache ca-certificates=20251003-r0
 
 WORKDIR /app
 COPY --from=node-builder /app/dist ./dist

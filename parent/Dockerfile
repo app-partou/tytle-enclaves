@@ -6,7 +6,7 @@
 # extracts files from this image and runs them via systemd. The Docker image
 # is used only as a packaging/distribution mechanism.
 
-FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab AS builder
+FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c AS builder
 
 WORKDIR /app
 COPY package.json package-lock.json ./
@@ -20,7 +20,7 @@ RUN npx tsc
 RUN npm prune --production
 
 # Minimal runtime
-FROM node:20-alpine@sha256:2d07db07a2d2a4fbc86d0e4e0dafb1e37a2e8c6e849fbb6a0b0654a1e8d4b7ab
+FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c
 
 WORKDIR /app
 COPY --from=builder /app/dist ./dist
