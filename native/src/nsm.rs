@@ -8,7 +8,7 @@ use napi_derive::napi;
 ///   type      = 0x0A           << 8   = 0x0000_0A00
 ///   nr        = 0              << 0   = 0x0000_0000
 /// Reference: aws-nitro-enclaves-nsm-api/src/driver/mod.rs (NSM_IOCTL_MAGIC = 0x0A)
-const NSM_IOCTL_CMD: u64 = 0xC020_0A00;
+const NSM_IOCTL_CMD: i32 = 0xC020_0A00u32 as i32;
 
 /// NSM message structure for ioctl.
 /// Contains request and response iovec pointers.
