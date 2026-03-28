@@ -1,0 +1,34 @@
+{
+  "name": "@tytle-enclaves/verify",
+  "version": "0.1.0",
+  "description": "CLI tool to verify Tytle Nitro Enclave attestations",
+  "type": "module",
+  "main": "dist/cli.js",
+  "bin": {
+    "verify": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/cli.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "tsc"
+  },
+  "dependencies": {
+    "cbor": "9.0.2",
+    "commander": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.33",
+    "typescript": "5.9.3",
+    "vitest": "4.0.18"
+  },
+  "license": "AGPL-3.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "Dockerfile.nitro-cli"
+  ]
+}

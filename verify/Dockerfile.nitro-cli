@@ -1,0 +1,12 @@
+# Portable nitro-cli container for PCR0 extraction.
+# nitro-cli build-enclave computes EIF measurements mathematically —
+# it does NOT need actual Nitro hardware, just Docker access.
+#
+# Usage:
+#   docker build -t nitro-cli-helper -f Dockerfile.nitro-cli .
+#   docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+#     nitro-cli-helper build-enclave --docker-uri <image> --output-file /tmp/out.eif
+
+FROM amazonlinux:2023
+RUN dnf install -y aws-nitro-enclaves-cli && dnf clean all
+ENTRYPOINT ["nitro-cli"]
