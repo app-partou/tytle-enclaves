@@ -1,0 +1,23 @@
+{
+  "name": "@tytle-enclaves/monerium-payment",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/enclave.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/enclave.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@tytle-enclaves/native": "file:../native",
+    "@tytle-enclaves/shared": "file:../shared",
+    "cbor": "9.0.2"
+  },
+  "devDependencies": {
+    "vitest": "4.0.18"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

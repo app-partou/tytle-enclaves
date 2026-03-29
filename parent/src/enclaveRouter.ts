@@ -15,6 +15,7 @@ import type { EnclaveRoute } from './types.js';
 const VIES_CID = parseInt(process.env.VIES_CID || '16', 10);
 const SICAE_CID = parseInt(process.env.SICAE_CID || '17', 10);
 const STRIPE_PAYMENT_CID = parseInt(process.env.STRIPE_PAYMENT_CID || '18', 10);
+const MONERIUM_PAYMENT_CID = parseInt(process.env.MONERIUM_PAYMENT_CID || '19', 10);
 
 /** Routing table: hostname → enclave CID + port. */
 const ROUTES: EnclaveRoute[] = [
@@ -32,6 +33,11 @@ const ROUTES: EnclaveRoute[] = [
     cid: STRIPE_PAYMENT_CID,
     port: 5000,
     hosts: ['api.stripe.com'],
+  },
+  {
+    cid: MONERIUM_PAYMENT_CID,
+    port: 5000,
+    hosts: ['api.monerium.app'],
   },
 ];
 

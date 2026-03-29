@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Import real codec directly (bypasses barrel re-export that pulls in native)
 import { encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
+import { stableStringify, computeManifestHash, validateManifest } from '../../node_modules/@tytle-enclaves/shared/src/manifest.js';
 
 // vi.hoisted runs before vi.mock hoisting — safe to reference in factory
 const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
@@ -20,6 +21,9 @@ vi.mock('@tytle-enclaves/shared', () => ({
   encodeFieldElements,
   hashFieldElements,
   VIES_SCHEMA,
+  stableStringify,
+  computeManifestHash,
+  validateManifest,
   proxyFetch: mockProxyFetch,
   attest: mockAttest,
   errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
@@ -36,6 +40,7 @@ vi.mock('@tytle-enclaves/shared', () => ({
 }));
 
 import { createViesHandler } from '../viesHandler.js';
+import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
 
 interface EnclaveRequest {
   id: string;
@@ -537,5 +542,29 @@ describe('BN254 attestation chain', () => {
     const expectedHash = hashFieldElements(expectedEncoded);
 
     expect((result.attestation as any).bn254Hash).toBe(expectedHash);
+  });
+});
+
+describe('handler manifest', () => {
+  it('manifest hash is present in response headers', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapValid('IE', '6388047V', 'TEST COMPANY', 'TEST ADDRESS') });
+    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'IE', vatNumber: '6388047V' })));
+    expect(result.headers['x-vies-manifest-hash']).toBe(MANIFEST_HASH);
+  });
+
+  it('manifest hash is included in attestation request headers', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapValid('IE', '6388047V', 'TEST COMPANY', 'TEST ADDRESS') });
+    await handler(makeRequest(JSON.stringify({ countryCode: 'IE', vatNumber: '6388047V' })));
+    const attestCall = mockAttest.mock.calls[0];
+    const attestHeaders = attestCall[4] as Record<string, string>;
+    expect(attestHeaders['x-manifest-hash']).toBe(MANIFEST_HASH);
+  });
+
+  it('manifest schema fields match actual VIES_SCHEMA', () => {
+    expect(HANDLER_MANIFEST.schema.fields.length).toBe(VIES_SCHEMA.length);
+    for (let i = 0; i < VIES_SCHEMA.length; i++) {
+      expect(HANDLER_MANIFEST.schema.fields[i].name).toBe(VIES_SCHEMA[i].name);
+      expect(HANDLER_MANIFEST.schema.fields[i].encoding).toBe(VIES_SCHEMA[i].encoding);
+    }
   });
 });

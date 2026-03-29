@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Import real codec directly (bypasses barrel re-export that pulls in native)
 import { encodeFieldElements, hashFieldElements, SICAE_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
+import { stableStringify, computeManifestHash, validateManifest } from '../../node_modules/@tytle-enclaves/shared/src/manifest.js';
 
 // vi.hoisted runs before vi.mock hoisting — safe to reference in factory
 const { mockProxyFetchPlain, mockAttest } = vi.hoisted(() => ({
@@ -20,6 +21,9 @@ vi.mock('@tytle-enclaves/shared', () => ({
   encodeFieldElements,
   hashFieldElements,
   SICAE_SCHEMA,
+  stableStringify,
+  computeManifestHash,
+  validateManifest,
   proxyFetchPlain: mockProxyFetchPlain,
   attest: mockAttest,
   errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
@@ -36,6 +40,7 @@ vi.mock('@tytle-enclaves/shared', () => ({
 }));
 
 import { createSicaeHandler } from '../sicaeHandler.js';
+import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
 
 interface EnclaveRequest {
   id: string;
@@ -241,7 +246,9 @@ describe('SICAE lookup — real HTML fixtures', () => {
 
     const result = await handler(makeRequest(JSON.stringify({ nif: '980494796' })));
 
-    expect(result.success).toBe(false);
+    // "Not found" is a valid, definitive answer — success: true so the provider
+    // receives the 404 status instead of the enclave throwing and falling back.
+    expect(result.success).toBe(true);
     expect(result.status).toBe(404);
     expect(result.error).toContain('No CAE found');
     expect(result.headers['x-sicae-nif']).toBe('980494796');
@@ -252,7 +259,7 @@ describe('SICAE lookup — real HTML fixtures', () => {
 
     const result = await handler(makeRequest(JSON.stringify({ nif: '308203811' })));
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
     expect(result.status).toBe(404);
     expect(result.error).toContain('No CAE found');
   });
@@ -370,7 +377,8 @@ describe('BN254 encoding output', () => {
 
     const result = await handler(makeRequest(JSON.stringify({ nif: '980494796' })));
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+    expect(result.status).toBe(404);
     expect(result.rawBody).toBe('');
   });
 });
@@ -424,5 +432,41 @@ describe('BN254 attestation chain', () => {
     const expectedHash = hashFieldElements(expectedEncoded);
 
     expect((result.attestation as any).bn254Hash).toBe(expectedHash);
+  });
+});
+
+describe('manifest hash integration', () => {
+  it('includes manifest hash in success response headers', async () => {
+    mockSicaeFlow(RESULT_513032525);
+
+    const result = await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
+
+    expect(result.success).toBe(true);
+    expect(result.status).toBe(200);
+    expect(result.headers['x-sicae-manifest-hash']).toBe(MANIFEST_HASH);
+  });
+
+  it('includes manifest hash in attestation request headers', async () => {
+    mockSicaeFlow(RESULT_513032525);
+
+    await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
+
+    expect(mockAttest).toHaveBeenCalledTimes(1);
+    const attestArgs = mockAttest.mock.calls[0];
+    // 5th argument is requestHeaders passed through encodeBn254AndAttest
+    const requestHeaders = attestArgs[4] as Record<string, string>;
+    expect(requestHeaders['x-manifest-hash']).toBe(MANIFEST_HASH);
+  });
+
+  it('manifest schema fields match SICAE_SCHEMA', () => {
+    const manifestFieldNames = HANDLER_MANIFEST.schema.fields.map((f: any) => f.name);
+    const schemaFieldNames = SICAE_SCHEMA.map((f: any) => f.name);
+    expect(manifestFieldNames).toEqual(schemaFieldNames);
+
+    for (const field of HANDLER_MANIFEST.schema.fields) {
+      const schemaField = SICAE_SCHEMA.find((f: any) => f.name === field.name);
+      expect(schemaField).toBeDefined();
+      expect(field.encoding).toBe(schemaField!.encoding);
+    }
   });
 });
