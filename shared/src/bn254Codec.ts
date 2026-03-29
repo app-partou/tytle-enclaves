@@ -60,6 +60,15 @@ export const STRIPE_PAYMENT_SCHEMA: FieldDef[] = [
   { name: 'hasMore',    encoding: 'uint',        jsType: 'boolean' },
 ];
 
+export const MONERIUM_PAYMENT_SCHEMA: FieldDef[] = [
+  { name: 'orderId',     encoding: 'sha256',      jsType: 'string' },
+  { name: 'state',       encoding: 'shortString', jsType: 'string' },
+  { name: 'orderAmount', encoding: 'shortString', jsType: 'string' },
+  { name: 'currency',    encoding: 'shortString', jsType: 'string' },
+  { name: 'balance',     encoding: 'uint',        jsType: 'number' },
+  { name: 'dataHash',    encoding: 'sha256',      jsType: 'string' },
+];
+
 // =============================================================================
 // Encoding Functions
 // =============================================================================

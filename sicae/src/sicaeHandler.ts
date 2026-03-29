@@ -16,6 +16,7 @@
 
 import { proxyFetchPlain, errorResponse, encodeBn254AndAttest, SICAE_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
+import { MANIFEST_HASH } from './manifest.js';
 
 // =============================================================================
 // SICAE Lookup Types
@@ -282,7 +283,7 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
       const result = await encodeBn254AndAttest(
         SICAE_SCHEMA,
         { nif, name: sicaeResult.officialName, cae1Code: sicaeResult.caePrimary, cae1Desc: sicaeResult.caePrimaryDescription, cae2Code, cae2Desc },
-        { apiEndpoint, method: 'POST', url: `http://${cfg.hostname}/Consulta.aspx`, requestHeaders: { nif } },
+        { apiEndpoint, method: 'POST', url: `http://${cfg.hostname}/Consulta.aspx`, requestHeaders: { nif, 'x-manifest-hash': MANIFEST_HASH } },
       );
 
       return {
@@ -295,6 +296,7 @@ export function createSicaeHandler(cfg: SicaeHandlerConfig) {
           'x-sicae-cae1-desc': sicaeResult.caePrimaryDescription,
           'x-sicae-cae2-code': cae2Code || '',
           'x-sicae-cae2-desc': cae2Desc || '',
+          'x-sicae-manifest-hash': MANIFEST_HASH,
         },
         rawBody: result.rawBody,
         attestation: result.attestation,

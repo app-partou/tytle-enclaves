@@ -29,6 +29,7 @@
 import crypto from 'node:crypto';
 import { proxyFetch, errorResponse, encodeBn254AndAttest, STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
+import { MANIFEST_HASH } from './manifest.js';
 
 // =============================================================================
 // Types
@@ -180,7 +181,7 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
         const result = await encodeBn254AndAttest(
           STRIPE_PAYMENT_SCHEMA,
           { operation, accountId: stripeAccount || null, objectType: 'not_found', dataHash, totalCount: 0, hasMore: 0 },
-          { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: attestHeaders },
+          { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: { ...attestHeaders, 'x-manifest-hash': MANIFEST_HASH } },
         );
 
         return {
@@ -193,6 +194,7 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
             'x-stripe-data-hash': dataHash,
             'x-stripe-total-count': '0',
             'x-stripe-has-more': '0',
+            'x-stripe-manifest-hash': MANIFEST_HASH,
           },
           rawBody: result.rawBody,
           attestation: result.attestation,
@@ -221,7 +223,7 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
       const result = await encodeBn254AndAttest(
         STRIPE_PAYMENT_SCHEMA,
         { operation, accountId: stripeAccount || null, objectType: jsonData.object, dataHash, totalCount, hasMore },
-        { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: attestHeaders },
+        { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: { ...attestHeaders, 'x-manifest-hash': MANIFEST_HASH } },
       );
 
       // 7. Return with human-readable headers + BN254 data
@@ -235,6 +237,7 @@ export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
           'x-stripe-data-hash': dataHash,
           'x-stripe-total-count': String(totalCount),
           'x-stripe-has-more': String(hasMore),
+          'x-stripe-manifest-hash': MANIFEST_HASH,
         },
         rawBody: result.rawBody,
         attestation: result.attestation,

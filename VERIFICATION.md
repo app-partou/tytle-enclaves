@@ -17,6 +17,7 @@ Tytle runs three enclave services, each with its own PCR0:
 | `vies` | EU VAT number validation (VIES + HMRC) |
 | `sicae` | Portuguese CAE code lookup |
 | `stripe-payment` | Stripe payment data retrieval |
+| `monerium-payment` | Monerium order + EURe on-chain balance |
 
 Because this repository is public, anyone can reproduce the build, compute the expected PCR0, and verify it matches the attestation. The current PCR0 and git commit for each service are published at:
 
@@ -207,6 +208,19 @@ nonce = SHA-256("a1b2c3...|ec.europa.eu/taxation_customs/vies/services/checkVatS
 ```
 
 Recompute the nonce from the attestation fields and verify it matches the `nonce` field.
+
+## Step 7: Verify the Handler Manifest (Optional)
+
+Services that declare a handler manifest include a `x-manifest-hash` in the attestation's request headers. This hash is a SHA-256 of the manifest JSON (with deterministically sorted keys), binding the attestation to a specific handler specification.
+
+To verify:
+
+1. Find the manifest hash in the response headers: `x-{service}-manifest-hash`
+2. Read the handler's `manifest.ts` from the source commit checked out in Step 2
+3. Compute `SHA-256(stableStringify(manifest))` where `stableStringify` sorts object keys recursively
+4. Verify it matches the hash from step 1
+
+The manifest describes every API query, every field derivation, and every validation policy. See [MANIFESTS.md](MANIFESTS.md) for the full specification.
 
 ## Why This Works
 

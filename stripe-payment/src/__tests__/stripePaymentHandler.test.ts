@@ -8,6 +8,9 @@ import {
   STRIPE_PAYMENT_SCHEMA,
 } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
 
+import { stableStringify, computeManifestHash, validateManifest } from '../../node_modules/@tytle-enclaves/shared/src/manifest.js';
+import { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from '../../node_modules/@tytle-enclaves/shared/src/policies.js';
+
 // vi.hoisted runs before vi.mock hoisting — safe to reference in factory
 const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
   mockProxyFetch: vi.fn(),
@@ -25,6 +28,13 @@ vi.mock('@tytle-enclaves/shared', () => ({
   encodeFieldElements,
   hashFieldElements,
   STRIPE_PAYMENT_SCHEMA,
+  stableStringify,
+  computeManifestHash,
+  validateManifest,
+  SKIP_TRANSIENT_ERRORS,
+  ATTEST_NOT_FOUND,
+  STRIP_AUTH,
+  REDACT_BEARER,
   proxyFetch: mockProxyFetch,
   attest: mockAttest,
   errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
@@ -40,6 +50,7 @@ vi.mock('@tytle-enclaves/shared', () => ({
   },
 }));
 
+import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
 import { createStripePaymentHandler } from '../stripePaymentHandler.js';
 
 interface EnclaveRequest {
@@ -596,5 +607,30 @@ describe('Stripe-Account header', () => {
 
     const headers = mockProxyFetch.mock.calls[0][4] as Record<string, string>;
     expect(headers).not.toHaveProperty('Stripe-Account');
+  });
+});
+
+describe('handler manifest', () => {
+  it('manifest hash is present in success response headers', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: JSON.stringify({ object: 'list', data: [{ id: 'ch_1' }], has_more: false }) });
+    const result = await handler(makeRequest({ operation: 'list_charges', apiKey: 'sk_test_123' }));
+    expect(result.headers['x-stripe-manifest-hash']).toBe(MANIFEST_HASH);
+    expect(result.headers['x-stripe-manifest-hash']).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('manifest hash is included in attestation request headers', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: JSON.stringify({ object: 'list', data: [], has_more: false }) });
+    await handler(makeRequest({ operation: 'list_charges', apiKey: 'sk_test_123' }));
+    const attestCall = mockAttest.mock.calls[0];
+    const attestHeaders = attestCall[4] as Record<string, string>;
+    expect(attestHeaders['x-manifest-hash']).toBe(MANIFEST_HASH);
+  });
+
+  it('manifest schema fields match actual STRIPE_PAYMENT_SCHEMA', () => {
+    expect(HANDLER_MANIFEST.schema.fields.length).toBe(STRIPE_PAYMENT_SCHEMA.length);
+    for (let i = 0; i < STRIPE_PAYMENT_SCHEMA.length; i++) {
+      expect(HANDLER_MANIFEST.schema.fields[i].name).toBe(STRIPE_PAYMENT_SCHEMA[i].name);
+      expect(HANDLER_MANIFEST.schema.fields[i].encoding).toBe(STRIPE_PAYMENT_SCHEMA[i].encoding);
+    }
   });
 });

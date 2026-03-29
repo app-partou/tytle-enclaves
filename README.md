@@ -27,11 +27,13 @@ Response + {nsmDocument, pcrs, nonce, ...}
 ## Directory Structure
 
 ```
-shared/          Generic attested HTTP/HTTPS fetch (enclave core)
-native/          Shared Rust napi-rs addon (vsock + NSM ioctl)
-parent/          Generic parent server (routes requests to enclaves)
-vies/            VIES/HMRC VAT validation enclave (config only)
-sicae/           SICAE Portuguese business CAE code lookup enclave (config only)
+shared/              Generic attested HTTP/HTTPS fetch (enclave core, manifest framework)
+native/              Shared Rust napi-rs addon (vsock + NSM ioctl)
+parent/              Generic parent server (routes requests to enclaves)
+vies/                VIES/HMRC VAT validation enclave
+sicae/               SICAE Portuguese business CAE code lookup enclave
+stripe-payment/      Stripe payment data retrieval enclave
+monerium-payment/    Monerium order + EURe balance enclave (Gnosis chain)
 ```
 
 ### Adding a New Enclave Service
@@ -58,14 +60,14 @@ Set `tls: false` on an `AllowedHost` to skip TLS and send plain HTTP over the vs
 
 ## Per-Service Isolation
 
-| Property | VIES Enclave | SICAE Enclave | Future Stripe Enclave |
-|----------|-------------|---------------|----------------------|
-| CID | 16 | 17 | 18 |
-| ECR tag | `vies` | `sicae` | `stripe` |
-| PCR0 SSM | `/tytle/{env}/enclave/vies/pcr0` | `/tytle/{env}/enclave/sicae/pcr0` | `/tytle/{env}/enclave/stripe/pcr0` |
-| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `www.sicae.pt` | `api.stripe.com` |
-| Transport | HTTPS (TLS) | HTTP (plain) | HTTPS (TLS) |
-| vsock-proxy ports | 8443, 8444 | 8445 | 8446 |
+| Property | VIES | SICAE | Stripe Payment | Monerium Payment |
+|----------|------|-------|----------------|------------------|
+| CID | 16 | 17 | 18 | 19 |
+| ECR tag | `vies` | `sicae` | `stripe-payment` | `monerium-payment` |
+| PCR0 SSM | `/tytle/{env}/enclave/vies/pcr0` | `/tytle/{env}/enclave/sicae/pcr0` | `/tytle/{env}/enclave/stripe/pcr0` | `/tytle/{env}/enclave/monerium/pcr0` |
+| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `www.sicae.pt` | `api.stripe.com` | `api.monerium.app`, `rpc.gnosischain.com` |
+| Transport | HTTPS (TLS) | HTTP (plain) | HTTPS (TLS) | HTTPS (TLS) |
+| vsock-proxy ports | 8443, 8444 | 8445 | 8446 | 8447, 8448 |
 
 Each enclave image contains ONLY shared core + its service config. PCR0 proves exactly which code ran. A VIES attestation's PCR0 can only match the VIES enclave image.
 
@@ -99,6 +101,10 @@ cd sicae
 cd parent
 docker build -t tytle-enclave-parent:latest .
 ```
+
+## Handler Manifests
+
+See [MANIFESTS.md](MANIFESTS.md) for the manifest framework — canonical query definitions, field-level provenance, composable policies, and repeatability guarantees.
 
 ## Verification
 

@@ -19,6 +19,7 @@
 
 import { proxyFetch, errorResponse, encodeBn254AndAttest, VIES_SCHEMA } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
+import { MANIFEST_HASH } from './manifest.js';
 
 // =============================================================================
 // SOAP Helpers
@@ -204,7 +205,7 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
           url: isHmrc
             ? `https://${cfg.hmrcHostname}/organisations/vat/check-vat-number/lookup/${vatNumber}`
             : `https://${cfg.viesHostname}/taxation_customs/vies/services/checkVatService`,
-          requestHeaders: { countryCode, vatNumber },
+          requestHeaders: { countryCode, vatNumber, 'x-manifest-hash': MANIFEST_HASH },
         },
       );
 
@@ -217,6 +218,7 @@ export function createViesHandler(cfg: ViesHandlerConfig) {
           'x-vies-valid': String(valid),
           'x-vies-name': name || '',
           'x-vies-address': address || '',
+          'x-vies-manifest-hash': MANIFEST_HASH,
         },
         rawBody: result.rawBody,
         attestation: result.attestation,
