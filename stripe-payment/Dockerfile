@@ -96,4 +96,10 @@ USER 1000
 
 # vsock listener port (inside enclave)
 EXPOSE 5000
-CMD ["node", "dist/enclave.js"]
+
+# Nitro Enclaves init execs the Docker image's CMD directly via execvpe
+# without resolving PATH, and without running the base image's ENTRYPOINT
+# (docker-entrypoint.sh from node:20-alpine). Clear ENTRYPOINT and use
+# absolute paths so the enclave init can locate the binary.
+ENTRYPOINT []
+CMD ["/usr/local/bin/node", "/app/dist/enclave.js"]
