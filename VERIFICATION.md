@@ -144,15 +144,13 @@ docker buildx build \
 
 ### Step 4: Compute and Compare PCR0
 
-Convert the Docker image to an EIF (Enclave Image Format) and extract PCR0. This uses `nitro-cli`, which only runs on Amazon Linux — but you can run it inside Docker on any machine:
+Convert the Docker image to an EIF (Enclave Image Format) and extract PCR0. This uses `nitro-cli`, which only runs on Amazon Linux - but you can run it inside Docker on any machine. The `verify/Dockerfile.nitro-cli` in this repo pins the base image by digest and the nitro-cli version, so you get the same helper binary regardless of when you run it:
 
 ```bash
-# Build a portable nitro-cli container (one-time)
-docker build -t nitro-cli-helper - <<'EOF'
-FROM amazonlinux:2023
-RUN dnf install -y aws-nitro-enclaves-cli && dnf clean all
-ENTRYPOINT ["nitro-cli"]
-EOF
+# Build the portable nitro-cli helper container (one-time)
+# Uses the pinned Dockerfile from this repo (amazonlinux:2023 pinned by digest,
+# aws-nitro-enclaves-cli pinned to an exact version).
+docker build -t nitro-cli-helper -f verify/Dockerfile.nitro-cli verify/
 
 # Convert Docker image to EIF and extract PCR0
 docker run --rm \
