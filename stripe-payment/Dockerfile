@@ -13,10 +13,16 @@
 #   docker pull rust:1.83-alpine && docker inspect --format='{{index .RepoDigests 0}}' rust:1.83-alpine
 FROM rust:1.83-alpine@sha256:0ac946ed7597a9f053a1be2ce38c09aa88b3d7079a91ea491493615294b1f699 AS rust-builder
 
-RUN apk add --no-cache \
-    musl-dev=1.2.5-r9 \
-    nodejs=22.15.1-r0 \
-    npm=10.9.1-r0
+# Install build deps from vendored .apk files (offline, fully reproducible).
+# rust:1.83-alpine lacks nodejs/npm/musl-dev, and Alpine removes old package
+# versions from its mirrors over time, so we vendor the exact .apk closure.
+# See deps/rust-builder-apks/README.md for rationale and regenerate.sh to update.
+COPY deps/rust-builder-apks/SHASUMS256.txt /tmp/apks/SHASUMS256.txt
+COPY deps/rust-builder-apks/*.apk /tmp/apks/
+RUN cd /tmp/apks && \
+    sha256sum -c SHASUMS256.txt && \
+    apk add --no-cache --allow-untrusted ./*.apk && \
+    rm -rf /tmp/apks
 
 WORKDIR /build/native
 COPY native/package.json native/package-lock.json* ./
@@ -44,11 +50,9 @@ COPY shared/src/ ./src/
 RUN npx tsc
 
 # Stage 3: Build stripe-payment enclave
+# node:20-alpine already includes libcrypto3, libssl3, and ca-certificates-bundle,
+# which is everything Node.js needs for HTTPS/TLS. No extra apk installs required.
 FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c AS node-builder
-
-RUN apk add --no-cache \
-    openssl=3.5.5-r0 \
-    ca-certificates=20251003-r0
 
 WORKDIR /app
 
@@ -79,9 +83,8 @@ RUN node -e " \
   }"
 
 # Stage 4: Minimal runtime
+# node:20-alpine already has ca-certificates-bundle; no extra apk installs needed.
 FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c
-
-RUN apk add --no-cache ca-certificates=20251003-r0
 
 WORKDIR /app
 COPY --from=node-builder /app/dist ./dist
