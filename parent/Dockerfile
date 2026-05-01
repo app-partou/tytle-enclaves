@@ -49,25 +49,21 @@ WORKDIR /app
 COPY parent/package.json parent/package-lock.json* ./
 RUN npm ci --ignore-scripts
 
-COPY parent/tsconfig.json ./
-COPY parent/src/ ./src/
-RUN npx tsc
-
-# Remove devDependencies, then inject workspace deps that npm can't resolve
-# from file: paths inside Docker. Injecting AFTER prune ensures they survive.
-RUN npm prune --production
-
-# Wire native addon into node_modules
+# Wire workspace deps BEFORE tsc so TypeScript can resolve imports.
+# npm can't resolve file: paths inside Docker, so inject manually.
 COPY --from=rust-builder /build/native/index.js ./node_modules/@tytle-enclaves/native/index.js
 COPY --from=rust-builder /build/native/index.d.ts ./node_modules/@tytle-enclaves/native/index.d.ts
 COPY --from=rust-builder /build/native/*.node ./node_modules/@tytle-enclaves/native/
 COPY --from=rust-builder /build/native/package.json ./node_modules/@tytle-enclaves/native/package.json
-
-# Wire shared library into node_modules
 COPY --from=shared-builder /shared/dist/ ./node_modules/@tytle-enclaves/shared/dist/
 COPY --from=shared-builder /shared/package.json ./node_modules/@tytle-enclaves/shared/package.json
-# Shared depends on cbor at runtime (attestor.ts imports it)
 COPY --from=shared-builder /shared/node_modules/cbor/ ./node_modules/cbor/
+
+COPY parent/tsconfig.json ./
+COPY parent/src/ ./src/
+RUN npx tsc
+
+RUN npm prune --production
 
 # Minimal runtime
 FROM node:20-slim
