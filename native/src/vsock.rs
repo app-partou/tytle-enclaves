@@ -249,24 +249,6 @@ impl VsockStream {
         }
     }
 
-    /// Connect asynchronously with a kernel-level timeout.
-    /// Runs socket + connect on tokio's blocking thread pool.
-    #[napi(factory)]
-    pub async fn connect_async(cid: u32, port: u32, timeout_secs: Option<u32>) -> Result<Self> {
-        let timeout = timeout_secs.unwrap_or(5);
-        let (fd, peer_cid, peer_port) = tokio::task::spawn_blocking(move || {
-            let mut task = ConnectTask { cid, port, timeout_secs: timeout };
-            task.compute()
-        })
-        .await
-        .map_err(|e| Error::from_reason(format!("spawn_blocking failed: {}", e)))??;
-        Ok(VsockStream {
-            fd: AtomicI32::new(fd),
-            peer_cid,
-            peer_port,
-        })
-    }
-
     /// Read up to `size` bytes from the stream.
     /// Returns a Buffer with the bytes read (may be fewer than `size`).
     /// Note: this is a blocking call (libc::read).
@@ -343,6 +325,17 @@ impl VsockStream {
     pub fn peer_port(&self) -> u32 {
         self.peer_port
     }
+}
+
+/// Connect to a vsock endpoint asynchronously with a kernel-level timeout.
+/// Runs socket + connect on the libuv thread pool.
+#[napi(ts_return_type = "Promise<VsockStream>")]
+pub fn vsock_connect_async(cid: u32, port: u32, timeout_secs: Option<u32>) -> AsyncTask<ConnectTask> {
+    AsyncTask::new(ConnectTask {
+        cid,
+        port,
+        timeout_secs: timeout_secs.unwrap_or(5),
+    })
 }
 
 struct ConnectTask {

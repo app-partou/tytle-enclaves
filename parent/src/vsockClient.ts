@@ -1,7 +1,7 @@
 /**
  * vsock Client - connects to Nitro Enclaves via AF_VSOCK using the native addon.
  *
- * Uses VsockStream.connectAsync() for non-blocking connect with kernel-level
+ * Uses vsockConnectAsync() for non-blocking connect with kernel-level
  * timeouts, and the shared protocol module for length-prefixed message framing.
  *
  * Build note: The parent server runs on EC2 (Amazon Linux 2023, glibc).
@@ -9,7 +9,7 @@
  * NOT the musl toolchain used for enclave Docker images. See parent/Dockerfile.
  */
 
-import { VsockStream } from '@tytle-enclaves/native';
+import { vsockConnectAsync } from '@tytle-enclaves/native';
 import { readMessage, writeMessage } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from './types.js';
 
@@ -28,7 +28,7 @@ export async function sendToEnclave(
   timeoutMs: number = 30_000,
 ): Promise<EnclaveResponse> {
   const timeoutSecs = Math.max(1, Math.ceil(timeoutMs / 1000));
-  const conn = await VsockStream.connectAsync(cid, port, timeoutSecs);
+  const conn = await vsockConnectAsync(cid, port, timeoutSecs);
 
   try {
     return await withTimeout(
@@ -55,7 +55,7 @@ export async function pingEnclave(
 ): Promise<boolean> {
   try {
     const timeoutSecs = Math.max(1, Math.ceil(timeoutMs / 1000));
-    const conn = await VsockStream.connectAsync(cid, port, timeoutSecs);
+    const conn = await vsockConnectAsync(cid, port, timeoutSecs);
     try {
       const result = await withTimeout(
         async () => {
