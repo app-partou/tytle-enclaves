@@ -53,7 +53,7 @@ pub fn nsm_request(request: Buffer) -> Result<Buffer> {
         };
 
         // ioctl call to NSM
-        let ret = libc::ioctl(fd, NSM_IOCTL_CMD, &mut msg as *mut NsmMessage);
+        let ret = libc::ioctl(fd, NSM_IOCTL_CMD as _, &mut msg as *mut NsmMessage);
         libc::close(fd);
 
         if ret < 0 {
