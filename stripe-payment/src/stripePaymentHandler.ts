@@ -1,21 +1,18 @@
 /**
- * Stripe Payment Custom Handler
+ * Stripe Payment Handler Definition
  *
  * Maps operation names to Stripe REST endpoints, makes the API call via
- * vsock proxy, validates the response, encodes as BN254 field elements,
- * and attests the encoded output.
+ * vsock proxy, validates the response, and returns structured HandlerResult
+ * for BN254 encoding + attestation by the factory.
  *
  * Request body (JSON):
  *   {
- *     "operation": "list_charges" | "list_customers" | "list_invoices" | "get_payment_intent" | "get_account",
+ *     "operation": "list_charges" | "list_customers" | "list_invoices" | "get_payment_intent" | "get_account" | "get_charge",
  *     "apiKey": "sk_...",
  *     "stripeAccount": "acct_..." (optional),
  *     "queryParams": { "limit": "100", "created[gte]": "..." } (optional),
  *     "resourceId": "pi_..." (optional, for get_* operations)
  *   }
- *
- * Response: BN254-encoded field elements (6 x 32 = 192 bytes, base64)
- *           + human-readable headers (x-stripe-*)
  *
  * STRIPE_PAYMENT_SCHEMA:
  *   [0..31]    operation    shortString
@@ -27,9 +24,9 @@
  */
 
 import crypto from 'node:crypto';
-import { proxyFetch, errorResponse, encodeBn254AndAttest, STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
-import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
-import { MANIFEST_HASH } from './manifest.js';
+import { STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
+import type { HandlerDef, HandlerResult, HandlerContext } from '@tytle-enclaves/shared';
+import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
 
 // =============================================================================
 // Types
@@ -42,6 +39,18 @@ type StripeOperation =
   | 'get_payment_intent'
   | 'get_account'
   | 'get_charge';
+
+interface StripeParams {
+  operation: StripeOperation;
+  apiKey: string;
+  stripeAccount?: string;
+  queryParams?: Record<string, string>;
+  resourceId?: string;
+}
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 const OPERATION_PATH_MAP: Record<StripeOperation, string> = {
   list_charges: '/v1/charges',
@@ -70,187 +79,172 @@ const VALID_OPERATIONS = new Set<string>(Object.keys(OPERATION_PATH_MAP));
 const STRIPE_API_VERSION = '2025-12-15.clover';
 
 // =============================================================================
-// Custom Handler
+// Handler Definition
 // =============================================================================
 
-interface StripePaymentHandlerConfig {
-  hostname: string;
-  vsockPort: number;
-}
+export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
+  name: 'stripe-payment',
+  schema: STRIPE_PAYMENT_SCHEMA,
+  manifestHash: MANIFEST_HASH,
+  policies: HANDLER_MANIFEST.policies,
+  requiredHosts: ['api.stripe.com'],
 
-export function createStripePaymentHandler(cfg: StripePaymentHandlerConfig) {
-  return async (request: EnclaveRequest): Promise<EnclaveResponse> => {
-    try {
-      // 1. Parse + validate request
-      let operation: StripeOperation;
-      let apiKey: string;
-      let stripeAccount: string | undefined;
-      let queryParams: Record<string, string> | undefined;
-      let resourceId: string | undefined;
+  parseParams(body: unknown): StripeParams {
+    const b = body as Record<string, unknown>;
+    const operation = b.operation as string | undefined;
+    const apiKey = b.apiKey as string | undefined;
+    const stripeAccount = b.stripeAccount as string | undefined;
+    const queryParams = b.queryParams as Record<string, string> | undefined;
+    const resourceId = b.resourceId as string | undefined;
 
-      try {
-        const body = JSON.parse(request.body || '{}');
-        operation = body.operation;
-        apiKey = body.apiKey;
-        stripeAccount = body.stripeAccount;
-        queryParams = body.queryParams;
-        resourceId = body.resourceId;
-      } catch {
-        return errorResponse(400, 'Invalid request body — expected JSON with { operation, apiKey }');
-      }
+    if (!operation || !VALID_OPERATIONS.has(operation)) {
+      throw new Error(`Invalid operation: "${operation}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
+    }
 
-      if (!operation || !VALID_OPERATIONS.has(operation)) {
-        return errorResponse(400, `Invalid operation: "${operation}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
-      }
+    if (!apiKey) {
+      throw new Error('apiKey is required');
+    }
 
-      if (!apiKey) {
-        return errorResponse(400, 'apiKey is required');
-      }
+    if (SINGLE_RESOURCE_OPS.has(operation) && !resourceId) {
+      throw new Error(`${operation} requires resourceId`);
+    }
 
-      // Validate single-resource operations require resourceId
-      if (SINGLE_RESOURCE_OPS.has(operation) && !resourceId) {
-        return errorResponse(400, `${operation} requires resourceId`);
-      }
+    return {
+      operation: operation as StripeOperation,
+      apiKey,
+      stripeAccount,
+      queryParams,
+      resourceId,
+    };
+  },
 
-      // 2. Build Stripe REST path
-      let path = OPERATION_PATH_MAP[operation];
+  async execute(params: StripeParams, ctx: HandlerContext): Promise<HandlerResult> {
+    const { operation, apiKey, stripeAccount, queryParams, resourceId } = params;
 
-      // For single-resource operations, append resourceId
-      if (SINGLE_RESOURCE_OPS.has(operation) && resourceId) {
-        path = `${path}/${encodeURIComponent(resourceId)}`;
-      }
+    const stripeHost = ctx.hosts.find((h: { hostname: string }) => h.hostname === 'api.stripe.com')!;
 
-      // Append query params
-      if (queryParams && Object.keys(queryParams).length > 0) {
-        const qs = new URLSearchParams(queryParams).toString();
-        path = `${path}?${qs}`;
-      }
+    // Build Stripe REST path
+    let path = OPERATION_PATH_MAP[operation];
 
-      // 3. Build headers
-      const headers: Record<string, string> = {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Stripe-Version': STRIPE_API_VERSION,
-      };
+    if (SINGLE_RESOURCE_OPS.has(operation) && resourceId) {
+      path = `${path}/${encodeURIComponent(resourceId)}`;
+    }
 
-      if (stripeAccount) {
-        headers['Stripe-Account'] = stripeAccount;
-      }
+    if (queryParams && Object.keys(queryParams).length > 0) {
+      const qs = new URLSearchParams(queryParams).toString();
+      path = `${path}?${qs}`;
+    }
 
-      // 4. Make API call
-      const apiEndpoint = `${cfg.hostname}${path.split('?')[0]}`;
-      const response = await proxyFetch(
-        cfg.vsockPort,
-        cfg.hostname,
-        'GET',
-        path,
-        headers,
-      );
+    // Build headers (include Authorization - factory strips it for attestation via STRIP_AUTH policy)
+    const headers: Record<string, string> = {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Stripe-Version': STRIPE_API_VERSION,
+    };
 
-      // Skip attestation for transient error responses (rate limits, auth errors, server errors).
-      // BUT attest definitive responses like 404 (entity not found is a valid answer).
-      if (response.status >= 400 && response.status !== 404) {
-        console.warn(`[stripe-payment-handler] Stripe API returned ${response.status} for ${operation}`);
-        return {
-          success: true,
+    if (stripeAccount) {
+      headers['Stripe-Account'] = stripeAccount;
+    }
+
+    // Make API call
+    const apiEndpoint = `${stripeHost.hostname}${path.split('?')[0]}`;
+    const response = await ctx.fetch(stripeHost, 'GET', path, headers);
+
+    // Transient errors (rate limits, auth errors, server errors) - skip attestation.
+    // 404 is NOT transient: "entity not found" is a valid definitive answer.
+    if (response.status >= 400 && response.status !== 404) {
+      ctx.log.warn('Stripe transient error, skipping attestation', { status: response.status, operation });
+      return {
+        values: {},
+        apiEndpoint,
+        method: 'GET',
+        url: `https://${stripeHost.hostname}${path}`,
+        requestHeaders: headers,
+        responseHeaders: response.headers,
+        rawPassthrough: {
           status: response.status,
           headers: response.headers,
           rawBody: response.body,
-          // No attestation — transient errors not worth attesting
-        };
-      }
-
-      if (response.status !== 200 && response.status !== 404) {
-        throw new Error(`Stripe API returned unexpected status ${response.status}`);
-      }
-
-      // 5. Parse and validate response
-      let jsonData: any;
-      try {
-        jsonData = JSON.parse(response.body);
-      } catch {
-        throw new Error('Stripe API returned invalid JSON');
-      }
-
-      // 404 = resource not found — a valid, definitive answer. Attest it without
-      // object type validation (Stripe 404s return {error: {...}}, not {object: ...}).
-      if (response.status === 404) {
-        const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
-
-        const { Authorization: _stripped, ...attestHeaders } = headers;
-        const result = await encodeBn254AndAttest(
-          STRIPE_PAYMENT_SCHEMA,
-          { operation, accountId: stripeAccount || null, objectType: 'not_found', dataHash, totalCount: 0, hasMore: 0 },
-          { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: { ...attestHeaders, 'x-manifest-hash': MANIFEST_HASH } },
-        );
-
-        return {
-          success: true,
-          status: 404,
-          headers: {
-            'x-stripe-operation': operation,
-            'x-stripe-account-id': stripeAccount || '',
-            'x-stripe-object-type': 'not_found',
-            'x-stripe-data-hash': dataHash,
-            'x-stripe-total-count': '0',
-            'x-stripe-has-more': '0',
-            'x-stripe-manifest-hash': MANIFEST_HASH,
-          },
-          rawBody: result.rawBody,
-          attestation: result.attestation,
-          bn254: result.rawBody,
-          bn254Headers: {
-            'x-stripe-data-hash': result.attestation.responseHash,
-          },
-        };
-      }
-
-      const expectedType = OPERATION_OBJECT_TYPE[operation];
-      if (jsonData.object !== expectedType) {
-        throw new Error(`Unexpected Stripe object type: expected "${expectedType}", got "${jsonData.object}"`);
-      }
-
-      // 6. Encode as BN254 field elements + attest
-      const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
-      const isListOp = expectedType === 'list';
-      const totalCount = isListOp ? (jsonData.data?.length ?? 0) : 0;
-      const hasMore = isListOp ? (jsonData.has_more ? 1 : 0) : 0;
-
-      // Strip Authorization header — the requestHash must be reproducible
-      // by external verifiers who don't have the API key.
-      const { Authorization: _stripped, ...attestHeaders } = headers;
-
-      const result = await encodeBn254AndAttest(
-        STRIPE_PAYMENT_SCHEMA,
-        { operation, accountId: stripeAccount || null, objectType: jsonData.object, dataHash, totalCount, hasMore },
-        { apiEndpoint, method: 'GET', url: `https://${cfg.hostname}${path}`, requestHeaders: { ...attestHeaders, 'x-manifest-hash': MANIFEST_HASH } },
-      );
-
-      // 7. Return with human-readable headers + BN254 data
-      return {
-        success: true,
-        status: 200,
-        headers: {
-          'x-stripe-operation': operation,
-          'x-stripe-account-id': stripeAccount || '',
-          'x-stripe-object-type': jsonData.object,
-          'x-stripe-data-hash': dataHash,
-          'x-stripe-total-count': String(totalCount),
-          'x-stripe-has-more': String(hasMore),
-          'x-stripe-manifest-hash': MANIFEST_HASH,
-        },
-        rawBody: result.rawBody,
-        attestation: result.attestation,
-        bn254: result.rawBody,
-        bn254Headers: {
-          'x-stripe-data-hash': result.attestation.responseHash,
         },
       };
-    } catch (err: any) {
-      // Sanitize error message — proxyFetch errors can include request details
-      const safeMessage = err.message?.replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]') || 'Unknown error';
-      console.error(`[stripe-payment-handler] Error: ${safeMessage}`);
-      return errorResponse(502, safeMessage);
     }
-  };
-}
+
+    // 404 - resource not found. Attest with objectType='not_found'.
+    if (response.status === 404) {
+      const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
+
+      return {
+        values: {
+          operation,
+          accountId: stripeAccount || null,
+          objectType: 'not_found',
+          dataHash,
+          totalCount: 0,
+          hasMore: 0,
+        },
+        apiEndpoint,
+        method: 'GET',
+        url: `https://${stripeHost.hostname}${path}`,
+        requestHeaders: headers,
+        responseHeaders: {
+          'x-stripe-operation': operation,
+          'x-stripe-account-id': stripeAccount || '',
+          'x-stripe-object-type': 'not_found',
+          'x-stripe-data-hash': dataHash,
+          'x-stripe-total-count': '0',
+          'x-stripe-has-more': '0',
+        },
+        status: 404,
+        bn254Headers: {
+          'x-stripe-data-hash': dataHash,
+        },
+      };
+    }
+
+    // Parse and validate response
+    let jsonData: Record<string, unknown>;
+    try {
+      jsonData = JSON.parse(response.body) as Record<string, unknown>;
+    } catch {
+      throw new Error('Stripe API returned invalid JSON');
+    }
+
+    const expectedType = OPERATION_OBJECT_TYPE[operation];
+    if (jsonData.object !== expectedType) {
+      throw new Error(`Unexpected Stripe object type: expected "${expectedType}", got "${String(jsonData.object)}"`);
+    }
+
+    // Compute attestation fields
+    const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
+    const isListOp = expectedType === 'list';
+    const listData = jsonData.data as unknown[] | undefined;
+    const totalCount = isListOp ? (listData?.length ?? 0) : 0;
+    const hasMore = isListOp ? (jsonData.has_more ? 1 : 0) : 0;
+
+    return {
+      values: {
+        operation,
+        accountId: stripeAccount || null,
+        objectType: String(jsonData.object),
+        dataHash,
+        totalCount,
+        hasMore,
+      },
+      apiEndpoint,
+      method: 'GET',
+      url: `https://${stripeHost.hostname}${path}`,
+      requestHeaders: headers,
+      responseHeaders: {
+        'x-stripe-operation': operation,
+        'x-stripe-account-id': stripeAccount || '',
+        'x-stripe-object-type': String(jsonData.object),
+        'x-stripe-data-hash': dataHash,
+        'x-stripe-total-count': String(totalCount),
+        'x-stripe-has-more': String(hasMore),
+      },
+      bn254Headers: {
+        'x-stripe-data-hash': dataHash,
+      },
+    };
+  },
+};

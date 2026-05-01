@@ -6,18 +6,17 @@ import {
   encodeFieldElements,
   hashFieldElements,
   MONERIUM_PAYMENT_SCHEMA,
-} from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
-import {
-  stableStringify,
-  computeManifestHash,
-  validateManifest,
-} from '../../node_modules/@tytle-enclaves/shared/src/manifest.js';
+} from '../../../shared/src/bn254Codec.js';
+import { stableStringify, computeManifestHash, validateManifest } from '../../../shared/src/manifest.js';
+import { toErrorMessage } from '../../../shared/src/errorUtils.js';
+import { getHeadersToStrip, redactError } from '../../../shared/src/policyEngine.js';
+import { stripSensitiveHeaders } from '../../../shared/src/sanitize.js';
 import {
   SKIP_TRANSIENT_ERRORS,
   ATTEST_NOT_FOUND,
   STRIP_AUTH,
   REDACT_BEARER,
-} from '../../node_modules/@tytle-enclaves/shared/src/policies.js';
+} from '../../../shared/src/policies.js';
 
 // vi.hoisted runs before vi.mock hoisting — safe to reference in factory
 const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
@@ -32,34 +31,89 @@ const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
 }));
 
 // Mock @tytle-enclaves/shared — provide real codec + policies + manifest utils + mocked proxyFetch/attest
-vi.mock('@tytle-enclaves/shared', () => ({
-  encodeFieldElements,
-  hashFieldElements,
-  MONERIUM_PAYMENT_SCHEMA,
-  stableStringify,
-  computeManifestHash,
-  validateManifest,
-  SKIP_TRANSIENT_ERRORS,
-  ATTEST_NOT_FOUND,
-  STRIP_AUTH,
-  REDACT_BEARER,
-  proxyFetch: mockProxyFetch,
-  attest: mockAttest,
-  errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
-    ({ success: false, status, headers, rawBody: '', error }),
-  encodeBn254AndAttest: async (
-    schema: any, values: any, args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
+vi.mock('@tytle-enclaves/shared', () => {
+  const errorResponse = (status: number, error: string, headers: Record<string, string> = {}) =>
+    ({ success: false, status, headers, rawBody: '', error });
+
+  const encodeBn254AndAttest = async (
+    schema: unknown[], values: Record<string, unknown>,
+    args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
   ) => {
-    const encodedBytes = encodeFieldElements(schema, values);
+    const encodedBytes = encodeFieldElements(schema as Parameters<typeof encodeFieldElements>[0], values);
     const rawBody = encodedBytes.toString('base64');
     const bn254Hash = hashFieldElements(encodedBytes);
     const attestation = await mockAttest(args.apiEndpoint, args.method, rawBody, args.url, args.requestHeaders, bn254Hash);
     return { rawBody, bn254Hash, attestation: { ...attestation, bn254Hash } };
-  },
-}));
+  };
 
-import { createMoneriumPaymentHandler } from '../moneriumPaymentHandler.js';
+  // Inline createHandler that mirrors the real factory but uses mocked I/O
+  const createHandler = (def: Record<string, unknown>, hosts: Array<{ hostname: string; vsockProxyPort: number; tls?: boolean }>) => {
+    const hToStrip = getHeadersToStrip((def.policies || []) as Parameters<typeof getHeadersToStrip>[0]);
+    const noop = () => {};
+    const ctx = {
+      hosts,
+      log: { info: noop, warn: noop, error: noop },
+      fetch: (host: { vsockProxyPort: number; hostname: string }, method: string, path: string, headers: Record<string, string>, body?: string) =>
+        mockProxyFetch(host.vsockProxyPort, host.hostname, method, path, headers, body),
+      fetchWithRetry: (host: { vsockProxyPort: number; hostname: string }, method: string, path: string, headers: Record<string, string>, body?: string) =>
+        mockProxyFetch(host.vsockProxyPort, host.hostname, method, path, headers, body),
+    };
+    return async (request: { body?: string }) => {
+      try {
+        let params: unknown;
+        try {
+          const body = JSON.parse(request.body || '{}');
+          params = (def.parseParams as (b: unknown) => unknown)(body);
+        } catch (err: unknown) {
+          return errorResponse(400, `Invalid request: ${toErrorMessage(err)}`);
+        }
+        const result = await (def.execute as (p: unknown, c: unknown) => Promise<Record<string, unknown>>)(params, ctx);
+        if (result.rawPassthrough) return { success: true, ...(result.rawPassthrough as Record<string, unknown>) };
+        if (result.skipAttestation) return { success: true, status: result.status ?? 200, headers: result.responseHeaders, rawBody: '' };
+        const attestHeaders = hToStrip.length > 0
+          ? stripSensitiveHeaders(result.requestHeaders as Record<string, string>, hToStrip)
+          : result.requestHeaders as Record<string, string>;
+        const attestResult = await encodeBn254AndAttest(
+          def.schema as unknown[], result.values as Record<string, unknown>,
+          {
+            apiEndpoint: result.apiEndpoint as string, method: result.method as string,
+            url: result.url as string,
+            requestHeaders: { ...attestHeaders, 'x-manifest-hash': def.manifestHash as string },
+          },
+        );
+        return {
+          success: true, status: result.status ?? 200,
+          headers: { ...(result.responseHeaders as Record<string, string>), [`x-${def.name}-manifest-hash`]: def.manifestHash },
+          rawBody: attestResult.rawBody, attestation: attestResult.attestation,
+          bn254: attestResult.rawBody, bn254Headers: result.bn254Headers,
+        };
+      } catch (err: unknown) {
+        return errorResponse(502, redactError((def.policies || []) as Parameters<typeof redactError>[0], toErrorMessage(err)));
+      }
+    };
+  };
+
+  return {
+    encodeFieldElements, hashFieldElements, MONERIUM_PAYMENT_SCHEMA,
+    stableStringify, computeManifestHash, validateManifest,
+    toErrorMessage, getHeadersToStrip, redactError, stripSensitiveHeaders,
+    SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER,
+    proxyFetch: mockProxyFetch, proxyFetchPlain: mockProxyFetch,
+    proxyFetchWithRetry: mockProxyFetch,
+    attest: mockAttest, errorResponse, encodeBn254AndAttest, createHandler,
+  };
+});
+
+import { moneriumPaymentHandlerDef } from '../moneriumPaymentHandler.js';
+import { createHandler } from '@tytle-enclaves/shared';
 import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
+
+const hosts = [
+  { hostname: 'api.monerium.app', vsockProxyPort: 8447 },
+  { hostname: 'rpc.gnosischain.com', vsockProxyPort: 8448 },
+];
+
+const handler = createHandler(moneriumPaymentHandlerDef as Parameters<typeof createHandler>[0], hosts);
 
 interface EnclaveRequest {
   id: string;
@@ -68,13 +122,6 @@ interface EnclaveRequest {
   headers: Record<string, string>;
   body: string;
 }
-
-const handler = createMoneriumPaymentHandler({
-  moneriumHostname: 'api.monerium.app',
-  moneriumVsockPort: 8447,
-  rpcHostname: 'rpc.gnosischain.com',
-  rpcVsockPort: 8448,
-});
 
 function makeRequest(body: object | string): EnclaveRequest {
   return {
@@ -90,7 +137,7 @@ function makeRequest(body: object | string): EnclaveRequest {
 // Monerium API Response Fixtures
 // =============================================================================
 
-function moneriumOrder(overrides: Record<string, any> = {}): string {
+function moneriumOrder(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
     profile: 'profile_xyz',
@@ -154,7 +201,7 @@ describe('request validation', () => {
     const result = await handler(makeRequest('not json'));
     expect(result.success).toBe(false);
     expect(result.status).toBe(400);
-    expect(result.error).toContain('Invalid request body');
+    expect(result.error).toContain('Invalid request');
   });
 
   it('returns 400 for missing operation', async () => {
@@ -252,7 +299,7 @@ describe('chain validation', () => {
     }));
 
     expect(result.success).toBe(false);
-    expect(result.status).toBe(400);
+    expect(result.status).toBe(502);
     expect(result.error).toContain('Only gnosis chain is supported');
     // Should NOT make the RPC call
     expect(mockProxyFetch).toHaveBeenCalledTimes(1);
@@ -707,7 +754,7 @@ describe('BN254 encoding + attestation chain', () => {
     }));
 
     expect(result.attestation).toBeDefined();
-    expect((result.attestation as any).bn254Hash).toMatch(/^[0-9a-f]{64}$/);
+    expect((result.attestation as Record<string, unknown>).bn254Hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('bn254Hash matches SHA-256 of encoded field elements', async () => {
@@ -827,8 +874,8 @@ describe('handler manifest', () => {
       orderId: 'test-id',
     }));
 
-    expect(result.headers['x-monerium-manifest-hash']).toBe(MANIFEST_HASH);
-    expect(result.headers['x-monerium-manifest-hash']).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.headers['x-monerium-payment-manifest-hash']).toBe(MANIFEST_HASH);
+    expect(result.headers['x-monerium-payment-manifest-hash']).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('manifest hash is present in 404 response headers', async () => {
@@ -844,7 +891,7 @@ describe('handler manifest', () => {
       orderId: 'test-id',
     }));
 
-    expect(result.headers['x-monerium-manifest-hash']).toBe(MANIFEST_HASH);
+    expect(result.headers['x-monerium-payment-manifest-hash']).toBe(MANIFEST_HASH);
   });
 
   it('manifest hash is included in attestation request headers', async () => {

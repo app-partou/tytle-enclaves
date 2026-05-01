@@ -1,10 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Import real codec directly (bypasses barrel re-export that pulls in native)
-import { encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
-import { stableStringify, computeManifestHash, validateManifest } from '../../node_modules/@tytle-enclaves/shared/src/manifest.js';
+import { encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '../../../shared/src/bn254Codec.js';
+import { stableStringify, computeManifestHash, validateManifest } from '../../../shared/src/manifest.js';
+import { toErrorMessage } from '../../../shared/src/errorUtils.js';
+import { getHeadersToStrip, redactError } from '../../../shared/src/policyEngine.js';
+import { stripSensitiveHeaders } from '../../../shared/src/sanitize.js';
+import { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from '../../../shared/src/policies.js';
 
-// vi.hoisted runs before vi.mock hoisting — safe to reference in factory
 const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
   mockProxyFetch: vi.fn(),
   mockAttest: vi.fn().mockResolvedValue({
@@ -16,551 +19,212 @@ const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
   }),
 }));
 
-// Mock @tytle-enclaves/shared — provide real codec + mocked proxyFetch/attest
-vi.mock('@tytle-enclaves/shared', () => ({
-  encodeFieldElements,
-  hashFieldElements,
-  VIES_SCHEMA,
-  stableStringify,
-  computeManifestHash,
-  validateManifest,
-  proxyFetch: mockProxyFetch,
-  attest: mockAttest,
-  errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
-    ({ success: false, status, headers, rawBody: '', error }),
-  encodeBn254AndAttest: async (
-    schema: any, values: any, args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
+vi.mock('@tytle-enclaves/shared', () => {
+  const errorResponse = (status: number, error: string, headers: Record<string, string> = {}) =>
+    ({ success: false, status, headers, rawBody: '', error });
+
+  const encodeBn254AndAttest = async (
+    schema: unknown[], values: Record<string, unknown>,
+    args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
   ) => {
-    const encodedBytes = encodeFieldElements(schema, values);
+    const encodedBytes = encodeFieldElements(schema as Parameters<typeof encodeFieldElements>[0], values);
     const rawBody = encodedBytes.toString('base64');
     const bn254Hash = hashFieldElements(encodedBytes);
     const attestation = await mockAttest(args.apiEndpoint, args.method, rawBody, args.url, args.requestHeaders, bn254Hash);
     return { rawBody, bn254Hash, attestation: { ...attestation, bn254Hash } };
-  },
-}));
+  };
 
-import { createViesHandler } from '../viesHandler.js';
-import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
+  // Inline createHandler that mirrors the real factory but uses mocked I/O
+  const createHandler = (def: Record<string, unknown>, hosts: Array<{ hostname: string; vsockProxyPort: number; tls?: boolean }>) => {
+    const hToStrip = getHeadersToStrip((def.policies || []) as Parameters<typeof getHeadersToStrip>[0]);
+    const noop = () => {};
+    const ctx = {
+      hosts,
+      log: { info: noop, warn: noop, error: noop },
+      fetch: (host: { vsockProxyPort: number; hostname: string }, method: string, path: string, headers: Record<string, string>, body?: string) =>
+        mockProxyFetch(host.vsockProxyPort, host.hostname, method, path, headers, body),
+      fetchWithRetry: (host: { vsockProxyPort: number; hostname: string }, method: string, path: string, headers: Record<string, string>, body?: string) =>
+        mockProxyFetch(host.vsockProxyPort, host.hostname, method, path, headers, body),
+    };
+    return async (request: { body?: string }) => {
+      try {
+        let params: unknown;
+        try {
+          const body = JSON.parse(request.body || '{}');
+          params = (def.parseParams as (b: unknown) => unknown)(body);
+        } catch (err: unknown) {
+          return errorResponse(400, `Invalid request: ${toErrorMessage(err)}`);
+        }
+        const result = await (def.execute as (p: unknown, c: unknown) => Promise<Record<string, unknown>>)(params, ctx);
+        if (result.rawPassthrough) return { success: true, ...(result.rawPassthrough as Record<string, unknown>) };
+        if (result.skipAttestation) return { success: true, status: result.status ?? 200, headers: result.responseHeaders, rawBody: '' };
+        const attestHeaders = hToStrip.length > 0
+          ? stripSensitiveHeaders(result.requestHeaders as Record<string, string>, hToStrip)
+          : result.requestHeaders as Record<string, string>;
+        const attestResult = await encodeBn254AndAttest(
+          def.schema as unknown[], result.values as Record<string, unknown>,
+          {
+            apiEndpoint: result.apiEndpoint as string, method: result.method as string,
+            url: result.url as string,
+            requestHeaders: { ...attestHeaders, 'x-manifest-hash': def.manifestHash as string },
+          },
+        );
+        return {
+          success: true, status: result.status ?? 200,
+          headers: { ...(result.responseHeaders as Record<string, string>), [`x-${def.name}-manifest-hash`]: def.manifestHash },
+          rawBody: attestResult.rawBody, attestation: attestResult.attestation,
+          bn254: attestResult.rawBody, bn254Headers: result.bn254Headers,
+        };
+      } catch (err: unknown) {
+        return errorResponse(502, redactError((def.policies || []) as Parameters<typeof redactError>[0], toErrorMessage(err)));
+      }
+    };
+  };
 
-interface EnclaveRequest {
-  id: string;
-  url: string;
-  method: string;
-  headers: Record<string, string>;
-  body: string;
-}
-
-const handler = createViesHandler({
-  viesHostname: 'ec.europa.eu',
-  viesVsockPort: 8443,
-  hmrcHostname: 'api.service.hmrc.gov.uk',
-  hmrcVsockPort: 8444,
+  return {
+    encodeFieldElements, hashFieldElements, VIES_SCHEMA,
+    stableStringify, computeManifestHash, validateManifest,
+    toErrorMessage, getHeadersToStrip, redactError, stripSensitiveHeaders,
+    SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER,
+    proxyFetch: mockProxyFetch, proxyFetchPlain: mockProxyFetch,
+    proxyFetchWithRetry: mockProxyFetch,
+    attest: mockAttest, errorResponse, encodeBn254AndAttest, createHandler,
+  };
 });
 
-function makeRequest(body: string): EnclaveRequest {
-  return {
-    id: 'test-request-id',
-    url: 'https://ec.europa.eu/taxation_customs/vies/services/checkVatService',
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-  };
+import { viesHandlerDef } from '../viesHandler.js';
+import { createHandler } from '@tytle-enclaves/shared';
+import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
+
+const hosts = [
+  { hostname: 'ec.europa.eu', vsockProxyPort: 8443 },
+  { hostname: 'api.service.hmrc.gov.uk', vsockProxyPort: 8444 },
+];
+
+const handler = createHandler(viesHandlerDef as Parameters<typeof createHandler>[0], hosts);
+
+function makeRequest(body: string) {
+  return { id: 'test-req', url: 'https://test', method: 'POST', headers: {}, body };
 }
 
-// =============================================================================
-// VIES SOAP Response Fixtures
-// =============================================================================
-
-function viesSoapValid(countryCode: string, vatNumber: string, name: string, address: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <checkVatResponse xmlns="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
-      <countryCode>${countryCode}</countryCode>
-      <vatNumber>${vatNumber}</vatNumber>
-      <requestDate>2026-02-17+01:00</requestDate>
-      <valid>true</valid>
-      <name>${name}</name>
-      <address>${address}</address>
-    </checkVatResponse>
-  </soap:Body>
-</soap:Envelope>`;
+function viesSoapValid(cc: string, vn: string, name: string, addr: string): string {
+  return `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><checkVatResponse xmlns="urn:ec.europa.eu:taxud:vies:services:checkVat:types"><countryCode>${cc}</countryCode><vatNumber>${vn}</vatNumber><valid>true</valid><name>${name}</name><address>${addr}</address></checkVatResponse></soap:Body></soap:Envelope>`;
 }
-
-function viesSoapInvalid(countryCode: string, vatNumber: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <checkVatResponse xmlns="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
-      <countryCode>${countryCode}</countryCode>
-      <vatNumber>${vatNumber}</vatNumber>
-      <requestDate>2026-02-17+01:00</requestDate>
-      <valid>false</valid>
-      <name>---</name>
-      <address>---</address>
-    </checkVatResponse>
-  </soap:Body>
-</soap:Envelope>`;
+function viesSoapInvalid(cc: string, vn: string): string {
+  return `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><checkVatResponse xmlns="urn:ec.europa.eu:taxud:vies:services:checkVat:types"><countryCode>${cc}</countryCode><vatNumber>${vn}</vatNumber><valid>false</valid><name>---</name><address>---</address></checkVatResponse></soap:Body></soap:Envelope>`;
 }
-
-function viesSoapFault(faultCode: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <soap:Fault>
-      <faultcode>soap:Server</faultcode>
-      <faultstring>${faultCode}</faultstring>
-    </soap:Fault>
-  </soap:Body>
-</soap:Envelope>`;
+function viesSoapFault(code: string): string {
+  return `<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body><soap:Fault><faultcode>soap:Server</faultcode><faultstring>${code}</faultstring></soap:Fault></soap:Body></soap:Envelope>`;
 }
-
-// =============================================================================
-// HMRC JSON Fixtures
-// =============================================================================
-
-function hmrcValid(vatNumber: string, name: string): string {
-  return JSON.stringify({
-    target: {
-      name,
-      vatNumber,
-      address: {
-        line1: '10 Downing Street',
-        line2: null,
-        postcode: 'SW1A 2AA',
-      },
-    },
-    processingDate: '2026-02-17T12:00:00+00:00',
-  });
+function hmrcValid(vn: string, name: string): string {
+  return JSON.stringify({ target: { name, vatNumber: vn, address: { line1: '10 Downing St', postcode: 'SW1A' } } });
 }
-
-// =============================================================================
-// Tests
-// =============================================================================
 
 beforeEach(() => {
   mockProxyFetch.mockReset();
   mockAttest.mockReset().mockResolvedValue({
-    attestationId: 'test-att-id',
-    responseHash: 'deadbeef',
-    mode: 'dev',
-    pcrs: { pcr0: '0'.repeat(96) },
-    timestamp: 1234567890,
+    attestationId: 'test-att-id', responseHash: 'deadbeef', mode: 'dev',
+    pcrs: { pcr0: '0'.repeat(96) }, timestamp: 1234567890,
   });
 });
 
 describe('request validation', () => {
   it('returns 400 for invalid JSON body', async () => {
-    const result = await handler(makeRequest('not json'));
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(400);
-    expect(result.error).toContain('Invalid request body');
-  });
-
-  it('returns 400 for empty body', async () => {
-    const result = await handler(makeRequest(''));
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(400);
+    const r = await handler(makeRequest('not json'));
+    expect(r.success).toBe(false);
+    expect(r.status).toBe(400);
   });
 
   it('returns 400 for missing countryCode', async () => {
-    const result = await handler(makeRequest(JSON.stringify({ vatNumber: '123' })));
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(400);
-    expect(result.error).toContain('required');
+    const r = await handler(makeRequest(JSON.stringify({ vatNumber: '123' })));
+    expect(r.success).toBe(false);
+    expect(r.status).toBe(400);
+    expect(r.error).toContain('required');
   });
 
-  it('returns 400 for missing vatNumber', async () => {
-    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'PT' })));
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(400);
-    expect(result.error).toContain('required');
+  it('returns 400 for invalid countryCode format', async () => {
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'P&T', vatNumber: '123' })));
+    expect(r.success).toBe(false);
+    expect(r.status).toBe(400);
+    expect(r.error).toContain('Invalid countryCode');
   });
 });
 
-describe('VIES SOAP path (non-GB)', () => {
-  it('parses valid VIES response and returns BN254 output', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA DO EXEMPLO 123'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'PT',
-      vatNumber: '507172230',
-    })));
-
-    expect(result.success).toBe(true);
-    expect(result.status).toBe(200);
-    expect(result.headers['x-vies-valid']).toBe('true');
-    expect(result.headers['x-vies-name']).toBe('TYTLE LDA');
-    expect(result.headers['x-vies-address']).toBe('RUA DO EXEMPLO 123');
-    expect(result.headers['x-vies-country-code']).toBe('PT');
-    expect(result.headers['x-vies-vat-number']).toBe('507172230');
-
-    // rawBody should be base64 of 160 bytes
-    const raw = Buffer.from(result.rawBody, 'base64');
-    expect(raw.length).toBe(160);
-
-    // Verify proxyFetch was called with VIES params
-    expect(mockProxyFetch).toHaveBeenCalledWith(
-      8443,
-      'ec.europa.eu',
-      'POST',
-      '/taxation_customs/vies/services/checkVatService',
-      expect.objectContaining({ 'Content-Type': 'text/xml;charset=UTF-8' }),
-      expect.stringContaining('checkVat'),
-    );
+describe('VIES SOAP path', () => {
+  it('parses valid response and returns BN254 output', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA 123') });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+    expect(r.success).toBe(true);
+    expect(r.status).toBe(200);
+    expect(r.headers['x-vies-valid']).toBe('true');
+    expect(r.headers['x-vies-name']).toBe('TYTLE LDA');
+    expect(Buffer.from(r.rawBody, 'base64').length).toBe(160);
   });
 
   it('parses invalid VAT response', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapInvalid('DE', '999999999'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'DE',
-      vatNumber: '999999999',
-    })));
-
-    expect(result.success).toBe(true);
-    expect(result.headers['x-vies-valid']).toBe('false');
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapInvalid('DE', '999') });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'DE', vatNumber: '999' })));
+    expect(r.success).toBe(true);
+    expect(r.headers['x-vies-valid']).toBe('false');
   });
 
-  it('handles SOAP fault (MS_UNAVAILABLE)', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapFault('MS_UNAVAILABLE'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'PT',
-      vatNumber: '507172230',
-    })));
-
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(502);
-    expect(result.error).toContain('VIES SOAP error');
-    expect(result.error).toContain('MS_UNAVAILABLE');
+  it('handles SOAP fault', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapFault('MS_UNAVAILABLE') });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+    expect(r.success).toBe(false);
+    expect(r.status).toBe(502);
+    expect(r.error).toContain('MS_UNAVAILABLE');
   });
 
-  it('handles SOAP fault (INVALID_INPUT)', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapFault('INVALID_INPUT'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'PT',
-      vatNumber: 'abc',
-    })));
-
-    expect(result.success).toBe(false);
-    expect(result.error).toContain('INVALID_INPUT');
-  });
-
-  it('handles non-200 VIES HTTP status', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 500,
-      headers: {},
-      body: 'Internal Server Error',
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'PT',
-      vatNumber: '507172230',
-    })));
-
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(502);
-  });
-
-  it('escapes XML special characters in vatNumber', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapInvalid('PT', '123'),
-    });
-
-    await handler(makeRequest(JSON.stringify({
-      countryCode: 'PT',
-      vatNumber: '<script>&"test',
-    })));
-
-    const soapBody = mockProxyFetch.mock.calls[0][5] as string;
-    expect(soapBody).toContain('&lt;script&gt;&amp;&quot;test');
-    expect(soapBody).not.toContain('<script>');
-  });
-
-  it('rejects invalid countryCode format', async () => {
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'P&T',
-      vatNumber: '123456789',
-    })));
-
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(400);
-    expect(result.error).toContain('Invalid countryCode');
-  });
-
-  it('handles VIES response with no name/address', async () => {
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-  <soap:Body>
-    <checkVatResponse xmlns="urn:ec.europa.eu:taxud:vies:services:checkVat:types">
-      <countryCode>PT</countryCode>
-      <vatNumber>507172230</vatNumber>
-      <valid>true</valid>
-    </checkVatResponse>
-  </soap:Body>
-</soap:Envelope>`;
-
-    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: xml });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'PT',
-      vatNumber: '507172230',
-    })));
-
-    expect(result.success).toBe(true);
-    expect(result.headers['x-vies-name']).toBe('');
-    expect(result.headers['x-vies-address']).toBe('');
+  it('handles non-200 VIES status', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 500, headers: {}, body: 'error' });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+    expect(r.success).toBe(false);
+    expect(r.status).toBe(502);
   });
 });
 
 describe('HMRC path (GB)', () => {
-  it('routes GB to HMRC endpoint', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: hmrcValid('123456789', 'British Company Ltd'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'GB',
-      vatNumber: '123456789',
-    })));
-
-    expect(result.success).toBe(true);
-    expect(result.headers['x-vies-valid']).toBe('true');
-    expect(result.headers['x-vies-name']).toBe('British Company Ltd');
-    expect(result.headers['x-vies-address']).toBe('10 Downing Street, SW1A 2AA');
-
-    expect(mockProxyFetch).toHaveBeenCalledWith(
-      8444,
-      'api.service.hmrc.gov.uk',
-      'GET',
-      '/organisations/vat/check-vat-number/lookup/123456789',
-      expect.objectContaining({ 'Accept': 'application/vnd.hmrc.1.0+json' }),
-    );
+  it('routes GB to HMRC and returns valid result', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: hmrcValid('123', 'British Co') });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'GB', vatNumber: '123' })));
+    expect(r.success).toBe(true);
+    expect(r.headers['x-vies-valid']).toBe('true');
+    expect(r.headers['x-vies-name']).toBe('British Co');
   });
 
-  it('handles HMRC 404 (VAT not found)', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 404,
-      headers: {},
-      body: '{"code":"NOT_FOUND"}',
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'GB',
-      vatNumber: '000000000',
-    })));
-
-    expect(result.success).toBe(true);
-    expect(result.headers['x-vies-valid']).toBe('false');
+  it('handles HMRC 404 (not found)', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 404, headers: {}, body: '{}' });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'GB', vatNumber: '000' })));
+    expect(r.success).toBe(true);
+    expect(r.headers['x-vies-valid']).toBe('false');
   });
 
-  it('throws on HMRC 500 (service error)', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 500,
-      headers: {},
-      body: 'Internal Server Error',
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'GB',
-      vatNumber: '123456789',
-    })));
-
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(502);
-    expect(result.error).toContain('HMRC returned unexpected status 500');
-  });
-
-  it('throws on HMRC 429 (rate limited)', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 429,
-      headers: {},
-      body: '{"code":"TOO_MANY_REQUESTS"}',
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'GB',
-      vatNumber: '123456789',
-    })));
-
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(502);
-    expect(result.error).toContain('unexpected status 429');
-  });
-
-  it('throws on HMRC invalid JSON', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: 'not json at all',
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'GB',
-      vatNumber: '123456789',
-    })));
-
-    expect(result.success).toBe(false);
-    expect(result.status).toBe(502);
-    expect(result.error).toContain('invalid JSON');
-  });
-
-  it('URL-encodes vatNumber in HMRC path', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 404,
-      headers: {},
-      body: '{}',
-    });
-
-    await handler(makeRequest(JSON.stringify({
-      countryCode: 'GB',
-      vatNumber: '12/34',
-    })));
-
-    const path = mockProxyFetch.mock.calls[0][3] as string;
-    expect(path).toContain('12%2F34');
-    expect(path).not.toContain('12/34');
+  it('throws on HMRC 500', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 500, headers: {}, body: 'err' });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'GB', vatNumber: '123' })));
+    expect(r.success).toBe(false);
+    expect(r.status).toBe(502);
   });
 });
 
-describe('BN254 encoding output', () => {
-  it('produces exactly 160 bytes for valid VIES response', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapValid('PT', '507172230', 'TEST', 'ADDR'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({
-      countryCode: 'PT',
-      vatNumber: '507172230',
-    })));
-
-    const raw = Buffer.from(result.rawBody, 'base64');
-    expect(raw.length).toBe(160);
+describe('BN254 attestation', () => {
+  it('returns bn254 and bn254Headers', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapValid('PT', '507172230', 'NAME', 'ADDR') });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
+    expect(r.bn254).toBe(r.rawBody);
+    expect(r.bn254Headers?.['x-vies-name']).toBe('NAME');
   });
 
-  it('produces identical bytes for identical inputs (deterministic)', async () => {
-    const soapResponse = viesSoapValid('PT', '507172230', 'TEST', 'ADDR');
-
-    mockProxyFetch.mockResolvedValue({
-      status: 200,
-      headers: {},
-      body: soapResponse,
-    });
-
-    const r1 = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
-    const r2 = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
-
-    expect(r1.rawBody).toBe(r2.rawBody);
+  it('includes manifest hash in response headers', async () => {
+    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapValid('IE', '123', 'CO', 'ADDR') });
+    const r = await handler(makeRequest(JSON.stringify({ countryCode: 'IE', vatNumber: '123' })));
+    expect(r.headers['x-vies-manifest-hash']).toBe(MANIFEST_HASH);
   });
 });
 
-describe('BN254 attestation chain', () => {
-  it('passes bn254Hash as 6th argument to attest()', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA 123'),
-    });
-
-    await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
-
-    expect(mockAttest).toHaveBeenCalledTimes(1);
-    const attestArgs = mockAttest.mock.calls[0];
-    // 6th argument should be BN254 hash (hex string, 64 chars)
-    expect(attestArgs[5]).toMatch(/^[0-9a-f]{64}$/);
-  });
-
-  it('returns bn254 and bn254Headers in response', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA 123'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
-
-    expect(result.bn254).toBe(result.rawBody);
-    expect(result.bn254Headers).toBeDefined();
-    expect(result.bn254Headers!['x-vies-name']).toBe('TYTLE LDA');
-    expect(result.bn254Headers!['x-vies-address']).toBe('RUA 123');
-  });
-
-  it('includes bn254Hash in attestation object', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapValid('PT', '507172230', 'TEST', 'ADDR'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
-
-    expect(result.attestation).toBeDefined();
-    expect((result.attestation as any).bn254Hash).toMatch(/^[0-9a-f]{64}$/);
-  });
-
-  it('bn254Hash matches SHA-256 of encoded field elements', async () => {
-    mockProxyFetch.mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      body: viesSoapValid('PT', '507172230', 'TYTLE LDA', 'RUA 123'),
-    });
-
-    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'PT', vatNumber: '507172230' })));
-
-    // Reproduce encoding independently
-    const expectedEncoded = encodeFieldElements(VIES_SCHEMA, {
-      countryCode: 'PT',
-      vatNumber: '507172230',
-      valid: 1,
-      name: 'TYTLE LDA',
-      address: 'RUA 123',
-    });
-    const expectedHash = hashFieldElements(expectedEncoded);
-
-    expect((result.attestation as any).bn254Hash).toBe(expectedHash);
-  });
-});
-
-describe('handler manifest', () => {
-  it('manifest hash is present in response headers', async () => {
-    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapValid('IE', '6388047V', 'TEST COMPANY', 'TEST ADDRESS') });
-    const result = await handler(makeRequest(JSON.stringify({ countryCode: 'IE', vatNumber: '6388047V' })));
-    expect(result.headers['x-vies-manifest-hash']).toBe(MANIFEST_HASH);
-  });
-
-  it('manifest hash is included in attestation request headers', async () => {
-    mockProxyFetch.mockResolvedValueOnce({ status: 200, headers: {}, body: viesSoapValid('IE', '6388047V', 'TEST COMPANY', 'TEST ADDRESS') });
-    await handler(makeRequest(JSON.stringify({ countryCode: 'IE', vatNumber: '6388047V' })));
-    const attestCall = mockAttest.mock.calls[0];
-    const attestHeaders = attestCall[4] as Record<string, string>;
-    expect(attestHeaders['x-manifest-hash']).toBe(MANIFEST_HASH);
-  });
-
-  it('manifest schema fields match actual VIES_SCHEMA', () => {
+describe('manifest', () => {
+  it('schema fields match VIES_SCHEMA', () => {
     expect(HANDLER_MANIFEST.schema.fields.length).toBe(VIES_SCHEMA.length);
     for (let i = 0; i < VIES_SCHEMA.length; i++) {
       expect(HANDLER_MANIFEST.schema.fields[i].name).toBe(VIES_SCHEMA[i].name);

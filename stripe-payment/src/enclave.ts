@@ -8,16 +8,15 @@
  * attestation. Human-readable values passed via response headers.
  */
 
-import { startEnclave } from '@tytle-enclaves/shared';
-import { createStripePaymentHandler } from './stripePaymentHandler.js';
+import { startEnclave, createHandler } from '@tytle-enclaves/shared';
+import { stripePaymentHandlerDef } from './stripePaymentHandler.js';
 
-const STRIPE_HOST = { hostname: 'api.stripe.com', vsockProxyPort: 8446 };
+const hosts = [
+  { hostname: 'api.stripe.com', vsockProxyPort: 8446 },
+];
 
 startEnclave({
   name: 'stripe-payment',
-  hosts: [STRIPE_HOST],
-  customHandler: createStripePaymentHandler({
-    hostname: STRIPE_HOST.hostname,
-    vsockPort: STRIPE_HOST.vsockProxyPort,
-  }),
+  hosts,
+  customHandler: createHandler(stripePaymentHandlerDef, hosts),
 });

@@ -9,6 +9,9 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
+    "@tytle-enclaves/native": "file:../native",
+    "@tytle-enclaves/shared": "file:../shared",
+    "cbor": "9.0.2",
     "express": "^4.21.0"
   },
   "devDependencies": {

@@ -20,7 +20,7 @@ docker buildx build \
   --platform linux/amd64 \
   -t "tytle-enclave-parent:${IMAGE_TAG}" \
   -f "${SCRIPT_DIR}/Dockerfile" \
-  "$SCRIPT_DIR"
+  "$REPO_DIR"
 
 IMAGE_DIGEST=$(docker inspect --format='{{.Id}}' "tytle-enclave-parent:${IMAGE_TAG}")
 echo "Image built: tytle-enclave-parent:${IMAGE_TAG}"

@@ -9,19 +9,16 @@
  * via response headers.
  */
 
-import { startEnclave } from '@tytle-enclaves/shared';
-import { createMoneriumPaymentHandler } from './moneriumPaymentHandler.js';
+import { startEnclave, createHandler } from '@tytle-enclaves/shared';
+import { moneriumPaymentHandlerDef } from './moneriumPaymentHandler.js';
 
-const MONERIUM_HOST = { hostname: 'api.monerium.app', vsockProxyPort: 8447 };
-const RPC_HOST = { hostname: 'rpc.gnosischain.com', vsockProxyPort: 8448 };
+const hosts = [
+  { hostname: 'api.monerium.app', vsockProxyPort: 8447 },
+  { hostname: 'rpc.gnosischain.com', vsockProxyPort: 8448 },
+];
 
 startEnclave({
   name: 'monerium-payment',
-  hosts: [MONERIUM_HOST, RPC_HOST],
-  customHandler: createMoneriumPaymentHandler({
-    moneriumHostname: MONERIUM_HOST.hostname,
-    moneriumVsockPort: MONERIUM_HOST.vsockProxyPort,
-    rpcHostname: RPC_HOST.hostname,
-    rpcVsockPort: RPC_HOST.vsockProxyPort,
-  }),
+  hosts,
+  customHandler: createHandler(moneriumPaymentHandlerDef, hosts),
 });

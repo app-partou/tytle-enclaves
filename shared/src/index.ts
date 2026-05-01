@@ -27,3 +27,14 @@ export type {
   RepeatabilityDef, HandlerManifest,
 } from './manifest.js';
 export { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from './policies.js';
+export { toErrorMessage } from './errorUtils.js';
+export { sanitizeError, stripSensitiveHeaders } from './sanitize.js';
+export { proxyFetchWithRetry } from './retryProxy.js';
+export type { RetryConfig } from './retryProxy.js';
+export { shouldSkipAttestation, getAttestOverrides, getHeadersToStrip, redactError } from './policyEngine.js';
+export { createHandler } from './handlerFactory.js';
+export type { HandlerDef, HandlerResult, HandlerContext } from './handlerFactory.js';
+export { readMessage, writeMessage } from './protocol.js';
+export type { MessageStream } from './protocol.js';
+export { createLogger } from './logger.js';
+export type { Logger } from './logger.js';

@@ -8,18 +8,11 @@
  * Request body:  { countryCode: string, vatNumber: string }
  * Response:      BN254-encoded field elements (5 x 32 = 160 bytes, base64)
  *                + human-readable headers (x-vies-*)
- *
- * VIES_SCHEMA:
- *   [0..31]   countryCode   shortString
- *   [32..63]  vatNumber     shortString
- *   [64..95]  valid         uint (1 = valid, 0 = invalid)
- *   [96..127] name          sha256 (0 if absent)
- *   [128..159] address      sha256 (0 if absent)
  */
 
-import { proxyFetch, errorResponse, encodeBn254AndAttest, VIES_SCHEMA } from '@tytle-enclaves/shared';
-import type { EnclaveRequest, EnclaveResponse } from '@tytle-enclaves/shared';
-import { MANIFEST_HASH } from './manifest.js';
+import { VIES_SCHEMA } from '@tytle-enclaves/shared';
+import type { HandlerDef, HandlerResult, HandlerContext } from '@tytle-enclaves/shared';
+import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
 
 // =============================================================================
 // SOAP Helpers
@@ -73,13 +66,10 @@ function parseHmrcResponse(json: string, status: number): {
   name?: string;
   address?: string;
 } {
-  // 404 = VAT number not found (definitive invalid)
   if (status === 404) {
     return { valid: false };
   }
 
-  // Non-200 statuses (500, 429, 503, etc.) are service errors — throw so the
-  // enclave returns a 502 instead of silently marking the VAT as invalid.
   if (status !== 200) {
     throw new Error(`HMRC returned unexpected status ${status}`);
   }
@@ -104,133 +94,110 @@ function parseHmrcResponse(json: string, status: number): {
 }
 
 // =============================================================================
-// Custom Handler
+// Handler Definition
 // =============================================================================
 
-interface ViesHandlerConfig {
-  viesHostname: string;
-  viesVsockPort: number;
-  hmrcHostname: string;
-  hmrcVsockPort: number;
+interface ViesParams {
+  countryCode: string;
+  vatNumber: string;
 }
 
-export function createViesHandler(cfg: ViesHandlerConfig) {
-  return async (request: EnclaveRequest): Promise<EnclaveResponse> => {
-    try {
-      // Parse request
-      let countryCode: string;
-      let vatNumber: string;
-      try {
-        const body = JSON.parse(request.body || '{}');
-        countryCode = body.countryCode;
-        vatNumber = body.vatNumber;
-      } catch {
-        return errorResponse(400, 'Invalid request body — expected JSON with { countryCode, vatNumber }');
-      }
+export const viesHandlerDef: HandlerDef<ViesParams> = {
+  name: 'vies',
+  schema: VIES_SCHEMA,
+  manifestHash: MANIFEST_HASH,
+  policies: HANDLER_MANIFEST.policies,
+  requiredHosts: ['ec.europa.eu', 'api.service.hmrc.gov.uk'],
 
-      if (!countryCode || !vatNumber) {
-        return errorResponse(400, 'Both countryCode and vatNumber are required');
-      }
+  parseParams(body: unknown): ViesParams {
+    const b = body as Record<string, unknown>;
+    const countryCode = b.countryCode as string | undefined;
+    const vatNumber = b.vatNumber as string | undefined;
 
-      // Validate countryCode format: 2-letter ISO alpha code
-      if (!/^[A-Z]{2}$/.test(countryCode)) {
-        return errorResponse(400, `Invalid countryCode: "${countryCode}" — must be 2-letter uppercase ISO code`);
-      }
+    if (!countryCode || !vatNumber) {
+      throw new Error('Both countryCode and vatNumber are required');
+    }
+    if (!/^[A-Z]{2}$/.test(countryCode)) {
+      throw new Error(`Invalid countryCode: "${countryCode}" - must be 2-letter uppercase ISO code`);
+    }
 
-      // Route to VIES or HMRC
-      let valid: boolean;
-      let name: string | undefined;
-      let address: string | undefined;
-      let apiEndpoint: string;
+    return { countryCode, vatNumber };
+  },
 
-      if (countryCode === 'GB') {
-        // HMRC REST
-        const path = `/organisations/vat/check-vat-number/lookup/${encodeURIComponent(vatNumber)}`;
-        apiEndpoint = `${cfg.hmrcHostname}${path}`;
+  async execute(params: ViesParams, ctx: HandlerContext): Promise<HandlerResult> {
+    const { countryCode, vatNumber } = params;
+    const isHmrc = countryCode === 'GB';
 
-        const response = await proxyFetch(
-          cfg.hmrcVsockPort,
-          cfg.hmrcHostname,
-          'GET',
-          path,
-          { 'Accept': 'application/vnd.hmrc.1.0+json' },
-        );
+    const viesHost = ctx.hosts.find((h) => h.hostname === 'ec.europa.eu')!;
+    const hmrcHost = ctx.hosts.find((h) => h.hostname === 'api.service.hmrc.gov.uk')!;
 
-        const parsed = parseHmrcResponse(response.body, response.status);
-        valid = parsed.valid;
-        name = parsed.name;
-        address = parsed.address;
-      } else {
-        // VIES SOAP
-        const soapBody = buildCheckVatSoapRequest(countryCode, vatNumber);
-        const path = '/taxation_customs/vies/services/checkVatService';
-        apiEndpoint = `${cfg.viesHostname}${path}`;
+    let valid: boolean;
+    let name: string | undefined;
+    let address: string | undefined;
+    let apiEndpoint: string;
 
-        const response = await proxyFetch(
-          cfg.viesVsockPort,
-          cfg.viesHostname,
-          'POST',
-          path,
-          {
-            'Content-Type': 'text/xml;charset=UTF-8',
-            'SOAPAction': '',
-          },
-          soapBody,
-        );
+    if (isHmrc) {
+      const path = `/organisations/vat/check-vat-number/lookup/${encodeURIComponent(vatNumber)}`;
+      apiEndpoint = `${hmrcHost.hostname}${path}`;
 
-        // Check for SOAP faults (match XML tag, not substring — avoids
-        // false positives on company names containing "Fault")
-        const hasSoapFault = /<(?:\w+:)?Fault[\s>\/]/.test(response.body);
-        if (hasSoapFault || response.status !== 200) {
-          // Extract fault string for error reporting
-          const faultMatch = response.body.match(/<(?:\w+:)?faultstring>([^<]*)<\/(?:\w+:)?faultstring>/);
-          const faultCode = faultMatch?.[1] || `HTTP ${response.status}`;
-          throw new Error(`VIES SOAP error: ${faultCode}`);
-        }
-
-        const parsed = parseCheckVatSoapResponse(response.body);
-        valid = parsed.valid;
-        name = parsed.name;
-        address = parsed.address;
-      }
-
-      // Encode as BN254 field elements + attest
-      const isHmrc = countryCode === 'GB';
-      const result = await encodeBn254AndAttest(
-        VIES_SCHEMA,
-        { countryCode, vatNumber, valid: valid ? 1 : 0, name: name || null, address: address || null },
-        {
-          apiEndpoint,
-          method: isHmrc ? 'GET' : 'POST',
-          url: isHmrc
-            ? `https://${cfg.hmrcHostname}/organisations/vat/check-vat-number/lookup/${vatNumber}`
-            : `https://${cfg.viesHostname}/taxation_customs/vies/services/checkVatService`,
-          requestHeaders: { countryCode, vatNumber, 'x-manifest-hash': MANIFEST_HASH },
-        },
+      const response = await ctx.fetch(
+        hmrcHost, 'GET', path,
+        { 'Accept': 'application/vnd.hmrc.1.0+json' },
       );
 
-      return {
-        success: true,
-        status: 200,
-        headers: {
-          'x-vies-country-code': countryCode,
-          'x-vies-vat-number': vatNumber,
-          'x-vies-valid': String(valid),
-          'x-vies-name': name || '',
-          'x-vies-address': address || '',
-          'x-vies-manifest-hash': MANIFEST_HASH,
-        },
-        rawBody: result.rawBody,
-        attestation: result.attestation,
-        bn254: result.rawBody,
-        bn254Headers: {
-          'x-vies-name': name || '',
-          'x-vies-address': address || '',
-        },
-      };
-    } catch (err: any) {
-      console.error(`[vies-handler] Error: ${err.message}`);
-      return errorResponse(502, err.message);
+      const parsed = parseHmrcResponse(response.body, response.status);
+      valid = parsed.valid;
+      name = parsed.name;
+      address = parsed.address;
+    } else {
+      const soapBody = buildCheckVatSoapRequest(countryCode, vatNumber);
+      const path = '/taxation_customs/vies/services/checkVatService';
+      apiEndpoint = `${viesHost.hostname}${path}`;
+
+      const response = await ctx.fetch(
+        viesHost, 'POST', path,
+        { 'Content-Type': 'text/xml;charset=UTF-8', 'SOAPAction': '' },
+        soapBody,
+      );
+
+      const hasSoapFault = /<(?:\w+:)?Fault[\s>\/]/.test(response.body);
+      if (hasSoapFault || response.status !== 200) {
+        const faultMatch = response.body.match(/<(?:\w+:)?faultstring>([^<]*)<\/(?:\w+:)?faultstring>/);
+        const faultCode = faultMatch?.[1] || `HTTP ${response.status}`;
+        throw new Error(`VIES SOAP error: ${faultCode}`);
+      }
+
+      const parsed = parseCheckVatSoapResponse(response.body);
+      valid = parsed.valid;
+      name = parsed.name;
+      address = parsed.address;
     }
-  };
-}
+
+    return {
+      values: {
+        countryCode,
+        vatNumber,
+        valid: valid ? 1 : 0,
+        name: name || null,
+        address: address || null,
+      },
+      apiEndpoint,
+      method: isHmrc ? 'GET' : 'POST',
+      url: isHmrc
+        ? `https://${hmrcHost.hostname}/organisations/vat/check-vat-number/lookup/${vatNumber}`
+        : `https://${viesHost.hostname}/taxation_customs/vies/services/checkVatService`,
+      requestHeaders: { countryCode, vatNumber },
+      responseHeaders: {
+        'x-vies-country-code': countryCode,
+        'x-vies-vat-number': vatNumber,
+        'x-vies-valid': String(valid),
+        'x-vies-name': name || '',
+        'x-vies-address': address || '',
+      },
+      bn254Headers: {
+        'x-vies-name': name || '',
+        'x-vies-address': address || '',
+      },
+    };
+  },
+};

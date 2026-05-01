@@ -13,11 +13,20 @@
  */
 
 import * as tls from 'node:tls';
+import { Duplex } from 'node:stream';
 import { VsockStream } from '@tytle-enclaves/native';
 import { VsockDuplex } from './vsockStream.js';
 
 /** CID 3 = host parent from inside the enclave */
 const HOST_CID = 3;
+
+/**
+ * Per-hostname TLS session cache for session resumption.
+ * Avoids a full TLS handshake on subsequent requests to the same host.
+ * Bounded naturally: each enclave has 1-2 fixed hosts.
+ * Node.js TLS falls back to a full handshake if a cached ticket is rejected.
+ */
+const tlsSessionCache = new Map<string, Buffer>();
 
 export interface HttpResponse {
   status: number;
@@ -59,15 +68,16 @@ export async function proxyFetch(
       const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
       duplex = new VsockDuplex(vsockRaw);
 
-      // Step 2: TLS handshake over vsock tunnel
+      // Step 2: TLS handshake over vsock tunnel (with session resumption)
       const tlsSocket = tls.connect(
         {
-          socket: duplex as any,
+          socket: duplex as Duplex,
           servername: hostname,
-          rejectUnauthorized: true, // Mandatory — validates server cert against CA bundle
+          rejectUnauthorized: true,
+          session: tlsSessionCache.get(hostname),
         },
         () => {
-          // TLS handshake complete — send HTTP request
+          // TLS handshake complete - send HTTP request
           // Host and Connection are set AFTER spread to prevent caller override
           const reqHeaders = {
             ...headers,
@@ -95,7 +105,12 @@ export async function proxyFetch(
         },
       );
 
-      // Step 3: Collect response (as bytes — decode to string after de-chunking)
+      // Cache TLS session ticket for resumption on next connection
+      tlsSocket.on('session', (session: Buffer) => {
+        tlsSessionCache.set(hostname, session);
+      });
+
+      // Step 3: Collect response (as bytes - decode to string after de-chunking)
       const chunks: Buffer[] = [];
       tlsSocket.on('data', (chunk: Buffer) => {
         chunks.push(chunk);
@@ -128,11 +143,15 @@ export async function proxyFetch(
 /**
  * Make a plain HTTP request through a vsock-proxy tunnel (no TLS).
  *
- * Same as proxyFetch but skips the TLS handshake — writes raw HTTP directly
+ * Same as proxyFetch but skips the TLS handshake - writes raw HTTP directly
  * to the VsockDuplex stream. Use for HTTP-only hosts (e.g., www.sicae.pt).
  *
- * WARNING: Without TLS the host can read and modify traffic in transit.
- * Only appropriate for public, non-sensitive data.
+ * TRUST MODEL: Without TLS, the host vsock-proxy sees plaintext traffic and
+ * could modify responses before the enclave processes them. The attestation
+ * still proves which code ran (PCR0) and which host was contacted, but
+ * CANNOT prove the response was not tampered by the host operating system.
+ * Only appropriate for public, non-sensitive data where integrity can be
+ * cross-verified through other sources.
  */
 export async function proxyFetchPlain(
   vsockPort: number,

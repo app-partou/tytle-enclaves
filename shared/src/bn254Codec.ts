@@ -6,11 +6,17 @@
  * encoder produces deterministic bytes consumable by ZK circuits.
  *
  * Field encoding types:
- *   shortString — UTF-8 string as BigInt (recoverable, must be < 31 bytes)
- *   sha256      — SHA-256 hash mod BN254_MODULUS (not recoverable, for long values)
- *   uint        — Numeric value as field element directly (booleans, counts, etc.)
+ *   shortString - UTF-8 string as BigInt (recoverable, must be < 31 bytes)
+ *   sha256      - SHA-256 hash mod BN254_MODULUS (not recoverable, for long values)
+ *   uint        - Numeric value as field element directly (booleans, counts, etc.)
  *
  * Output: N fields x 32 bytes, big-endian, fixed offsets.
+ *
+ * SCHEMA DUPLICATION NOTE: The schema constants below are duplicated in the main
+ * repo at packages/attestation-core/src/bn254Schemas.ts. This submodule is a
+ * standalone public repo (app-partou/tytle-enclaves) and cannot import from the
+ * main repo. Any schema change here MUST be mirrored there.
+ * Parity is enforced by: packages/attestation-core/src/__tests__/bn254SchemaParity.test.ts
  */
 
 import crypto from 'node:crypto';

@@ -1,12 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Import real codec directly (bypasses barrel re-export that pulls in native)
-import { encodeFieldElements, hashFieldElements, SICAE_SCHEMA } from '../../node_modules/@tytle-enclaves/shared/src/bn254Codec.js';
-import { stableStringify, computeManifestHash, validateManifest } from '../../node_modules/@tytle-enclaves/shared/src/manifest.js';
+import { encodeFieldElements, hashFieldElements, SICAE_SCHEMA } from '../../../shared/src/bn254Codec.js';
+import { stableStringify, computeManifestHash, validateManifest } from '../../../shared/src/manifest.js';
+import { toErrorMessage } from '../../../shared/src/errorUtils.js';
+import { getHeadersToStrip, redactError } from '../../../shared/src/policyEngine.js';
+import { stripSensitiveHeaders } from '../../../shared/src/sanitize.js';
+import { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from '../../../shared/src/policies.js';
 
 // vi.hoisted runs before vi.mock hoisting — safe to reference in factory
-const { mockProxyFetchPlain, mockAttest } = vi.hoisted(() => ({
-  mockProxyFetchPlain: vi.fn(),
+const { mockProxyFetch, mockAttest } = vi.hoisted(() => ({
+  mockProxyFetch: vi.fn(),
   mockAttest: vi.fn().mockResolvedValue({
     attestationId: 'test-att-id',
     responseHash: 'deadbeef',
@@ -16,46 +20,89 @@ const { mockProxyFetchPlain, mockAttest } = vi.hoisted(() => ({
   }),
 }));
 
-// Mock @tytle-enclaves/shared — provide real codec + mocked proxyFetchPlain/attest
-vi.mock('@tytle-enclaves/shared', () => ({
-  encodeFieldElements,
-  hashFieldElements,
-  SICAE_SCHEMA,
-  stableStringify,
-  computeManifestHash,
-  validateManifest,
-  proxyFetchPlain: mockProxyFetchPlain,
-  attest: mockAttest,
-  errorResponse: (status: number, error: string, headers: Record<string, string> = {}) =>
-    ({ success: false, status, headers, rawBody: '', error }),
-  encodeBn254AndAttest: async (
-    schema: any, values: any, args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
+// Mock @tytle-enclaves/shared — provide real codec + mocked proxyFetch/attest
+vi.mock('@tytle-enclaves/shared', () => {
+  const errorResponse = (status: number, error: string, headers: Record<string, string> = {}) =>
+    ({ success: false, status, headers, rawBody: '', error });
+
+  const encodeBn254AndAttest = async (
+    schema: unknown[], values: Record<string, unknown>,
+    args: { apiEndpoint: string; method: string; url: string; requestHeaders: Record<string, string> },
   ) => {
-    const encodedBytes = encodeFieldElements(schema, values);
+    const encodedBytes = encodeFieldElements(schema as Parameters<typeof encodeFieldElements>[0], values);
     const rawBody = encodedBytes.toString('base64');
     const bn254Hash = hashFieldElements(encodedBytes);
     const attestation = await mockAttest(args.apiEndpoint, args.method, rawBody, args.url, args.requestHeaders, bn254Hash);
     return { rawBody, bn254Hash, attestation: { ...attestation, bn254Hash } };
-  },
-}));
+  };
 
-import { createSicaeHandler } from '../sicaeHandler.js';
-import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
+  // Inline createHandler that mirrors the real factory but uses mocked I/O
+  const createHandler = (def: Record<string, unknown>, hosts: Array<{ hostname: string; vsockProxyPort: number; tls?: boolean }>) => {
+    const hToStrip = getHeadersToStrip((def.policies || []) as Parameters<typeof getHeadersToStrip>[0]);
+    const noop = () => {};
+    const ctx = {
+      hosts,
+      log: { info: noop, warn: noop, error: noop },
+      fetch: (host: { vsockProxyPort: number; hostname: string }, method: string, path: string, headers: Record<string, string>, body?: string) =>
+        mockProxyFetch(host.vsockProxyPort, host.hostname, method, path, headers, body),
+      fetchWithRetry: (host: { vsockProxyPort: number; hostname: string }, method: string, path: string, headers: Record<string, string>, body?: string) =>
+        mockProxyFetch(host.vsockProxyPort, host.hostname, method, path, headers, body),
+    };
+    return async (request: { body?: string }) => {
+      try {
+        let params: unknown;
+        try {
+          const body = JSON.parse(request.body || '{}');
+          params = (def.parseParams as (b: unknown) => unknown)(body);
+        } catch (err: unknown) {
+          return errorResponse(400, `Invalid request: ${toErrorMessage(err)}`);
+        }
+        const result = await (def.execute as (p: unknown, c: unknown) => Promise<Record<string, unknown>>)(params, ctx);
+        if (result.rawPassthrough) return { success: true, ...(result.rawPassthrough as Record<string, unknown>) };
+        if (result.skipAttestation) return { success: true, status: result.status ?? 200, headers: result.responseHeaders, rawBody: '' };
+        const attestHeaders = hToStrip.length > 0
+          ? stripSensitiveHeaders(result.requestHeaders as Record<string, string>, hToStrip)
+          : result.requestHeaders as Record<string, string>;
+        const attestResult = await encodeBn254AndAttest(
+          def.schema as unknown[], result.values as Record<string, unknown>,
+          {
+            apiEndpoint: result.apiEndpoint as string, method: result.method as string,
+            url: result.url as string,
+            requestHeaders: { ...attestHeaders, 'x-manifest-hash': def.manifestHash as string },
+          },
+        );
+        return {
+          success: true, status: result.status ?? 200,
+          headers: { ...(result.responseHeaders as Record<string, string>), [`x-${def.name}-manifest-hash`]: def.manifestHash },
+          rawBody: attestResult.rawBody, attestation: attestResult.attestation,
+          bn254: attestResult.rawBody, bn254Headers: result.bn254Headers,
+        };
+      } catch (err: unknown) {
+        return errorResponse(502, redactError((def.policies || []) as Parameters<typeof redactError>[0], toErrorMessage(err)));
+      }
+    };
+  };
 
-interface EnclaveRequest {
-  id: string;
-  url: string;
-  method: string;
-  headers: Record<string, string>;
-  body: string;
-}
-
-const handler = createSicaeHandler({
-  hostname: 'www.sicae.pt',
-  vsockProxyPort: 8445,
+  return {
+    encodeFieldElements, hashFieldElements, SICAE_SCHEMA,
+    stableStringify, computeManifestHash, validateManifest,
+    toErrorMessage, getHeadersToStrip, redactError, stripSensitiveHeaders,
+    SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER,
+    proxyFetch: mockProxyFetch, proxyFetchPlain: mockProxyFetch,
+    proxyFetchWithRetry: mockProxyFetch,
+    attest: mockAttest, errorResponse, encodeBn254AndAttest, createHandler,
+  };
 });
 
-function makeRequest(body: string): EnclaveRequest {
+import { sicaeHandlerDef } from '../sicaeHandler.js';
+import { createHandler } from '@tytle-enclaves/shared';
+import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
+
+const hosts = [{ hostname: 'www.sicae.pt', vsockProxyPort: 8445, tls: false as const }];
+
+const handler = createHandler(sicaeHandlerDef as Parameters<typeof createHandler>[0], hosts);
+
+function makeRequest(body: string) {
   return {
     id: 'test-request-id',
     url: 'http://www.sicae.pt/Consulta.aspx',
@@ -87,18 +134,18 @@ const RESULT_513032525 = `<!DOCTYPE html>
 <input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="def456" />
 <table class="gridMain" cellspacing="0" border="0" id="ctl00_MainContent_ConsultaDataGrid" style="border-collapse:collapse;text-align: center">
 	<tr class="gridHeader">
-		<td>NIPC</td><td>Denomina\u00e7\u00e3o Social/Firma</td><td>CAE Principal</td><td>CAEs Secund\u00e1rios</td><td>Mais CAE</td>
+		<td>NIPC</td><td>Denominação Social/Firma</td><td>CAE Principal</td><td>CAEs Secundários</td><td>Mais CAE</td>
 	</tr><tr>
 		<td>513032525</td><td class="upperFirma"><div style="cursor: pointer;" title="GREEN OPPORTUNITY LDA">GREEN OPPORTUNITY LDA</div>
             </td><td>
-                    <div style="cursor: pointer;" title="Atividades de engenharia e t\u00e9cnicas afins">
+                    <div style="cursor: pointer;" title="Atividades de engenharia e técnicas afins">
                         71120</div>
                 </td><td class="centerCae">
-                    <div style="cursor: pointer; float: left; padding-left:50px;" title="Com\u00e9rcio a retalho n\u00e3o especializado, por outros m\u00e9todos, sem predomin\u00e2ncia de produtos alimentares, bebidas e tabaco">
+                    <div style="cursor: pointer; float: left; padding-left:50px;" title="Comércio a retalho não especializado, por outros métodos, sem predominância de produtos alimentares, bebidas e tabaco">
                         47126,</div>
-                    <div style="cursor: pointer; float: left; padding-left:15px;" title="Compra e venda de bens imobili\u00e1rios">
+                    <div style="cursor: pointer; float: left; padding-left:15px;" title="Compra e venda de bens imobiliários">
                         68110,</div>
-                    <div style="cursor: pointer; float: left; padding-left:15px;" title="Atividades de servi\u00e7os de intermedia\u00e7\u00e3o de atividades imobili\u00e1rias">
+                    <div style="cursor: pointer; float: left; padding-left:15px;" title="Atividades de serviços de intermediação de atividades imobiliárias">
                         68310</div>
                 </td><td>
                     <div style="cursor: pointer; float: left; padding-left:15px;" title="Ver mais CAE"><a target="_self" href='Detalhe.aspx?NIPC=513032525' > Mais CAE</a></div>
@@ -115,9 +162,9 @@ const RESULT_NO_DATA = `<!DOCTYPE html>
 <input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="def456" />
 <table class="gridMain" cellspacing="0" border="0" id="ctl00_MainContent_ConsultaDataGrid" style="border-collapse:collapse;text-align: center">
 	<tr class="gridHeader">
-		<td>NIPC</td><td>Denomina\u00e7\u00e3o Social/Firma</td><td>CAE Principal</td><td>CAEs Secund\u00e1rios</td>
+		<td>NIPC</td><td>Denominação Social/Firma</td><td>CAE Principal</td><td>CAEs Secundários</td>
 	</tr><tr>
-		<td>&nbsp;</td><td class="upperFirma"><div style="cursor: pointer;" title="N\u00e3o existem dados para o crit\u00e9rio de pesquisa indicado.">N\u00e3o existem dados para o crit\u00e9rio de pesquisa indicado.</div>
+		<td>&nbsp;</td><td class="upperFirma"><div style="cursor: pointer;" title="Não existem dados para o critério de pesquisa indicado.">Não existem dados para o critério de pesquisa indicado.</div>
             </td><td>
                     <div style="cursor: pointer;" title="">
                         </div>
@@ -139,7 +186,7 @@ const RESULT_INVALID_NIF = `<!DOCTYPE html>
 <form method="post" action="Consulta.aspx" id="form1">
 <input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="abc123" />
 <input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="def456" />
-<span id="ctl00_MainContent_lblError" class="ClassErro">O campo 'NIPC' n\u00e3o \u00e9 v\u00e1lido</span>
+<span id="ctl00_MainContent_lblError" class="ClassErro">O campo 'NIPC' não é válido</span>
 </form></body></html>`;
 
 // =============================================================================
@@ -148,20 +195,20 @@ const RESULT_INVALID_NIF = `<!DOCTYPE html>
 
 function mockSicaeFlow(resultHtml: string, cookie?: string) {
   // GET Consulta.aspx
-  mockProxyFetchPlain.mockResolvedValueOnce({
+  mockProxyFetch.mockResolvedValueOnce({
     status: 200,
     headers: cookie ? { 'set-cookie': `ASP.NET_SessionId=${cookie}; path=/; HttpOnly` } : {},
     body: CONSULTA_PAGE,
   });
   // POST with NIF — the handler tries both form variants; we mock both calls
   // returning the same result (first variant produces the result, handler stops)
-  mockProxyFetchPlain.mockResolvedValueOnce({
+  mockProxyFetch.mockResolvedValueOnce({
     status: 200,
     headers: {},
     body: resultHtml,
   });
   // Second variant (in case first doesn't match) — provide a fallback
-  mockProxyFetchPlain.mockResolvedValueOnce({
+  mockProxyFetch.mockResolvedValueOnce({
     status: 200,
     headers: {},
     body: resultHtml,
@@ -173,7 +220,7 @@ function mockSicaeFlow(resultHtml: string, cookie?: string) {
 // =============================================================================
 
 beforeEach(() => {
-  mockProxyFetchPlain.mockReset();
+  mockProxyFetch.mockReset();
   mockAttest.mockReset().mockResolvedValue({
     attestationId: 'test-att-id',
     responseHash: 'deadbeef',
@@ -188,7 +235,7 @@ describe('request validation', () => {
     const result = await handler(makeRequest('not json'));
     expect(result.success).toBe(false);
     expect(result.status).toBe(400);
-    expect(result.error).toContain('Invalid request body');
+    expect(result.error).toContain('Invalid request');
   });
 
   it('returns 400 for empty body', async () => {
@@ -247,10 +294,9 @@ describe('SICAE lookup — real HTML fixtures', () => {
     const result = await handler(makeRequest(JSON.stringify({ nif: '980494796' })));
 
     // "Not found" is a valid, definitive answer — success: true so the provider
-    // receives the 404 status instead of the enclave throwing and falling back.
+    // receives the 404 status via rawPassthrough instead of the enclave throwing.
     expect(result.success).toBe(true);
     expect(result.status).toBe(404);
-    expect(result.error).toContain('No CAE found');
     expect(result.headers['x-sicae-nif']).toBe('980494796');
   });
 
@@ -261,7 +307,6 @@ describe('SICAE lookup — real HTML fixtures', () => {
 
     expect(result.success).toBe(true);
     expect(result.status).toBe(404);
-    expect(result.error).toContain('No CAE found');
   });
 });
 
@@ -272,7 +317,7 @@ describe('HTTP flow', () => {
     await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
 
     // Second call is the POST — verify it includes the cookie
-    const postHeaders = mockProxyFetchPlain.mock.calls[1][4] as Record<string, string>;
+    const postHeaders = mockProxyFetch.mock.calls[1][4] as Record<string, string>;
     expect(postHeaders['Cookie']).toBe('ASP.NET_SessionId=sess_abc123');
   });
 
@@ -282,22 +327,22 @@ describe('HTTP flow', () => {
     await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
 
     // Verify the GET call
-    expect(mockProxyFetchPlain.mock.calls[0][0]).toBe(8445);
-    expect(mockProxyFetchPlain.mock.calls[0][1]).toBe('www.sicae.pt');
-    expect(mockProxyFetchPlain.mock.calls[0][2]).toBe('GET');
-    expect(mockProxyFetchPlain.mock.calls[0][3]).toBe('/Consulta.aspx');
+    expect(mockProxyFetch.mock.calls[0][0]).toBe(8445);
+    expect(mockProxyFetch.mock.calls[0][1]).toBe('www.sicae.pt');
+    expect(mockProxyFetch.mock.calls[0][2]).toBe('GET');
+    expect(mockProxyFetch.mock.calls[0][3]).toBe('/Consulta.aspx');
 
     // Verify the POST call
-    expect(mockProxyFetchPlain.mock.calls[1][2]).toBe('POST');
-    expect(mockProxyFetchPlain.mock.calls[1][3]).toBe('/Consulta.aspx');
-    const formBody = mockProxyFetchPlain.mock.calls[1][5] as string;
+    expect(mockProxyFetch.mock.calls[1][2]).toBe('POST');
+    expect(mockProxyFetch.mock.calls[1][3]).toBe('/Consulta.aspx');
+    const formBody = mockProxyFetch.mock.calls[1][5] as string;
     expect(formBody).toContain('513032525');
     expect(formBody).toContain('__VIEWSTATE');
     expect(formBody).toContain('__EVENTVALIDATION');
   });
 
   it('handles GET failure', async () => {
-    mockProxyFetchPlain.mockResolvedValueOnce({
+    mockProxyFetch.mockResolvedValueOnce({
       status: 503,
       headers: {},
       body: 'Service Unavailable',
@@ -306,12 +351,12 @@ describe('HTTP flow', () => {
     const result = await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
 
     expect(result.success).toBe(false);
-    expect(result.status).toBe(503);
+    expect(result.status).toBe(502);
     expect(result.error).toContain('SICAE GET failed');
   });
 
   it('handles missing __VIEWSTATE', async () => {
-    mockProxyFetchPlain.mockResolvedValueOnce({
+    mockProxyFetch.mockResolvedValueOnce({
       status: 200,
       headers: {},
       body: '<html><body>No viewstate here</body></html>',
@@ -325,7 +370,7 @@ describe('HTTP flow', () => {
   });
 
   it('handles missing __EVENTVALIDATION', async () => {
-    mockProxyFetchPlain.mockResolvedValueOnce({
+    mockProxyFetch.mockResolvedValueOnce({
       status: 200,
       headers: {},
       body: '<html><body><input type="hidden" id="__VIEWSTATE" value="abc" /></body></html>',
@@ -411,7 +456,7 @@ describe('BN254 attestation chain', () => {
     const result = await handler(makeRequest(JSON.stringify({ nif: '513032525' })));
 
     expect(result.attestation).toBeDefined();
-    expect((result.attestation as any).bn254Hash).toMatch(/^[0-9a-f]{64}$/);
+    expect((result.attestation as Record<string, unknown>).bn254Hash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('bn254Hash matches SHA-256 of encoded field elements', async () => {
@@ -431,7 +476,7 @@ describe('BN254 attestation chain', () => {
     });
     const expectedHash = hashFieldElements(expectedEncoded);
 
-    expect((result.attestation as any).bn254Hash).toBe(expectedHash);
+    expect((result.attestation as Record<string, unknown>).bn254Hash).toBe(expectedHash);
   });
 });
 
@@ -459,12 +504,12 @@ describe('manifest hash integration', () => {
   });
 
   it('manifest schema fields match SICAE_SCHEMA', () => {
-    const manifestFieldNames = HANDLER_MANIFEST.schema.fields.map((f: any) => f.name);
-    const schemaFieldNames = SICAE_SCHEMA.map((f: any) => f.name);
+    const manifestFieldNames = HANDLER_MANIFEST.schema.fields.map((f: Record<string, unknown>) => f.name);
+    const schemaFieldNames = SICAE_SCHEMA.map((f: Record<string, unknown>) => f.name);
     expect(manifestFieldNames).toEqual(schemaFieldNames);
 
     for (const field of HANDLER_MANIFEST.schema.fields) {
-      const schemaField = SICAE_SCHEMA.find((f: any) => f.name === field.name);
+      const schemaField = SICAE_SCHEMA.find((f: Record<string, unknown>) => f.name === field.name);
       expect(schemaField).toBeDefined();
       expect(field.encoding).toBe(schemaField!.encoding);
     }

@@ -28,8 +28,8 @@ import type { PolicyDef } from './manifest.js';
  */
 export const SKIP_TRANSIENT_ERRORS: PolicyDef = {
   id: 'skip_transient_errors',
-  check: { type: 'status_skip', codes: [400, 401, 403, 429, 500, 502, 503], except: [404] },
-  reason: 'Transient HTTP errors are not attested',
+  check: { type: 'status_skip', codes: [400, 401, 403, 429, 500, 502, 503] },
+  reason: 'Transient HTTP errors are not attested (404 handled by ATTEST_NOT_FOUND)',
 };
 
 /**

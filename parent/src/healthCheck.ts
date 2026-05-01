@@ -1,12 +1,16 @@
 /**
  * Enclave Health Monitoring.
  *
- * Checks enclave status via `nitro-cli describe-enclaves` and reports
- * health to the parent server's /health endpoint.
+ * Two-level check:
+ * 1. State: `nitro-cli describe-enclaves` confirms enclave process is RUNNING
+ * 2. Connectivity: vsock ping confirms the enclave's accept loop is responsive
+ *
+ * Both must pass for an enclave to be marked healthy.
  */
 
 import { execSync } from 'node:child_process';
 import { getAllRoutes } from './enclaveRouter.js';
+import { pingEnclave } from './vsockClient.js';
 
 export interface HealthStatus {
   healthy: boolean;
@@ -18,25 +22,35 @@ interface EnclaveStatus {
   cid: number;
   hosts: string[];
   state: string;
+  connectivity: 'responsive' | 'unresponsive' | 'untested';
   healthy: boolean;
 }
 
 /** Check the health of all configured enclaves. */
-export function checkHealth(): HealthStatus {
+export async function checkHealth(): Promise<HealthStatus> {
   const routes = getAllRoutes();
   const enclaveStates = getEnclaveStates();
 
-  const enclaves: EnclaveStatus[] = routes.map((route) => {
-    const state = enclaveStates.find((e) => e.EnclaveCID === route.cid);
-    const isRunning = state?.State === 'RUNNING';
+  const enclaves: EnclaveStatus[] = await Promise.all(
+    routes.map(async (route) => {
+      const state = enclaveStates.find((e) => e.EnclaveCID === route.cid);
+      const isRunning = state?.State === 'RUNNING';
 
-    return {
-      cid: route.cid,
-      hosts: route.hosts,
-      state: state?.State || 'NOT_FOUND',
-      healthy: isRunning,
-    };
-  });
+      let connectivity: EnclaveStatus['connectivity'] = 'untested';
+      if (isRunning) {
+        const pongReceived = await pingEnclave(route.cid, route.port);
+        connectivity = pongReceived ? 'responsive' : 'unresponsive';
+      }
+
+      return {
+        cid: route.cid,
+        hosts: route.hosts,
+        state: state?.State || 'NOT_FOUND',
+        connectivity,
+        healthy: isRunning && connectivity === 'responsive',
+      };
+    }),
+  );
 
   return {
     healthy: enclaves.every((e) => e.healthy),

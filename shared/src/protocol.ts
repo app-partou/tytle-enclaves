@@ -3,18 +3,25 @@
  *
  * Format: [4-byte big-endian length][JSON payload]
  *
- * This is necessary because vsock is a stream protocol — there are no
- * message boundaries. Without framing, a large response could arrive
- * in multiple chunks and be misinterpreted.
+ * Generic over MessageStream so the same framing works with both
+ * VsockStream (native addon, inside enclaves) and any other stream
+ * implementation (parent server, test mocks).
  */
-
-import type { VsockStream } from '@tytle-enclaves/native';
 
 const HEADER_SIZE = 4;
 const MAX_MESSAGE_SIZE = 16 * 1024 * 1024; // 16MB max
 
+/**
+ * Minimal stream interface for the protocol layer.
+ * VsockStream from the native addon implements this shape natively.
+ */
+export interface MessageStream {
+  read(size: number): Buffer;
+  write(data: Buffer): number;
+}
+
 /** Write a JSON message with length prefix. */
-export async function writeMessage(stream: VsockStream, data: unknown): Promise<void> {
+export async function writeMessage(stream: MessageStream, data: unknown): Promise<void> {
   const json = JSON.stringify(data);
   const payload = Buffer.from(json, 'utf-8');
 
@@ -36,8 +43,7 @@ export async function writeMessage(stream: VsockStream, data: unknown): Promise<
 }
 
 /** Read a length-prefixed JSON message. Returns parsed object. */
-export async function readMessage<T = unknown>(stream: VsockStream): Promise<T> {
-  // Read 4-byte header
+export async function readMessage<T = unknown>(stream: MessageStream): Promise<T> {
   const header = await readExact(stream, HEADER_SIZE);
   const length = header.readUInt32BE(0);
 
@@ -48,7 +54,6 @@ export async function readMessage<T = unknown>(stream: VsockStream): Promise<T> 
     throw new Error(`Message too large: ${length} bytes (max ${MAX_MESSAGE_SIZE})`);
   }
 
-  // Read payload
   const payload = await readExact(stream, length);
   const json = payload.toString('utf-8');
 
@@ -56,7 +61,7 @@ export async function readMessage<T = unknown>(stream: VsockStream): Promise<T> 
 }
 
 /** Read exactly `size` bytes from the stream. */
-async function readExact(stream: VsockStream, size: number): Promise<Buffer> {
+async function readExact(stream: MessageStream, size: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let remaining = size;
 
