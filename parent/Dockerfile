@@ -65,6 +65,15 @@ RUN npx tsc
 
 RUN npm prune --production
 
+# Re-inject workspace deps after prune (prune removes file: deps it can't resolve)
+COPY --from=rust-builder /build/native/index.js ./node_modules/@tytle-enclaves/native/index.js
+COPY --from=rust-builder /build/native/index.d.ts ./node_modules/@tytle-enclaves/native/index.d.ts
+COPY --from=rust-builder /build/native/*.node ./node_modules/@tytle-enclaves/native/
+COPY --from=rust-builder /build/native/package.json ./node_modules/@tytle-enclaves/native/package.json
+COPY --from=shared-builder /shared/dist/ ./node_modules/@tytle-enclaves/shared/dist/
+COPY --from=shared-builder /shared/package.json ./node_modules/@tytle-enclaves/shared/package.json
+COPY --from=shared-builder /shared/node_modules/cbor/ ./node_modules/cbor/
+
 # Minimal runtime
 FROM node:20-slim
 
