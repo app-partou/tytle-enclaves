@@ -17,7 +17,7 @@ strip_deps_for() {
   esac
 }
 
-for pkg in shared vies sicae stripe-payment; do
+for pkg in shared vies sicae stripe-payment monerium-payment parent; do
   pkg_dir="$REPO_ROOT/$pkg"
   echo "=== $pkg ==="
 
