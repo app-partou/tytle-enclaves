@@ -5,22 +5,25 @@
  * does NOT need actual Nitro hardware. By running it in an Amazon Linux
  * container with Docker socket mounted, this works on any machine.
  *
+ * The helper image is built from THIS package's Dockerfile.nitro-cli (shipped in the package `files`), which pins the
+ * base image by digest and nitro-cli by version: an unpinned helper can measure a different PCR0 than the release
+ * did. The helper's tag is a hash of that file, so a changed pin never reuses a stale local image.
+ *
  * SECURITY: All shell commands use execFileSync with argument arrays.
  */
 
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import crypto from 'node:crypto';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import * as report from './report.js';
 
-const HELPER_IMAGE = 'tytle-verify-nitro-cli:latest';
+/** The pinned helper Dockerfile: the package root's Dockerfile.nitro-cli (from src/lib or dist/lib alike). */
+export const NITRO_CLI_DOCKERFILE = readFileSync(new URL('../../Dockerfile.nitro-cli', import.meta.url), 'utf-8');
 
-// Inline Dockerfile so it works regardless of how the package is installed (npx, global, local)
-const NITRO_CLI_DOCKERFILE = `FROM amazonlinux:2023
-RUN dnf install -y aws-nitro-enclaves-cli && dnf clean all
-ENTRYPOINT ["nitro-cli"]
-`;
+/** The helper image's tag: the first 16 hex of the SHA-256 of the pinned Dockerfile. */
+export const HELPER_IMAGE = `tytle-verify-nitro-cli:${crypto.createHash('sha256').update(NITRO_CLI_DOCKERFILE).digest('hex').slice(0, 16)}`;
 
 /**
  * Get the Docker socket mount path, platform-aware.

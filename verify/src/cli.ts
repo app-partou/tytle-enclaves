@@ -12,6 +12,7 @@
  */
 
 import { Command } from 'commander';
+import { existsSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { VALID_SERVICES, type ServiceName } from './lib/types.js';
 import {
@@ -51,6 +52,10 @@ program
     '--pcr0 <hex>',
     'Compare against this PCR0 instead of fetching from API',
   )
+  .option(
+    '--bn254 <file>',
+    'A file with the BN254 vector (base64) you received: checks it is the one signed',
+  )
   .action(async (opts) => {
     let service: ServiceName = opts.service;
     let attestation: string = opts.attestation;
@@ -71,6 +76,7 @@ program
       if (opts.commit) opts.commit = validateCommitHash(opts.commit);
       if (opts.pcr0) opts.pcr0 = validatePcr0Hex(opts.pcr0);
       if (opts.repoDir) validateRepoDir(opts.repoDir);
+      if (opts.bn254 && !existsSync(opts.bn254)) throw new Error(`--bn254 file not found: ${opts.bn254}`);
     } catch (err: any) {
       console.error(`\n\x1b[31mValidation error:\x1b[0m ${err.message}`);
       process.exit(1);
@@ -96,6 +102,7 @@ program
         repoDir: opts.repoDir,
         skipBuild: opts.skipBuild,
         pcr0: opts.pcr0,
+        bn254: opts.bn254,
       });
 
       process.exit(success ? 0 : 1);

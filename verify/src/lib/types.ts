@@ -17,7 +17,12 @@ export interface AttestationDocument {
     pcr2: string;
   };
   nonce: string;
+  /** SHA-256 (hex) of the BN254 vector: the NSM document's user_data. */
   bn254Hash?: string;
+  /** 1 = SHA-256(responseHash|apiEndpoint|timestamp); 2 = the same with `|challenge` appended. Absent = 1. */
+  nonceVersion?: 1 | 2;
+  /** The caller's challenge (64 lowercase hex), echoed: present exactly when nonceVersion is 2. */
+  challenge?: string;
 }
 
 export interface Pcr0ServiceInfo {

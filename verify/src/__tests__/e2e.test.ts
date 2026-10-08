@@ -1,333 +1,412 @@
 /**
- * End-to-end tests for the verification CLI.
+ * End-to-end tests of `verify` through its one entry point, runVerification, on AWS-shaped documents
+ * (helpers/syntheticNsm.ts).
  *
- * Uses a self-signed COSE_Sign1 attestation that mirrors real Nitro format.
- * The signature IS valid (we generated the keypair), but the certificate chain
- * will NOT root to AWS Nitro CA (expected). This exercises the full flow.
+ * The synthetic chains are trusted nowhere, so ONE module is swapped: the trust anchor (../lib/trustAnchor.js)
+ * returns the synthetic root a test names. Everything else runs for real: the decode, the signature, the chain walk,
+ * the nonce, the bindings and the report. The network (the PCR0 API) is replaced by --pcr0 or a stubbed fetch, and
+ * the report is read where the CLI writes it, the console.
+ *
+ * Until 2026-10 these tests used a self-signed document with an EMPTY cabundle and asserted that the run FAILS, so
+ * they stayed green while every real document failed (enclave audit P2.1). Each case now names exactly the checks
+ * that fail.
  */
 
-import { describe, it, expect, beforeAll } from 'vitest';
-import { writeFileSync, mkdtempSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import crypto from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { buildTestAttestation, type TestAttestation } from './helpers/buildAttestation.js';
-import { verifyCoseSignature } from '../lib/cose.js';
-import { verifyNonce, computeNonce } from '../lib/nonce.js';
-import { decodeNsmDocument, extractPcrs } from '../lib/attestationDoc.js';
-import { runVerification } from '../commands/verify.js';
+import { runVerification, type VerifyOptions } from '../commands/verify.js';
+import { computeNonce } from '../lib/nonce.js';
+import type { AttestationDocument } from '../lib/types.js';
+import { buildDoc, CHAINS, SIGNED_AT_SEC, type DocOptions } from './helpers/syntheticNsm.js';
 
-let testAtt: TestAttestation;
-let tempDir: string;
-let attestationFile: string;
-
-beforeAll(() => {
-  testAtt = buildTestAttestation({
-    apiEndpoint: 'ec.europa.eu/taxation_customs/vies/services/checkVatService',
-    apiMethod: 'POST',
-    rawResponseBody: '<soap:Envelope><valid>true</valid></soap:Envelope>',
-    pcr0: 'ab'.repeat(48),
-  });
-
-  tempDir = mkdtempSync(path.join(tmpdir(), 'verify-e2e-'));
-  attestationFile = path.join(tempDir, 'attestation.json');
-  writeFileSync(attestationFile, JSON.stringify(testAtt.document));
+const anchor = vi.hoisted(() => ({ pem: '' }));
+vi.mock('../lib/trustAnchor.js', async () => {
+  const { X509Certificate } = await import('node:crypto');
+  return { getAwsNitroRootCa: () => new X509Certificate(anchor.pem) };
 });
 
-describe('e2e: COSE decode + signature', () => {
-  it('decodes the self-signed COSE_Sign1 document', () => {
-    const decoded = decodeNsmDocument(testAtt.document.nsmDocument);
+/** Every check of a run with --pcr0, --bn254 and --skip-build, in report order. */
+const ALL_CHECKS = [
+  'COSE_Sign1 signature valid',
+  'Certificate chain roots to AWS Nitro CA',
+  'Enclave ran in release mode (PCR0 not all zeroes)',
+  'Nonce matches recomputed value',
+  'COSE payload nonce matches application nonce',
+  'Attestation time agrees with the signed NSM time',
+  'COSE user_data equals bn254Hash',
+  'bn254Hash is SHA-256 of the vector (--bn254)',
+  'responseHash is SHA-256 of the vector as base64 (--bn254)',
+  'PCR0 matches published value (API)',
+  'Reproducible build verification',
+];
 
-    expect(decoded.protectedRaw).toBeInstanceOf(Buffer);
-    expect(decoded.payload.module_id).toBe('test-enclave-module');
-    expect(decoded.payload.certificate).toBeInstanceOf(Buffer);
-    expect(decoded.signature).toBeInstanceOf(Buffer);
-  });
+let dir: string;
 
-  it('extracts PCRs from the COSE payload', () => {
-    const decoded = decodeNsmDocument(testAtt.document.nsmDocument);
-    const pcrs = extractPcrs(decoded);
-
-    expect(pcrs.pcr0).toBe('ab'.repeat(48));
-    expect(pcrs.pcr1).toBe('00'.repeat(48));
-    expect(pcrs.pcr2).toBe('00'.repeat(48));
-  });
-
-  it('verifies the COSE_Sign1 signature (self-signed)', () => {
-    const result = verifyCoseSignature(testAtt.document.nsmDocument);
-
-    // Signature SHOULD be valid (we signed it with our own key)
-    expect(result.signatureValid).toBe(true);
-    // Cert chain should FAIL (not signed by Nitro CA)
-    expect(result.certChainValid).toBe(false);
-    // PCRs should be extracted
-    expect(result.pcrs.pcr0).toBe('ab'.repeat(48));
-  });
-
-  it('extracts payload nonce from COSE document', () => {
-    const result = verifyCoseSignature(testAtt.document.nsmDocument);
-
-    expect(result.payloadNonce).toBe(testAtt.document.nonce);
-  });
+beforeEach(() => {
+  dir = mkdtempSync(path.join(tmpdir(), 'verify-e2e-'));
+  anchor.pem = CHAINS.main().anchorPem;
+  vi.stubGlobal('fetch', vi.fn(async () => {
+    throw new Error('no network in tests');
+  }));
 });
 
-describe('e2e: nonce verification', () => {
-  it('nonce matches recomputed value', () => {
-    const result = verifyNonce(testAtt.document);
-    expect(result.valid).toBe(true);
-  });
-
-  it('nonce fails with tampered responseHash', () => {
-    const tampered = { ...testAtt.document, responseHash: 'ff'.repeat(32) };
-    const result = verifyNonce(tampered);
-    expect(result.valid).toBe(false);
-  });
-
-  it('nonce fails with tampered timestamp', () => {
-    const tampered = { ...testAtt.document, timestamp: testAtt.document.timestamp + 1 };
-    const result = verifyNonce(tampered);
-    expect(result.valid).toBe(false);
-  });
-
-  it('nonce fails with tampered apiEndpoint', () => {
-    const tampered = { ...testAtt.document, apiEndpoint: 'evil.com/fake' };
-    const result = verifyNonce(tampered);
-    expect(result.valid).toBe(false);
-  });
+afterEach(() => {
+  rmSync(dir, { recursive: true, force: true });
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
-describe('e2e: COSE payload nonce binding', () => {
-  it('payload nonce matches application nonce', () => {
-    const result = verifyCoseSignature(testAtt.document.nsmDocument);
-    expect(result.payloadNonce).toBe(testAtt.document.nonce);
+const write = (name: string, content: string): string => {
+  const file = path.join(dir, name);
+  writeFileSync(file, content);
+  return file;
+};
+
+const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, '');
+
+interface Run {
+  ok: boolean;
+  /** Each check of the final report, in order: [name, passed] */
+  checks: Array<[string, boolean]>;
+  failed: string[];
+  detail: (name: string) => string | undefined;
+  output: string;
+}
+
+/** Run the CLI's verification on `document`, as `verify --service vies --attestation <file> --skip-build`. */
+async function run(document: unknown, options: Partial<VerifyOptions> = {}): Promise<Run> {
+  const lines: string[] = [];
+  const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+    lines.push(stripAnsi(args.map(String).join(' ')));
   });
-
-  it('detects tampered application nonce (envelope swap)', () => {
-    const result = verifyCoseSignature(testAtt.document.nsmDocument);
-    // If someone swaps the envelope nonce, it won't match the payload nonce
-    const fakeNonce = 'ff'.repeat(32);
-    expect(result.payloadNonce).not.toBe(fakeNonce);
-  });
-});
-
-describe('e2e: full verification flow', () => {
-  it('runs full verification with --skip-build (self-signed cert fails chain)', async () => {
-    // Mock the PCR0 API to return our test PCR0
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () =>
-      new Response(
-        JSON.stringify({
-          enclaves: {
-            vies: {
-              pcr0: 'ab'.repeat(48),
-              gitCommit: 'a'.repeat(40),
-              repoUrl: 'https://github.com/app-partou/tytle-enclaves',
-              buildDir: 'vies',
-              history: [],
-            },
-          },
-          verificationGuide: '',
-        }),
-        { status: 200 },
-      );
-
-    try {
-      const success = await runVerification({
-        service: 'vies',
-        attestation: attestationFile,
-        skipBuild: true,
-      });
-
-      // Should FAIL overall because cert chain doesn't root to Nitro CA
-      expect(success).toBe(false);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  it('runs verification with explicit --pcr0 (matching)', async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () =>
-      new Response(
-        JSON.stringify({
-          enclaves: {
-            vies: {
-              pcr0: 'ab'.repeat(48),
-              gitCommit: 'a'.repeat(40),
-              repoUrl: 'https://github.com/app-partou/tytle-enclaves',
-              buildDir: 'vies',
-              history: [],
-            },
-          },
-          verificationGuide: '',
-        }),
-        { status: 200 },
-      );
-
-    try {
-      const success = await runVerification({
-        service: 'vies',
-        attestation: attestationFile,
-        skipBuild: true,
-        pcr0: 'ab'.repeat(48),
-      });
-
-      // Still fails (cert chain) but PCR0 check should pass
-      expect(success).toBe(false);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  });
-
-  it('runs verification with wrong --pcr0 (mismatching)', async () => {
-    const success = await runVerification({
+  let ok: boolean;
+  try {
+    ok = await runVerification({
       service: 'vies',
-      attestation: attestationFile,
+      attestation: write('attestation.json', JSON.stringify(document)),
       skipBuild: true,
-      pcr0: 'ff'.repeat(48), // Wrong PCR0
+      ...options,
     });
+  } finally {
+    spy.mockRestore();
+  }
+  const checks: Array<[string, boolean]> = [];
+  const details = new Map<string, string>();
+  for (const line of lines) {
+    const check = /^║  \[(PASS|FAIL)\] (.+?) *║$/.exec(line);
+    if (check) {
+      checks.push([check[2], check[1] === 'PASS']);
+      continue;
+    }
+    const detail = /^║ {9}(.+?) *║$/.exec(line);
+    if (detail && checks.length > 0) details.set(checks[checks.length - 1][0], detail[1]);
+  }
+  return {
+    ok,
+    checks,
+    failed: checks.filter(([, passed]) => !passed).map(([name]) => name),
+    detail: (name) => details.get(name),
+    output: lines.join('\n'),
+  };
+}
 
-    expect(success).toBe(false);
+/** A genuine run: the document, its PCR0 given as published, and the vector it signed given by --bn254. */
+async function runGenuine(o: DocOptions = {}, edit: (d: AttestationDocument) => void = () => {}, extra: Partial<VerifyOptions> = {}) {
+  const { document, bn254Base64 } = buildDoc(o);
+  edit(document);
+  return run(document, { pcr0: document.pcrs.pcr0, bn254: write('vector.b64', bn254Base64), ...extra });
+}
+
+describe('a genuine document passes every check', () => {
+  it('an AWS-shaped document (cabundle root first), with the vector given by --bn254 (red)', async () => {
+    const r = await runGenuine();
+    expect(r.checks).toEqual(ALL_CHECKS.map((name) => [name, true]));
+    expect(r.ok).toBe(true);
+    expect(r.output).toContain('Result: ALL CHECKS PASSED');
+  });
+
+  it("AWS's own depth (root, regional, zonal, instance), days after the instance CA expired (red)", async () => {
+    const chain = CHAINS.awsDepth();
+    anchor.pem = chain.anchorPem;
+    const r = await runGenuine({ chain });
+    expect(r.failed).toEqual([]);
+    expect(r.ok).toBe(true);
+  });
+
+  it("a version-2 document (the caller's challenge in the nonce) (red)", async () => {
+    const r = await runGenuine({ challenge: crypto.randomBytes(32).toString('hex') });
+    expect(r.failed).toEqual([]);
+    expect(r.output).toContain('Nonce matches recomputed SHA-256(responseHash|apiEndpoint|timestamp|challenge)');
+  });
+
+  it('a document without a BN254 vector (no user_data, no bn254Hash) passes, with no data-binding check (red)', async () => {
+    const { document } = buildDoc({ userData: null });
+    delete document.bn254Hash;
+    const r = await run(document, { pcr0: document.pcrs.pcr0 });
+    expect(r.failed).toEqual([]);
+    expect(r.checks.map(([name]) => name)).not.toContain('COSE user_data equals bn254Hash');
+    expect(r.output).toContain('No user_data and no bn254Hash: this answer carries no BN254 vector');
+  });
+
+  it("a signed time exactly 10 minutes from the attestation's own time still agrees (red)", async () => {
+    const r = await runGenuine({ payloadTimestampMs: SIGNED_AT_SEC * 1000 + 10 * 60_000 });
+    expect(r.failed).toEqual([]);
   });
 });
 
-describe('e2e: error handling', () => {
-  it('rejects missing attestation file', async () => {
-    await expect(
-      runVerification({
-        service: 'vies',
-        attestation: '/tmp/nonexistent-attestation-file.json',
-        skipBuild: true,
-      }),
-    ).rejects.toThrow('not found');
+describe('the bindings', () => {
+  it('a payload without a nonce FAILS the nonce binding (red)', async () => {
+    const r = await runGenuine({ omit: ['nonce'] });
+    expect(r.failed).toEqual(['COSE payload nonce matches application nonce']);
+    expect(r.detail('COSE payload nonce matches application nonce')).toBe(
+      'The NSM payload carries no nonce: the document is not bound to this answer',
+    );
   });
 
-  it('rejects malformed JSON', async () => {
-    const badFile = path.join(tempDir, 'bad.json');
-    writeFileSync(badFile, 'not json');
-
-    await expect(
-      runVerification({
-        service: 'vies',
-        attestation: badFile,
-        skipBuild: true,
-      }),
-    ).rejects.toThrow('not valid JSON');
-  });
-
-  it('rejects attestation missing required fields', async () => {
-    const incompleteFile = path.join(tempDir, 'incomplete.json');
-    writeFileSync(incompleteFile, JSON.stringify({ attestationId: 'test' }));
-
-    await expect(
-      runVerification({
-        service: 'vies',
-        attestation: incompleteFile,
-        skipBuild: true,
-      }),
-    ).rejects.toThrow('missing or invalid');
-  });
-
-  it('rejects attestation with invalid nsmDocument (too short)', async () => {
-    const badDoc = { ...testAtt.document, nsmDocument: btoa('short') };
-    const badFile = path.join(tempDir, 'short-nsm.json');
-    writeFileSync(badFile, JSON.stringify(badDoc));
-
-    await expect(
-      runVerification({
-        service: 'vies',
-        attestation: badFile,
-        skipBuild: true,
-      }),
-    ).rejects.toThrow('too short');
-  });
-
-  it('rejects attestation with non-hex nonce', async () => {
-    const badDoc = { ...testAtt.document, nonce: 'not-hex-at-all!!!' };
-    const badFile = path.join(tempDir, 'bad-nonce.json');
-    writeFileSync(badFile, JSON.stringify(badDoc));
-
-    await expect(
-      runVerification({
-        service: 'vies',
-        attestation: badFile,
-        skipBuild: true,
-      }),
-    ).rejects.toThrow('not a valid hex');
-  });
-
-  it('handles API failure gracefully', async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => {
-      throw new Error('Network error');
+  it('an application nonce that is not the signed one fails the binding (the envelope swapped) (red)', async () => {
+    const { document } = buildDoc();
+    const swapped = {
+      ...document,
+      responseHash: 'ff'.repeat(32),
+      nonce: computeNonce('ff'.repeat(32), document.apiEndpoint, document.timestamp),
     };
+    const r = await run(swapped, { pcr0: document.pcrs.pcr0 });
+    expect(r.failed).toEqual(['COSE payload nonce matches application nonce']);
+  });
 
-    try {
-      const success = await runVerification({
-        service: 'vies',
-        attestation: attestationFile,
-        skipBuild: true,
-      });
+  it('user_data that is not the bn254Hash fails (red)', async () => {
+    const r = await runGenuine({ userData: crypto.randomBytes(32) });
+    expect(r.failed).toEqual(['COSE user_data equals bn254Hash']);
+  });
 
-      // Should fail (API unreachable + cert chain)
-      expect(success).toBe(false);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+  it('user_data with no bn254Hash in the attestation fails (red)', async () => {
+    const { document } = buildDoc();
+    delete document.bn254Hash;
+    const r = await run(document, { pcr0: document.pcrs.pcr0 });
+    expect(r.failed).toEqual(['COSE user_data equals bn254Hash']);
+    expect(r.detail('COSE user_data equals bn254Hash')).toBe('The document carries user_data, but the attestation names no bn254Hash');
+  });
+
+  it('a bn254Hash with no user_data in the payload fails (red)', async () => {
+    const r = await runGenuine({ userData: null });
+    expect(r.failed).toEqual(['COSE user_data equals bn254Hash']);
+  });
+
+  it('--bn254 with a vector that was not the one signed fails both recomputes (red)', async () => {
+    const { document } = buildDoc();
+    const r = await run(document, { pcr0: document.pcrs.pcr0, bn254: write('other.b64', crypto.randomBytes(160).toString('base64')) });
+    expect(r.failed).toEqual([
+      'bn254Hash is SHA-256 of the vector (--bn254)',
+      'responseHash is SHA-256 of the vector as base64 (--bn254)',
+    ]);
+  });
+
+  it("a signed time 11 minutes from the attestation's own time fails the time check (red)", async () => {
+    const r = await runGenuine({ payloadTimestampMs: SIGNED_AT_SEC * 1000 + 11 * 60_000 });
+    expect(r.failed).toEqual(['Attestation time agrees with the signed NSM time']);
+  });
+
+  it('a payload without a signed time fails the chain and the time check (red)', async () => {
+    const r = await runGenuine({ payloadTimestampMs: null });
+    expect(r.failed).toEqual(['Certificate chain roots to AWS Nitro CA', 'Attestation time agrees with the signed NSM time']);
+    expect(r.detail('Certificate chain roots to AWS Nitro CA')).toBe('The document has no valid signed time');
+  });
+
+  it('a changed responseHash fails the nonce recompute (red)', async () => {
+    const r = await runGenuine({}, (d) => { d.responseHash = 'ff'.repeat(32); });
+    expect(r.failed).toEqual(['Nonce matches recomputed value', 'responseHash is SHA-256 of the vector as base64 (--bn254)']);
+  });
+
+  it('a changed timestamp fails the nonce recompute (red)', async () => {
+    const r = await runGenuine({}, (d) => { d.timestamp += 1; });
+    expect(r.failed).toEqual(['Nonce matches recomputed value']);
+  });
+
+  it('a changed apiEndpoint fails the nonce recompute (red)', async () => {
+    const r = await runGenuine({}, (d) => { d.apiEndpoint = 'evil.example/fake'; });
+    expect(r.failed).toEqual(['Nonce matches recomputed value']);
+  });
+
+  it('version 2 without its challenge fails the nonce recompute (red)', async () => {
+    const r = await runGenuine({ challenge: crypto.randomBytes(32).toString('hex') }, (d) => { delete d.challenge; });
+    expect(r.failed).toEqual(['Nonce matches recomputed value']);
+    expect(r.detail('Nonce matches recomputed value')).toBe('nonce version 2 needs a challenge of 64 lowercase hex');
+  });
+
+  it('a challenge on a version-1 document fails the nonce recompute (red)', async () => {
+    const r = await runGenuine({}, (d) => { d.challenge = crypto.randomBytes(32).toString('hex'); });
+    expect(r.failed).toEqual(['Nonce matches recomputed value']);
+    expect(r.detail('Nonce matches recomputed value')).toBe('a challenge was given but the nonce is version 1');
+  });
+
+  it('another challenge than the one signed fails the nonce recompute (red)', async () => {
+    const r = await runGenuine({ challenge: crypto.randomBytes(32).toString('hex') }, (d) => {
+      d.challenge = crypto.randomBytes(32).toString('hex');
+    });
+    expect(r.failed).toEqual(['Nonce matches recomputed value']);
   });
 });
 
-describe('e2e: tamper detection', () => {
-  it('detects tampered nsmDocument (invalid CBOR)', async () => {
-    // Flip a byte in the middle of the nsmDocument
-    const nsmBytes = Buffer.from(testAtt.document.nsmDocument, 'base64');
-    nsmBytes[Math.floor(nsmBytes.length / 2)] ^= 0xff;
-    const tampered = { ...testAtt.document, nsmDocument: nsmBytes.toString('base64') };
-    const tamperedFile = path.join(tempDir, 'tampered-nsm.json');
-    writeFileSync(tamperedFile, JSON.stringify(tampered));
-
-    // Should either throw during decode or fail signature verification
-    try {
-      const success = await runVerification({
-        service: 'vies',
-        attestation: tamperedFile,
-        skipBuild: true,
-        pcr0: 'ab'.repeat(48),
-      });
-      expect(success).toBe(false);
-    } catch {
-      // Also acceptable — decode error
-    }
+describe('the signature and the chain', () => {
+  it('one flipped bit in the signature fails the signature (red)', async () => {
+    const r = await runGenuine({}, (d) => {
+      const bytes = Buffer.from(d.nsmDocument, 'base64');
+      bytes[bytes.length - 1] ^= 0x01;       // the signature is the COSE array's last item
+      d.nsmDocument = bytes.toString('base64');
+    });
+    expect(r.failed).toEqual(['COSE_Sign1 signature valid']);
   });
 
-  it('detects swapped nonce (envelope modified but COSE intact)', async () => {
-    const wrongNonce = computeNonce('ff'.repeat(32), testAtt.document.apiEndpoint, testAtt.document.timestamp);
-    const tampered = { ...testAtt.document, nonce: wrongNonce, responseHash: 'ff'.repeat(32) };
-    const tamperedFile = path.join(tempDir, 'swapped-nonce.json');
-    writeFileSync(tamperedFile, JSON.stringify(tampered));
+  it("a document signed by another key than the leaf's fails the signature (red)", async () => {
+    const r = await runGenuine({ signWith: CHAINS.otherRoot().leafKey });
+    expect(r.failed).toEqual(['COSE_Sign1 signature valid']);
+  });
 
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () =>
-      new Response(
-        JSON.stringify({
-          enclaves: { vies: { pcr0: 'ab'.repeat(48), gitCommit: 'a'.repeat(40), repoUrl: '', buildDir: 'vies', history: [] } },
-          verificationGuide: '',
-        }),
-        { status: 200 },
-      );
+  it('a flipped byte inside the document fails the signature (lock)', async () => {
+    const r = await runGenuine({}, (d) => {
+      const bytes = Buffer.from(d.nsmDocument, 'base64');
+      bytes[Math.floor(bytes.length / 2)] ^= 0xff;
+      d.nsmDocument = bytes.toString('base64');
+    });
+    expect(r.ok).toBe(false);
+    expect(r.failed).toContain('COSE_Sign1 signature valid');
+  });
 
-    try {
-      const success = await runVerification({
-        service: 'vies',
-        attestation: tamperedFile,
-        skipBuild: true,
-      });
+  it('an algorithm other than ES384 fails, and nothing in the payload is trusted (red)', async () => {
+    const r = await runGenuine({ alg: -7 });
+    expect(r.ok).toBe(false);
+    expect(r.failed).toEqual(expect.arrayContaining([
+      'COSE_Sign1 signature valid',
+      'Certificate chain roots to AWS Nitro CA',
+      'COSE payload nonce matches application nonce',
+      'PCR0 matches published value (API)',
+    ]));
+    expect(r.detail('COSE_Sign1 signature valid')).toMatch(/^Invalid COSE algorithm: -7\. Expected -35 \(ES384\)/);
+  });
 
-      // Should fail — the recomputed nonce matches the tampered envelope,
-      // BUT the COSE payload nonce binding check will catch the mismatch
-      // (payload nonce != tampered envelope nonce)
-      expect(success).toBe(false);
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
+  it('a chain under a root that is not the pin fails only the chain (red)', async () => {
+    const r = await runGenuine({ chain: CHAINS.otherRoot() });
+    expect(r.failed).toEqual(['Certificate chain roots to AWS Nitro CA']);
+    expect(r.detail('Certificate chain roots to AWS Nitro CA')).toMatch(/^cabundle\[0\] \(.+\) is not the AWS Nitro root/);
+  });
+
+  it('an intermediate that is not a CA fails only the chain (lock)', async () => {
+    const r = await runGenuine({ chain: CHAINS.intermediateNotCa() });
+    expect(r.failed).toEqual(['Certificate chain roots to AWS Nitro CA']);
+  });
+
+  it('a leaf that is a CA fails only the chain (lock)', async () => {
+    const r = await runGenuine({ chain: CHAINS.leafIsCa() });
+    expect(r.failed).toEqual(['Certificate chain roots to AWS Nitro CA']);
+  });
+});
+
+describe('PCR0', () => {
+  const published = (pcr0: string, extra: Record<string, unknown> = {}) =>
+    vi.fn(async () => new Response(JSON.stringify({
+      enclaves: {
+        vies: {
+          pcr0,
+          gitCommit: 'a'.repeat(40),
+          repoUrl: 'https://github.com/app-partou/tytle-enclaves',
+          buildDir: 'vies',
+          history: [],
+          ...extra,
+        },
+      },
+      verificationGuide: '',
+    }), { status: 200 }));
+
+  it('a PCR0 other than the published one fails (red)', async () => {
+    const r = await runGenuine({}, () => {}, { pcr0: 'ff'.repeat(48) });
+    expect(r.failed).toEqual(['PCR0 matches published value (API)']);
+  });
+
+  it('a debug-mode document (PCR0 all zeroes) fails even when the published PCR0 is zeroes (red)', async () => {
+    const r = await runGenuine({ pcr0: Buffer.alloc(48) });
+    expect(r.failed).toEqual(['Enclave ran in release mode (PCR0 not all zeroes)']);
+    expect(r.detail('Enclave ran in release mode (PCR0 not all zeroes)')).toBe('PCR0 is all zeroes: a debug-mode enclave, never trusted');
+  });
+
+  it('without --pcr0 the published PCR0 is read from the API (red)', async () => {
+    const { document, bn254Base64 } = buildDoc();
+    const fetchMock = published(document.pcrs.pcr0);
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await run(document, { bn254: write('vector.b64', bn254Base64) });
+    expect(r.failed).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledWith('https://api.tytle.io/api/enclave/pcr0', expect.anything());
+  });
+
+  it("a PCR0 found in the API's history passes, and the run says from when (red)", async () => {
+    const { document } = buildDoc();
+    vi.stubGlobal('fetch', published('ff'.repeat(48), {
+      history: [{ pcr0: document.pcrs.pcr0, gitCommit: 'b'.repeat(40), environment: 'production', deployedAt: '2026-09-01T00:00:00Z' }],
+    }));
+    const r = await run(document);
+    expect(r.failed).toEqual([]);
+    expect(r.output).toContain('Attestation PCR0 matches historical entry from 2026-09-01T00:00:00Z');
+  });
+
+  it('with the API unreachable and no --pcr0, only the PCR0 check fails (red)', async () => {
+    const { document } = buildDoc();
+    const r = await run(document);
+    expect(r.failed).toEqual(['PCR0 matches published value (API)']);
+    expect(r.detail('PCR0 matches published value (API)')).toBe('API unreachable and no --pcr0 provided');
+  });
+
+  it("the API's repoUrl is reported, never used (the rebuild itself: rebuildSource.test.ts) (red)", async () => {
+    const { document } = buildDoc();
+    vi.stubGlobal('fetch', published(document.pcrs.pcr0, { repoUrl: 'https://github.com/someone/fork' }));
+    const r = await run(document);
+    expect(r.failed).toEqual([]);
+    expect(r.output).toContain(
+      'WARN The API names https://github.com/someone/fork as the source; the build always comes from https://github.com/app-partou/tytle-enclaves',
+    );
+  });
+});
+
+describe('reading the attestation file', () => {
+  const refused = async (document: unknown, message: string) => {
+    await expect(run(document)).rejects.toThrow(message);
+  };
+
+  it('a missing file is refused (lock)', async () => {
+    vi.spyOn(console, 'log').mockImplementationOnce(() => {});
+    await expect(runVerification({ service: 'vies', attestation: path.join(dir, 'nonexistent.json'), skipBuild: true }))
+      .rejects.toThrow('not found');
+  });
+
+  it('a file that is not JSON is refused (lock)', async () => {
+    vi.spyOn(console, 'log').mockImplementationOnce(() => {});
+    await expect(runVerification({ service: 'vies', attestation: write('bad.json', 'not json'), skipBuild: true }))
+      .rejects.toThrow('not valid JSON');
+  });
+
+  it('a document without its required fields is refused (lock)', async () => {
+    await refused({ attestationId: 'test' }, 'missing or invalid');
+  });
+
+  it('an nsmDocument too short to be a COSE_Sign1 is refused (lock)', async () => {
+    await refused({ ...buildDoc().document, nsmDocument: Buffer.from('short').toString('base64') }, 'too short');
+  });
+
+  it('a nonce that is not hex is refused (lock)', async () => {
+    await refused({ ...buildDoc().document, nonce: 'not-hex-at-all!!!' }, 'not a valid hex');
+  });
+
+  it('a bn254Hash that is not 64 hex is refused (red)', async () => {
+    await refused({ ...buildDoc().document, bn254Hash: 'ab'.repeat(31) }, 'bn254Hash must be 64 hex characters');
+  });
+
+  it('a nonceVersion other than 1 or 2 is refused (red)', async () => {
+    await refused({ ...buildDoc().document, nonceVersion: 3 }, 'nonceVersion must be 1 or 2');
+  });
+
+  it("a challenge that is not 64 lowercase hex is refused, the route's null too (red)", async () => {
+    await refused({ ...buildDoc().document, challenge: 'AB'.repeat(32) }, 'challenge must be 64 lowercase hex characters');
+    await refused({ ...buildDoc().document, nonceVersion: 2, challenge: null }, 'challenge must be 64 lowercase hex characters');
   });
 });

@@ -3,12 +3,15 @@
  *
  * Runs all checks sequentially and outputs a final report:
  * 1. Parse attestation document
- * 2. Verify COSE_Sign1 signature + certificate chain (establishes trusted PCR0)
- * 3. Verify nonce binding (application nonce == COSE payload nonce)
- * 4. Fetch PCR0 + commit from public API (uses trusted PCR0 for history lookup)
- * 5. Compare PCR0 against API
- * 6. Reproduce Docker build (unless --skip-build)
- * 7. Extract PCR0 from reproduced build + compare
+ * 2. Verify COSE_Sign1 signature + certificate chain at the signed time (establishes trusted PCR0); a debug-mode
+ *    enclave (PCR0 all zeroes) fails
+ * 3. Verify nonce binding (application nonce == COSE payload nonce; a payload without one fails), the nonce for
+ *    the version the document says it signed, and that the document's time agrees with the signed time
+ * 4. Verify the data binding: COSE user_data == bn254Hash; with --bn254, the vector's hashes
+ * 5. Fetch PCR0 + commit from public API (uses trusted PCR0 for history lookup)
+ * 6. Compare PCR0 against API
+ * 7. Reproduce Docker build (unless --skip-build), always from the repository below
+ * 8. Extract PCR0 from reproduced build + compare
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -19,7 +22,7 @@ import type {
   ServiceName,
 } from '../lib/types.js';
 import { verifyCoseSignature } from '../lib/cose.js';
-import { verifyNonce } from '../lib/nonce.js';
+import { CHALLENGE_PATTERN, verifyNonce } from '../lib/nonce.js';
 import { fetchPcr0Info } from '../lib/pcr0Api.js';
 import {
   checkDocker,
@@ -38,7 +41,25 @@ export interface VerifyOptions {
   repoDir?: string;
   skipBuild?: boolean;
   pcr0?: string; // manual PCR0 override
+  /** A file holding the BN254 vector (base64) the data holder received: its hashes are recomputed. */
+  bn254?: string;
 }
+
+/**
+ * The source every reproducible build comes from. Hardcoded: the thing being verified never chooses the code it is
+ * compared with - the API's `repoUrl` is reported, never used.
+ */
+export const REPO_URL = 'https://github.com/app-partou/tytle-enclaves';
+
+/**
+ * How far the document's own time (the enclave's, in the nonce) may be from the signed NSM time. The same bound as
+ * the main repo's verifier; since the 2026-10 enclave release the enclave signs the hypervisor's time, so an honest
+ * document is within a second.
+ */
+const MAX_TIME_DRIFT_MS = 10 * 60 * 1000;
+
+/** SHA-256 (hex) of a BN254 vector, as the enclave puts it in user_data. */
+const HEX64 = /^[0-9a-f]{64}$/i;
 
 export async function runVerification(options: VerifyOptions): Promise<boolean> {
   const checks: CheckResult[] = [];
@@ -112,12 +133,26 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
     // The trusted PCR0 from the hardware-signed COSE payload (normalized to lowercase)
     const trustedPcr0 = coseResult.pcrs.pcr0.toLowerCase();
 
-    // --- Step 3b: Verify nonce binding ---
+    for (const warning of coseResult.chainWarnings) report.warn(warning);
+
+    // A debug-mode enclave's document carries all-zero PCRs, and the host can read its memory: it proves nothing,
+    // whatever PCR0 is published (the same rule as the main repo's verifier).
+    const releaseMode = /[1-9a-f]/.test(trustedPcr0);
+    checks.push({
+      name: 'Enclave ran in release mode (PCR0 not all zeroes)',
+      passed: releaseMode,
+      detail: releaseMode ? undefined : 'PCR0 is all zeroes: a debug-mode enclave, never trusted',
+    });
+    if (releaseMode) report.pass('The enclave ran in release mode');
+    else report.fail('PCR0 is all zeroes: a debug-mode enclave, never trusted');
+
+    // --- Step 4: Verify nonce binding ---
     // The nonce in the COSE payload (hardware-signed) must match the
     // application-level nonce. This proves the application didn't
     // swap the envelope around a different NSM document.
     report.step(4, 'Verifying nonce');
 
+    const version = attestation.nonceVersion ?? 1;
     const nonceResult = verifyNonce(attestation);
 
     checks.push({
@@ -125,40 +160,101 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
       passed: nonceResult.valid,
       detail: nonceResult.valid
         ? undefined
-        : `Expected ${nonceResult.expected}, got ${nonceResult.actual}`,
+        : nonceResult.error ?? `Expected ${nonceResult.expected}, got ${nonceResult.actual}`,
     });
 
     if (nonceResult.valid) {
-      report.pass('Nonce matches recomputed SHA-256(responseHash|apiEndpoint|timestamp)');
+      report.pass(version === 2
+        ? 'Nonce matches recomputed SHA-256(responseHash|apiEndpoint|timestamp|challenge)'
+        : 'Nonce matches recomputed SHA-256(responseHash|apiEndpoint|timestamp)');
     } else {
-      report.fail(
-        `Nonce mismatch: expected ${nonceResult.expected}, got ${nonceResult.actual}`,
-      );
+      report.fail(nonceResult.error ?? `Nonce mismatch: expected ${nonceResult.expected}, got ${nonceResult.actual}`);
     }
 
-    // Verify COSE payload nonce matches the application nonce
-    if (coseResult.payloadNonce) {
-      const nonceBinding = safeEqual(coseResult.payloadNonce, attestation.nonce);
-      checks.push({
-        name: 'COSE payload nonce matches application nonce',
-        passed: nonceBinding,
-        detail: nonceBinding
-          ? undefined
+    // The COSE payload nonce must match the application nonce. A payload without one binds the document to nothing.
+    const nonceBinding = coseResult.payloadNonce !== null && safeEqual(coseResult.payloadNonce, attestation.nonce);
+    checks.push({
+      name: 'COSE payload nonce matches application nonce',
+      passed: nonceBinding,
+      detail: nonceBinding
+        ? undefined
+        : coseResult.payloadNonce === null
+          ? 'The NSM payload carries no nonce: the document is not bound to this answer'
           : `COSE payload: ${coseResult.payloadNonce.slice(0, 16)}..., App: ${attestation.nonce.slice(0, 16)}...`,
-      });
-
-      if (nonceBinding) {
-        report.pass('COSE payload nonce bound to application nonce');
-      } else {
-        report.fail('COSE payload nonce does NOT match application nonce');
-      }
+    });
+    if (nonceBinding) {
+      report.pass('COSE payload nonce bound to application nonce');
+    } else {
+      report.fail(coseResult.payloadNonce === null
+        ? 'COSE payload carries no nonce'
+        : 'COSE payload nonce does NOT match application nonce');
     }
 
-    // --- Step 5: Fetch PCR0 + commit from API ---
-    report.step(5, 'Fetching PCR0 and commit from public API');
+    // The document's own time (in the nonce) must agree with the signed NSM time.
+    const timeAgrees = coseResult.payloadTimestampMs !== null
+      && Math.abs(coseResult.payloadTimestampMs - attestation.timestamp * 1000) <= MAX_TIME_DRIFT_MS;
+    checks.push({
+      name: 'Attestation time agrees with the signed NSM time',
+      passed: timeAgrees,
+      detail: timeAgrees
+        ? undefined
+        : coseResult.payloadTimestampMs === null
+          ? 'The NSM payload carries no valid signed time'
+          : `Attestation: ${new Date(attestation.timestamp * 1000).toISOString()}, signed: ${new Date(coseResult.payloadTimestampMs).toISOString()} (at most ${MAX_TIME_DRIFT_MS / 60_000} minutes apart)`,
+    });
+    if (timeAgrees) report.pass('Attestation time agrees with the signed NSM time');
+    else report.fail('Attestation time does not agree with the signed NSM time');
+
+    // --- Step 5: Verify the data binding ---
+    // The enclave puts the SHA-256 of its BN254 vector in user_data: what the data holder received is what was signed.
+    report.step(5, 'Verifying the data binding (user_data)');
+
+    if (attestation.bn254Hash !== undefined) {
+      const bound = coseResult.payloadUserData !== null && safeEqual(coseResult.payloadUserData, attestation.bn254Hash);
+      checks.push({
+        name: 'COSE user_data equals bn254Hash',
+        passed: bound,
+        detail: bound ? undefined : `user_data: ${coseResult.payloadUserData ?? 'none'}, bn254Hash: ${attestation.bn254Hash}`,
+      });
+      if (bound) report.pass('COSE user_data is the bn254Hash');
+      else report.fail('COSE user_data is NOT the bn254Hash');
+    } else if (coseResult.payloadUserData !== null) {
+      checks.push({
+        name: 'COSE user_data equals bn254Hash',
+        passed: false,
+        detail: 'The document carries user_data, but the attestation names no bn254Hash',
+      });
+      report.fail('The document carries user_data, but the attestation names no bn254Hash');
+    } else {
+      report.info('No user_data and no bn254Hash: this answer carries no BN254 vector');
+    }
+
+    if (options.bn254) {
+      // The vector as the data holder received it: base64. The enclave hashes its bytes into user_data
+      // (bn254Hash), and its rawBody - the base64 STRING - into responseHash (shared/src/attestor.ts).
+      const vectorB64 = readFileSync(options.bn254, 'utf-8').trim();
+      const vectorHash = crypto.createHash('sha256').update(Buffer.from(vectorB64, 'base64')).digest('hex');
+      const vectorResponseHash = crypto.createHash('sha256').update(vectorB64, 'utf-8').digest('hex');
+      const hashOk = attestation.bn254Hash !== undefined && safeEqual(vectorHash, attestation.bn254Hash);
+      const responseOk = safeEqual(vectorResponseHash, attestation.responseHash);
+      checks.push({
+        name: 'bn254Hash is SHA-256 of the vector (--bn254)',
+        passed: hashOk,
+        detail: hashOk ? undefined : `SHA-256 of the vector: ${vectorHash}, bn254Hash: ${attestation.bn254Hash ?? 'none'}`,
+      });
+      checks.push({
+        name: 'responseHash is SHA-256 of the vector as base64 (--bn254)',
+        passed: responseOk,
+        detail: responseOk ? undefined : `SHA-256 of the base64: ${vectorResponseHash}, responseHash: ${attestation.responseHash}`,
+      });
+      if (hashOk && responseOk) report.pass('The vector given with --bn254 is the one signed');
+      else report.fail('The vector given with --bn254 is NOT the one signed');
+    }
+
+    // --- Step 6: Fetch PCR0 + commit from API ---
+    report.step(6, 'Fetching PCR0 and commit from public API');
 
     let apiPcr0: string | undefined;
-    let repoUrl = 'https://github.com/app-partou/tytle-enclaves';
 
     if (options.pcr0) {
       apiPcr0 = options.pcr0.toLowerCase();
@@ -167,7 +263,9 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
       try {
         const pcr0Info = await fetchPcr0Info(options.service, options.apiUrl);
         apiPcr0 = pcr0Info.pcr0.toLowerCase();
-        repoUrl = pcr0Info.repoUrl || repoUrl;
+        if (pcr0Info.repoUrl && pcr0Info.repoUrl !== REPO_URL) {
+          report.warn(`The API names ${pcr0Info.repoUrl} as the source; the build always comes from ${REPO_URL}`);
+        }
         commit = options.commit || pcr0Info.gitCommit;
         report.info(`Published PCR0: ${apiPcr0.slice(0, 16)}...`);
         report.info(`Published commit: ${commit}`);
@@ -195,8 +293,8 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
       }
     }
 
-    // --- Step 6: Compare PCR0 against API ---
-    report.step(6, 'Comparing PCR0 against published value');
+    // --- Step 7: Compare PCR0 against API ---
+    report.step(7, 'Comparing PCR0 against published value');
 
     if (apiPcr0) {
       const pcr0Match = trustedPcr0 === apiPcr0;
@@ -224,9 +322,9 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
       report.fail('Cannot compare PCR0 — API unreachable and no --pcr0 provided');
     }
 
-    // --- Steps 7-8: Reproducible build (optional) ---
+    // --- Steps 8-9: Reproducible build (optional) ---
     if (!options.skipBuild) {
-      report.step(7, 'Reproducing Docker build');
+      report.step(8, 'Reproducing Docker build');
 
       if (!checkDocker()) {
         checks.push({
@@ -249,7 +347,7 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
           const buildResult = reproduceBuild(
             options.service,
             commit,
-            repoUrl,
+            REPO_URL,
             options.repoDir,
           );
           tempDir = buildResult.tempDir;
@@ -262,7 +360,7 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
           report.pass(`Image built: ${buildResult.imageTag}`);
 
           // Extract PCR0 from reproduced build and compare
-          report.step(8, 'Extracting and comparing reproduced PCR0');
+          report.step(9, 'Extracting and comparing reproduced PCR0');
 
           try {
             const buildPcr0 = extractPcr0(buildResult.imageTag);
@@ -416,6 +514,17 @@ function readAttestation(filePath: string): AttestationDocument {
     throw new Error(
       'Attestation field nonce is not a valid hex string',
     );
+  }
+
+  // Optional fields: present means well-formed.
+  if (doc.bn254Hash !== undefined && (typeof doc.bn254Hash !== 'string' || !HEX64.test(doc.bn254Hash))) {
+    throw new Error('Attestation field bn254Hash must be 64 hex characters');
+  }
+  if (doc.nonceVersion !== undefined && doc.nonceVersion !== 1 && doc.nonceVersion !== 2) {
+    throw new Error('Attestation field nonceVersion must be 1 or 2');
+  }
+  if (doc.challenge !== undefined && (typeof doc.challenge !== 'string' || !CHALLENGE_PATTERN.test(doc.challenge))) {
+    throw new Error('Attestation field challenge must be 64 lowercase hex characters');
   }
 
   return doc as unknown as AttestationDocument;
