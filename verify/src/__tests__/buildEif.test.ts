@@ -82,6 +82,18 @@ const runOf = (r: Run): string[] | undefined => r.calls.find((call) => call[0] =
 const built = (r: Run): boolean => r.calls.some((call) => call[0] === 'buildx' && call[1] === 'build');
 const signing = { EIF_SIGNING_KEY: SIGNER_KEY, EIF_SIGNING_CERT: SIGNER };
 
+describe('the nitro-cli pair is the record\'s vies build', () => {
+  // The tests below print nitro-cli's REAL output for ONE vies image (fixtures/signing). When the vies entry of
+  // scripts/expected-digests.json changes, that output is another build's and the scripts refuse it as "not the
+  // committed build": the fix is to measure the pair again, not to touch the record.
+  it.each(['nitro-cli-1.4.4-unsigned.stdout.txt', 'nitro-cli-1.4.4-signed.stdout.txt'])('%s', (file) => {
+    const m = (JSON.parse(readFileSync(fixture(file), 'utf8')) as { Measurements: Record<string, string> }).Measurements;
+    expect({ pcr0: m.PCR0, pcr1: m.PCR1, pcr2: m.PCR2 },
+      `${file} is not the vies build of scripts/expected-digests.json: measure the nitro-cli pair again (fixtures/signing/generate.sh)`)
+      .toEqual({ pcr0: VIES.pcr0, pcr1: VIES.pcr1, pcr2: VIES.pcr2 });
+  });
+});
+
 describe('scripts/build-eif.sh', SCRIPT_TIMEOUT, () => {
   it('unsigned: the committed build, its EIF and its measurements, and no signing flag (red)', () => {
     const r = runScript('scripts/build-eif.sh', ['vies', out]);

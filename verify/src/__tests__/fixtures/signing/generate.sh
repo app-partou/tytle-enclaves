@@ -28,7 +28,8 @@ openssl req -new -x509 -sha384 -key signer-TESTONLY.key.pem -out expired.pem \
 openssl req -new -x509 -sha384 -key signer-TESTONLY.key.pem -out not-yet-valid.pem \
   -not_before 20300101000000Z -not_after 20320101000000Z -subj "$(subject future)"
 
-# The nitro-cli pair: ONE image (vies at the release, config sha256:b7b13fd8...) measured by the pinned helper
+# The nitro-cli pair: ONE image (vies at the release, config sha256:b86896b1...; measured again whenever the vies entry of
+# scripts/expected-digests.json changes - buildEif.test.ts says so) measured by the pinned helper
 # (verify/Dockerfile.nitro-cli, run for linux/amd64), first unsigned, then signed with signer.pem. Its standard
 # output only (the progress lines go to standard error):
 #   docker run --rm --platform linux/amd64 -v /var/run/docker.sock:/var/run/docker.sock <helper> build-enclave \
