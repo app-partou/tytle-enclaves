@@ -50,6 +50,9 @@ function check(body: unknown): Promise<EnclaveResponse> {
   return handler({ id: 'req-1', url: 'https://ec.europa.eu/x', method: 'POST', headers: {}, body: typeof body === 'string' ? body : JSON.stringify(body) });
 }
 
+/** The SHA-256 hex of an upstream body: the value the handler signs as dataHash. */
+const sha256 = (body: string) => createHash('sha256').update(body, 'utf8').digest('hex');
+
 function signed(values: Record<string, string | number | null>) {
   const vector = encodeFieldElements(VIES_SCHEMA, values);
   return { base64: vector.toString('base64'), hash: hashFieldElements(vector) };
@@ -75,32 +78,32 @@ describe('request validation (lock)', () => {
   });
 });
 
-describe('VIES (lock)', () => {
-  it('a valid number: valid, name and the three-line address are signed', async () => {
+describe('VIES', () => {
+  it('a valid number: valid, name, the three-line address and the body\'s hash are signed (red before the release: dataHash)', async () => {
     fakeIo.reply(VIES_PORT, xml(VIES_VALID));
     const res = await check({ countryCode: 'PT', vatNumber: '503504564' });
 
     const name = 'EDP COMERCIAL - COMERCIALIZAÇÃO DE ENERGIA S A';
     const address = 'AV 24 DE JULHO N 12\nLISBOA\n1249-300 LISBOA';
-    const want = signed({ countryCode: 'PT', vatNumber: '503504564', valid: 1, name, address });
+    const want = signed({ countryCode: 'PT', vatNumber: '503504564', valid: 1, name, address, dataHash: sha256(VIES_VALID) });
     expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64, bn254: want.base64 });
     expect(res.headers).toMatchObject({ 'x-vies-valid': 'true', 'x-vies-name': name, 'x-vies-address': address, 'x-vies-manifest-hash': MANIFEST_HASH });
-    expect(res.bn254Headers).toEqual({ 'x-vies-name': name, 'x-vies-address': address });
+    expect(res.bn254Headers).toEqual({ 'x-vies-name': name, 'x-vies-address': address, 'x-vies-data-hash': sha256(VIES_VALID) });
     // The attested request config names the number asked and the manifest the handler ran under.
     const requestConfig = `https://ec.europa.eu/taxation_customs/vies/services/checkVatService|POST|${JSON.stringify({ countryCode: 'PT', vatNumber: '503504564', 'x-manifest-hash': MANIFEST_HASH })}`;
     expect(res.attestation?.requestHash).toBe(createHash('sha256').update(requestConfig).digest('hex'));
     expect(fakeIo.nsmAsks.map((a) => a.userData?.toString('hex'))).toEqual([want.hash]);
   });
 
-  it('VIES\'s own "not valid" is signed as valid 0', async () => {
+  it('VIES\'s own "not valid" is signed as valid 0 (lock)', async () => {
     fakeIo.reply(VIES_PORT, xml(VIES_NOT_VALID));
     const res = await check({ countryCode: 'PT', vatNumber: '123456789' });
-    const want = signed({ countryCode: 'PT', vatNumber: '123456789', valid: 0, name: null, address: null });
+    const want = signed({ countryCode: 'PT', vatNumber: '123456789', valid: 0, name: null, address: null, dataHash: sha256(VIES_NOT_VALID) });
     expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64 });
     expect(res.headers['x-vies-valid']).toBe('false');
   });
 
-  it('asks VIES over its own port with the SOAP checkVat request', async () => {
+  it('asks VIES over its own port with the SOAP checkVat request (lock)', async () => {
     fakeIo.reply(VIES_PORT, xml(VIES_VALID));
     await check({ countryCode: 'PT', vatNumber: '503504564' });
     const [request] = fakeIo.requests(VIES_PORT);
@@ -110,7 +113,7 @@ describe('VIES (lock)', () => {
     expect(fakeIo.requests(HMRC_PORT)).toEqual([]);
   });
 
-  it('a SOAP fault is an error, never signed', async () => {
+  it('a SOAP fault is an error, never signed (lock)', async () => {
     fakeIo.reply(VIES_PORT, xml(VIES_FAULT));
     const res = await check({ countryCode: 'PT', vatNumber: '503504564' });
     expect(res).toMatchObject({ success: false, status: 502 });
@@ -118,7 +121,7 @@ describe('VIES (lock)', () => {
     expect(fakeIo.nsmAsks).toHaveLength(0);
   });
 
-  it('a VIES HTTP 500 is an error', async () => {
+  it('a VIES HTTP 500 is an error (lock)', async () => {
     fakeIo.reply(VIES_PORT, xml('error', 500));
     const res = await check({ countryCode: 'PT', vatNumber: '503504564' });
     expect(res).toMatchObject({ success: false, status: 502 });
@@ -126,11 +129,11 @@ describe('VIES (lock)', () => {
   });
 });
 
-describe('HMRC (lock)', () => {
-  it('a registered number: valid, name and address are signed', async () => {
+describe('HMRC', () => {
+  it('a registered number: valid, name and address are signed (lock)', async () => {
     fakeIo.reply(HMRC_PORT, json(200, HMRC_REGISTERED));
     const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
-    const want = signed({ countryCode: 'GB', vatNumber: '123456789', valid: 1, name: 'EXAMPLE TRADING LTD', address: '10 EXAMPLE STREET, EXAMPLETOWN, EX1 1EX' });
+    const want = signed({ countryCode: 'GB', vatNumber: '123456789', valid: 1, name: 'EXAMPLE TRADING LTD', address: '10 EXAMPLE STREET, EXAMPLETOWN, EX1 1EX', dataHash: sha256(HMRC_REGISTERED) });
     expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64 });
     expect(res.headers).toMatchObject({ 'x-vies-valid': 'true', 'x-vies-name': 'EXAMPLE TRADING LTD' });
     const [request] = fakeIo.requests(HMRC_PORT);
@@ -138,15 +141,15 @@ describe('HMRC (lock)', () => {
     expect(fakeIo.requests(VIES_PORT)).toEqual([]);
   });
 
-  it('HMRC\'s own "not registered" (404, code NOT_FOUND) is signed as valid 0', async () => {
+  it('HMRC\'s own "not registered" (404, code NOT_FOUND) is signed as valid 0 (lock)', async () => {
     fakeIo.reply(HMRC_PORT, json(404, HMRC_NOT_REGISTERED));
     const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
-    const want = signed({ countryCode: 'GB', vatNumber: '123456789', valid: 0, name: null, address: null });
+    const want = signed({ countryCode: 'GB', vatNumber: '123456789', valid: 0, name: null, address: null, dataHash: sha256(HMRC_NOT_REGISTERED) });
     expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64 });
     expect(res.headers['x-vies-valid']).toBe('false');
   });
 
-  it('an HMRC 500 is an error', async () => {
+  it('an HMRC 500 is an error (lock)', async () => {
     fakeIo.reply(HMRC_PORT, json(500, '{}'));
     const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
     expect(res).toMatchObject({ success: false, status: 502 });
@@ -208,21 +211,44 @@ describe('a value the register would refuse is a 400 before anything is fetched 
 
 describe('the signed name and address are the text VIES meant (red before the release)', () => {
   it('XML escapes are read back: "&amp;" is signed as "&"', async () => {
-    fakeIo.reply(VIES_PORT, xml(VIES_VALID
+    const reply = VIES_VALID
       .replace('EDP COMERCIAL - COMERCIALIZAÇÃO DE ENERGIA S A', 'SMITH &amp; SONS &lt;PT&gt; &amp;lt;1&amp;gt;')
-      .replace('AV 24 DE JULHO N 12', 'RUA D&apos;ALMEIDA &quot;12&quot;')));
+      .replace('AV 24 DE JULHO N 12', 'RUA D&apos;ALMEIDA &quot;12&quot;');
+    fakeIo.reply(VIES_PORT, xml(reply));
     const res = await check({ countryCode: 'PT', vatNumber: '503504564' });
     const address = 'RUA D\'ALMEIDA "12"\nLISBOA\n1249-300 LISBOA';
     // "&amp;lt;" is the text "&lt;": read once, never twice.
     const name = 'SMITH & SONS <PT> &lt;1&gt;';
-    const want = signed({ countryCode: 'PT', vatNumber: '503504564', valid: 1, name, address });
+    const want = signed({ countryCode: 'PT', vatNumber: '503504564', valid: 1, name, address, dataHash: sha256(reply) });
     expect(res).toMatchObject({ success: true, rawBody: want.base64 });
     expect(res.headers).toMatchObject({ 'x-vies-name': name, 'x-vies-address': address });
   });
 });
 
+describe('the whole upstream body is committed: dataHash (red before the release)', () => {
+  it('the vector is 6 fields, the last the SHA-256 of the body VIES sent - one byte more is another hash', async () => {
+    fakeIo.reply(VIES_PORT, xml(VIES_VALID));
+    fakeIo.reply(VIES_PORT, xml(`${VIES_VALID} `));
+    const a = await check({ countryCode: 'PT', vatNumber: '503504564' });
+    const b = await check({ countryCode: 'PT', vatNumber: '503504564' });
+    expect(Buffer.from(a.rawBody, 'base64')).toHaveLength(192);
+    expect(a.headers['x-vies-data-hash']).toBe(sha256(VIES_VALID));
+    expect(b.headers['x-vies-data-hash']).toBe(sha256(`${VIES_VALID} `));
+    // Everything but dataHash is the same answer.
+    expect(Buffer.from(a.rawBody, 'base64').subarray(0, 160)).toEqual(Buffer.from(b.rawBody, 'base64').subarray(0, 160));
+    expect(a.rawBody).not.toBe(b.rawBody);
+  });
+
+  it('HMRC: the body HMRC sent, the "not registered" answer too', async () => {
+    fakeIo.reply(HMRC_PORT, json(404, HMRC_NOT_REGISTERED));
+    const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
+    expect(res.headers['x-vies-data-hash']).toBe(sha256(HMRC_NOT_REGISTERED));
+  });
+});
+
 describe('manifest (lock)', () => {
-  it('declares the VIES_SCHEMA fields in order', () => {
+  it('declares the VIES_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(VIES_SCHEMA.map((f) => [f.name, f.encoding]));
+    expect(HANDLER_MANIFEST.schema.outputBytes).toBe(VIES_SCHEMA.length * 32);
   });
 });

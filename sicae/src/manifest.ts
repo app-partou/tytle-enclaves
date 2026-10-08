@@ -43,7 +43,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
 
   schema: {
     name: 'SICAE_SCHEMA',
-    outputBytes: 192,
+    outputBytes: 256,
     fields: [
       { name: 'nif',       encoding: 'shortString', source: { from: 'request', param: 'nif' } },
       { name: 'name',      encoding: 'sha256',      source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'officialName' } },
@@ -51,6 +51,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       { name: 'cae1Desc',  encoding: 'sha256',      source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'primaryCAE.description' } },
       { name: 'cae2Code',  encoding: 'shortString', source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'secondaryCAE[0].code' } },
       { name: 'cae2Desc',  encoding: 'sha256',      source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'secondaryCAE[0].description' } },
+      { name: 'dataHash',  encoding: 'sha256',      source: { from: 'derived', inputs: ['sicae_post:rawBody'], join: '', transform: 'sha256' } },
+      { name: 'transport', encoding: 'shortString', source: { from: 'host', host: 'www.sicae.pt', property: 'tls' } },
     ],
   },
 
@@ -97,15 +99,15 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'http_transport',
-      check: { type: 'behavioral', description: 'Uses HTTP (no TLS) — www.sicae.pt does not support HTTPS' },
-      reason: 'Data is public and cross-referenced; host cannot forge NSM attestation',
+      check: { type: 'behavioral', description: 'Uses HTTP (no TLS) - www.sicae.pt does not support HTTPS; the signed vector says so (transport = \'http\')' },
+      reason: 'The host relays plaintext and could change the page before the enclave reads it: the answer records which code read which page (dataHash), never that the page is genuine (audit P1.5, D-P1-1)',
     },
   ],
 
   repeatability: {
-    hashAlgorithm: null,
-    dataHashInput: null,
-    outputFormat: 'BN254 big-endian, 6 × 32 bytes, base64',
+    hashAlgorithm: 'sha256',
+    dataHashInput: 'sicae_post:rawBody - the page the answer was read from, UTF-8',
+    outputFormat: 'BN254 big-endian, 8 × 32 bytes, base64',
     deterministic: true,
   },
 };

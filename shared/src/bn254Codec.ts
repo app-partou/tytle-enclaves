@@ -40,6 +40,11 @@ export interface FieldDef {
 // Provider Schemas
 // =============================================================================
 
+// Version 2 of the VIES and SICAE vectors (the 2026-10 release, audit P1.4 / P1.5): `dataHash` (the SHA-256 of the
+// upstream body the answer was read from) is appended to both, and SICAE's `transport` ('http' / 'https', from the
+// host's allowlist entry) after it. Version 1 (VIES 5 fields, SICAE 6) is what earlier releases signed; data-bridge
+// decodes a vector by its length (packages/attestation-core schemaForVector), so stored version-1 rows keep decoding.
+
 export const SICAE_SCHEMA: FieldDef[] = [
   { name: 'nif',       encoding: 'shortString', jsType: 'string' },
   { name: 'name',      encoding: 'sha256',      jsType: 'string' },
@@ -47,6 +52,8 @@ export const SICAE_SCHEMA: FieldDef[] = [
   { name: 'cae1Desc',  encoding: 'sha256',      jsType: 'string' },
   { name: 'cae2Code',  encoding: 'shortString', jsType: 'string' },
   { name: 'cae2Desc',  encoding: 'sha256',      jsType: 'string' },
+  { name: 'dataHash',  encoding: 'sha256',      jsType: 'string' },
+  { name: 'transport', encoding: 'shortString', jsType: 'string' },
 ];
 
 export const VIES_SCHEMA: FieldDef[] = [
@@ -55,6 +62,7 @@ export const VIES_SCHEMA: FieldDef[] = [
   { name: 'valid',       encoding: 'uint',        jsType: 'boolean' },
   { name: 'name',        encoding: 'sha256',      jsType: 'string' },
   { name: 'address',     encoding: 'sha256',      jsType: 'string' },
+  { name: 'dataHash',    encoding: 'sha256',      jsType: 'string' },
 ];
 
 export const STRIPE_PAYMENT_SCHEMA: FieldDef[] = [

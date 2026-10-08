@@ -36,13 +36,14 @@ export const HANDLER_MANIFEST: HandlerManifest = {
 
   schema: {
     name: 'VIES_SCHEMA',
-    outputBytes: 160,
+    outputBytes: 192,
     fields: [
       { name: 'countryCode', encoding: 'shortString', source: { from: 'request', param: 'countryCode' } },
       { name: 'vatNumber',   encoding: 'shortString', source: { from: 'request', param: 'vatNumber' } },
       { name: 'valid',       encoding: 'uint',         source: { from: 'parsed', query: 'vies_soap', parser: 'soap_xml', field: 'valid' } },
       { name: 'name',        encoding: 'sha256',       source: { from: 'parsed', query: 'vies_soap', parser: 'soap_xml', field: 'name' } },
       { name: 'address',     encoding: 'sha256',       source: { from: 'parsed', query: 'vies_soap', parser: 'soap_xml', field: 'address' } },
+      { name: 'dataHash',    encoding: 'sha256',       source: { from: 'derived', inputs: ['vies_soap:rawBody', 'hmrc_rest:rawBody'], join: '', transform: 'sha256' } },
     ],
   },
 
@@ -105,9 +106,9 @@ export const HANDLER_MANIFEST: HandlerManifest = {
   ],
 
   repeatability: {
-    hashAlgorithm: null,
-    dataHashInput: null,
-    outputFormat: 'BN254 big-endian, 5 × 32 bytes, base64',
+    hashAlgorithm: 'sha256',
+    dataHashInput: 'the routed query\'s raw body (vies_soap:rawBody, or hmrc_rest:rawBody for GB), UTF-8',
+    outputFormat: 'BN254 big-endian, 6 × 32 bytes, base64',
     deterministic: true,
   },
 };

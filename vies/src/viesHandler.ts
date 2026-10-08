@@ -6,10 +6,11 @@
  * and attests the encoded output.
  *
  * Request body:  { countryCode: string, vatNumber: string }
- * Response:      BN254-encoded field elements (5 x 32 = 160 bytes, base64)
- *                + human-readable headers (x-vies-*)
+ * Response:      BN254-encoded field elements (6 x 32 = 192 bytes, base64; the last is dataHash, the SHA-256
+ *                of the upstream body the answer was read from) + human-readable headers (x-vies-*)
  */
 
+import crypto from 'node:crypto';
 import { VIES_SCHEMA } from '@tytle-enclaves/shared';
 import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost } from '@tytle-enclaves/shared';
 import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
@@ -211,6 +212,7 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
     let name: string | undefined;
     let address: string | undefined;
     let apiEndpoint: string;
+    let upstreamBody: string;
 
     if (isHmrc) {
       const path = `/organisations/vat/check-vat-number/lookup/${encodeURIComponent(vatNumber)}`;
@@ -222,6 +224,7 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
       );
 
       const parsed = parseHmrcResponse(response.body, response.status);
+      upstreamBody = response.body;
       valid = parsed.valid;
       name = parsed.name;
       address = parsed.address;
@@ -244,10 +247,15 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
       }
 
       const parsed = parseCheckVatSoapResponse(response.body);
+      upstreamBody = response.body;
       valid = parsed.valid;
       name = parsed.name;
       address = parsed.address;
     }
+
+    // The whole upstream body is committed, so a later parser change or a dispute can be checked against what the
+    // register sent (audit P1.4 `dataHash`; the same rule as Stripe's): the hex digest is the value, encoded as sha256.
+    const dataHash = crypto.createHash('sha256').update(upstreamBody, 'utf8').digest('hex');
 
     return {
       values: {
@@ -256,6 +264,7 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
         valid: valid ? 1 : 0,
         name: name || null,
         address: address || null,
+        dataHash,
       },
       apiEndpoint,
       method: isHmrc ? 'GET' : 'POST',
@@ -269,10 +278,12 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
         'x-vies-valid': String(valid),
         'x-vies-name': name || '',
         'x-vies-address': address || '',
+        'x-vies-data-hash': dataHash,
       },
       bn254Headers: {
         'x-vies-name': name || '',
         'x-vies-address': address || '',
+        'x-vies-data-hash': dataHash,
       },
     };
   },

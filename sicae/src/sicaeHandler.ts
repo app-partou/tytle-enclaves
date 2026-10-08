@@ -2,7 +2,7 @@
  * SICAE Custom Handler
  *
  * Multi-step HTTP + HTML parsing inside the enclave, outputting
- * concatenated BN254 field elements (compact binary, 192 bytes).
+ * concatenated BN254 field elements (compact binary, 256 bytes).
  *
  * Flow:
  * 1. Parse request body as JSON: { nif: string }
@@ -10,11 +10,13 @@
  * 3. POST NIF search -> get results HTML
  * 4. Read the page: a results row (officialName, primary CAE, secondary CAE), SICAE's "no data" row,
  *    its "NIPC not valid" refusal, or a page it cannot read (an error, never an answer)
- * 5. Encode as BN254 field elements (6 x 32 bytes = 192 bytes); "not found" is nif + five nulls, status 404
+ * 5. Encode as BN254 field elements (8 x 32 bytes = 256 bytes): the answer, dataHash (the SHA-256 of the page it
+ *    was read from) and transport ('http': www.sicae.pt has no HTTPS); "not found" is nif + five nulls, status 404
  * 6. Attest the encoded bytes
  * 7. Return response with attestation + human-readable headers
  */
 
+import crypto from 'node:crypto';
 import { SICAE_SCHEMA } from '@tytle-enclaves/shared';
 import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost } from '@tytle-enclaves/shared';
 import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
@@ -319,6 +321,7 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
 
     // Step 2: POST NIF search - try each variant until SICAE processes one
     let outcome: PageOutcome = { kind: 'not_processed' };
+    let answeredPage = '';
     const refusedStatuses: number[] = [];
     for (const variant of variants) {
       const formBody = buildFormBody(nif, viewState, eventValidation, variant);
@@ -347,11 +350,16 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
         continue;
       }
       outcome = readSicaePage(postResponse.body, nif);
+      answeredPage = postResponse.body;
       // A processed page - an answer or one this handler cannot read - is what any other variant would get too.
       if (outcome.kind !== 'not_processed') break;
     }
 
     const apiEndpoint = `${sicaeHost.hostname}/Consulta.aspx`;
+    // Committed with every answer (audit P1.4 / P1.5): the page it was read from, and how the bytes came - plain HTTP
+    // here, so the answer is a provenance record, never evidence the page itself is genuine.
+    const dataHash = crypto.createHash('sha256').update(answeredPage, 'utf8').digest('hex');
+    const transport = sicaeHost.tls === false ? 'http' : 'https';
 
     if (outcome.kind === 'unreadable') {
       throw new Error(`SICAE page unreadable: ${outcome.detail}`);
@@ -366,12 +374,13 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
       // (audit 2026-10 P1.4: only an attested 200 with an empty result is not_found). nif is set, every other
       // field is null - a found row always has a name and a primary CAE.
       return {
-        values: { nif, name: null, cae1Code: null, cae1Desc: null, cae2Code: null, cae2Desc: null },
+        values: { nif, name: null, cae1Code: null, cae1Desc: null, cae2Code: null, cae2Desc: null, dataHash, transport },
         apiEndpoint,
         method: 'POST',
         url: `http://${sicaeHost.hostname}/Consulta.aspx`,
         requestHeaders: { nif },
-        responseHeaders: { 'x-sicae-nif': nif, 'x-sicae-not-found': outcome.why },
+        responseHeaders: { 'x-sicae-nif': nif, 'x-sicae-not-found': outcome.why, 'x-sicae-data-hash': dataHash, 'x-sicae-transport': transport },
+        bn254Headers: { 'x-sicae-data-hash': dataHash },
         status: 404,
       };
     }
@@ -389,6 +398,8 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
         cae1Desc: sicaeResult.caePrimaryDescription,
         cae2Code,
         cae2Desc,
+        dataHash,
+        transport,
       },
       apiEndpoint,
       method: 'POST',
@@ -401,11 +412,14 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
         'x-sicae-cae1-desc': sicaeResult.caePrimaryDescription,
         'x-sicae-cae2-code': cae2Code || '',
         'x-sicae-cae2-desc': cae2Desc || '',
+        'x-sicae-data-hash': dataHash,
+        'x-sicae-transport': transport,
       },
       bn254Headers: {
         'x-sicae-name': sicaeResult.officialName,
         'x-sicae-cae1-desc': sicaeResult.caePrimaryDescription,
         'x-sicae-cae2-desc': cae2Desc || '',
+        'x-sicae-data-hash': dataHash,
       },
     };
   },

@@ -51,12 +51,18 @@ function scriptSicae(...posts: string[]): void {
 
 const posts = () => fakeIo.requests(PORT).filter((r) => r.startsWith('POST '));
 
+/** The SHA-256 hex of a page: the value the handler signs as dataHash. */
+const sha256 = (page: string) => createHash('sha256').update(page, 'utf8').digest('hex');
+
 /** The vector the enclave must sign, and the hash it must hand the NSM as user_data. */
 function signed(values: Record<string, string | null>) {
   const vector = encodeFieldElements(SICAE_SCHEMA, values);
   return { base64: vector.toString('base64'), hash: hashFieldElements(vector) };
 }
-const NOT_FOUND = (nif: string) => signed({ nif, name: null, cae1Code: null, cae1Desc: null, cae2Code: null, cae2Desc: null });
+/** "Not found": nif, five nulls, the hash of the page it was read from, and the transport. */
+const NOT_FOUND = (nif: string, page: string) => signed({
+  nif, name: null, cae1Code: null, cae1Desc: null, cae2Code: null, cae2Desc: null, dataHash: sha256(page), transport: 'http',
+});
 
 beforeEach(() => {
   fakeIo.reset();
@@ -92,6 +98,8 @@ describe('a results row', () => {
       cae1Desc: 'Comércio de eletricidade, exceto para mobilidade elétrica',
       cae2Code: '35230',
       cae2Desc: 'Comércio de gás por condutas',
+      dataHash: sha256(FOUND),
+      transport: 'http',
     });
     expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64, bn254: want.base64 });
     expect(res.headers).toMatchObject({
@@ -105,6 +113,7 @@ describe('a results row', () => {
       'x-sicae-name': 'EDP COMERCIAL-COMERCIALIZAÇÃO DE ENERGIA, S.A.',
       'x-sicae-cae1-desc': 'Comércio de eletricidade, exceto para mobilidade elétrica',
       'x-sicae-cae2-desc': 'Comércio de gás por condutas',
+      'x-sicae-data-hash': sha256(FOUND),
     });
     expect(res.attestation?.bn254Hash).toBe(want.hash);
     // The attested request config names the NIF and the manifest the handler ran under.
@@ -142,7 +151,7 @@ describe('SICAE\'s own "not found" answers are signed (red before the release)',
     scriptSicae(html(NO_DATA));
     const res = await lookup('980494796');
 
-    const want = NOT_FOUND('980494796');
+    const want = NOT_FOUND('980494796', NO_DATA);
     expect(res).toMatchObject({ success: true, status: 404, rawBody: want.base64, bn254: want.base64 });
     expect(res.headers).toMatchObject({ 'x-sicae-nif': '980494796', 'x-sicae-not-found': 'no_data', 'x-sicae-manifest-hash': MANIFEST_HASH });
     expect(res.attestation?.bn254Hash).toBe(want.hash);
@@ -154,7 +163,7 @@ describe('SICAE\'s own "not found" answers are signed (red before the release)',
     scriptSicae(html(INVALID_NIPC));
     const res = await lookup('123456788');
 
-    const want = NOT_FOUND('123456788');
+    const want = NOT_FOUND('123456788', INVALID_NIPC);
     expect(res).toMatchObject({ success: true, status: 404, rawBody: want.base64 });
     expect(res.headers['x-sicae-not-found']).toBe('invalid_nipc');
     expect(fakeIo.nsmAsks.map((a) => a.userData?.toString('hex'))).toEqual([want.hash]);
@@ -239,6 +248,23 @@ describe('the other variant is tried only when the first was not processed (lock
   });
 });
 
+describe('what the vector commits to besides the answer (red before the release)', () => {
+  it('dataHash is the SHA-256 of the page the answer was read from - not a page a first variant brought back', async () => {
+    scriptSicae(html(SEARCH_PAGE), html(FOUND));
+    const res = await lookup('503504564');
+    expect(res.headers['x-sicae-data-hash']).toBe(sha256(FOUND));
+    expect(Buffer.from(res.rawBody, 'base64')).toHaveLength(256);
+  });
+
+  it('transport is signed as "http": www.sicae.pt is reached in plaintext', async () => {
+    scriptSicae(html(FOUND));
+    const res = await lookup('503504564');
+    expect(res.headers['x-sicae-transport']).toBe('http');
+    const transport = Buffer.from(res.rawBody, 'base64').subarray(7 * 32, 8 * 32);
+    expect(transport).toEqual(encodeFieldElements([{ name: 'transport', encoding: 'shortString' }], { transport: 'http' }));
+  });
+});
+
 describe('the search page itself (lock)', () => {
   it('a GET that is not 200 is an error', async () => {
     fakeIo.reply(PORT, httpReply(503, 'Service Unavailable'));
@@ -264,7 +290,8 @@ describe('the search page itself (lock)', () => {
 });
 
 describe('manifest (lock)', () => {
-  it('declares the SICAE_SCHEMA fields in order', () => {
+  it('declares the SICAE_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(SICAE_SCHEMA.map((f) => [f.name, f.encoding]));
+    expect(HANDLER_MANIFEST.schema.outputBytes).toBe(SICAE_SCHEMA.length * 32);
   });
 });

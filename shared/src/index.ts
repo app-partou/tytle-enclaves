@@ -22,7 +22,7 @@ export type { FieldDef, FieldEncoding } from './bn254Codec.js';
 export { stableStringify, computeManifestHash, validateManifest } from './manifest.js';
 export type {
   FieldTransform, ResponseFieldSource, RequestParamSource, RequestHeaderSource,
-  ParsedSource, DerivedSource, FieldSource, FieldProvenance,
+  ParsedSource, DerivedSource, HostSource, FieldSource, FieldProvenance,
   QueryAuth, RpcCall, QueryDef, PolicyCheck, PolicyDef,
   RepeatabilityDef, HandlerManifest,
 } from './manifest.js';
