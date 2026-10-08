@@ -22,7 +22,8 @@ const COSE_ALG_ES384 = -35;
 export interface CoseVerificationResult {
   signatureValid: boolean;
   certChainValid: boolean;
-  pcrs: { pcr0: string; pcr1: string; pcr2: string };
+  /** From the signed payload: the EIF's PCR0-2, and PCR8 - who signed the EIF ('' or zeroes: unsigned). */
+  pcrs: { pcr0: string; pcr1: string; pcr2: string; pcr8: string };
   /** Nonce from the hardware-signed COSE payload (hex). Compare to application nonce. */
   payloadNonce: string | null;
   /** user_data from the hardware-signed COSE payload (hex): the SHA-256 of the BN254 vector. */
@@ -62,7 +63,7 @@ export function verifyCoseSignature(
     return {
       signatureValid: false,
       certChainValid: false,
-      pcrs: { pcr0: '', pcr1: '', pcr2: '' },
+      pcrs: { pcr0: '', pcr1: '', pcr2: '', pcr8: '' },
       payloadNonce: null,
       payloadUserData: null,
       payloadTimestampMs: null,

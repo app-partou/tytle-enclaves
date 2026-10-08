@@ -9,17 +9,21 @@
  *   node recipe.mjs helper-tag                  the nitro-cli helper's tag, as the verify CLI computes it
  *   node recipe.mjs config-digest  < manifest   the config digest of a docker tarball's one image
  *   node recipe.mjs image-name     < manifest   the one name of a docker tarball's one image
- *   node recipe.mjs measurements   < stdout     the {pcr0, pcr1, pcr2} of nitro-cli build-enclave's output
+ *   node recipe.mjs measurements   < stdout     the {pcr0, pcr1, pcr2, and pcr8 when signed} of nitro-cli build-enclave
  *   node recipe.mjs pcr0           < json       the pcr0 of a measurements object
+ *   node recipe.mjs signing-check <cert> <key>  refuse a signing certificate that is not P-384, is not the key's, or
+ *                                               ends within 60 days; print the PCR8 an EIF it signs carries
+ *   node recipe.mjs pcr8-is <hex>  < json       fail unless the measurements carry that PCR8
  *   node recipe.mjs check  <service> <digest> < measurements    the build against scripts/expected-digests.json
  *   node recipe.mjs record <service> <digest> < measurements    the build INTO scripts/expected-digests.json
+ *   node recipe.mjs eif-measurements <service> <digest> < measurements    what build-eif.sh writes next to an EIF
  *
  * The verify CLI holds the same rules in TypeScript (verify/src/lib/buildRecipe.ts, nitroCli.ts): it never runs code
  * of the repository it verifies on its host. verify's buildRecipe.drift.test.ts runs both on the same inputs.
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { X509Certificate, createHash, createPrivateKey } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -87,6 +91,7 @@ export function measurementsOf(stdout) {
   if (start < 0) throw new Error('nitro-cli printed no measurements');
   const measured = JSON.parse(lines.slice(start).join('\n')).Measurements ?? {};
   const pcrs = { pcr0: measured.PCR0, pcr1: measured.PCR1, pcr2: measured.PCR2 };
+  if (measured.PCR8 !== undefined) pcrs.pcr8 = measured.PCR8; // a signed EIF only
   for (const [name, value] of Object.entries(pcrs)) {
     if (typeof value !== 'string' || !SHA384_HEX.test(value.toLowerCase())) {
       throw new Error(`nitro-cli printed no ${name.toUpperCase()} (a SHA-384 in hex)`);
@@ -105,10 +110,57 @@ function pcrsOf(measurementsJson) {
   return { pcr0, pcr1, pcr2 };
 }
 
+/**
+ * How long a signing certificate must still be valid when it signs. An EIF whose certificate has expired does not start
+ * (nitro-cli run-enclave fails with E36, E39 and E11), so each restart of it on the host would fail too.
+ */
+export const SIGNING_CERT_MIN_DAYS = 60;
+
+/**
+ * The PCR8 of an EIF signed with this certificate: the register starts at 48 zero bytes and is extended once with the
+ * SHA-384 of the certificate's DER - SHA-384(0x00 * 48 || SHA-384(DER)). Not SHA-384(0x00 * 48 || DER): an extend
+ * takes the digest. Checked against the PCR8 nitro-cli 1.4.4 printed for a signed build (verify's fixtures).
+ */
+export function pcr8Of(certPem) {
+  const digest = createHash('sha384').update(new X509Certificate(certPem).raw).digest();
+  return createHash('sha384').update(Buffer.concat([Buffer.alloc(48), digest])).digest('hex');
+}
+
+/** The signing certificate and its key, checked before anything is signed; returns the PCR8 the EIF will carry. */
+export function signingCheck(certPem, keyPem, now = new Date()) {
+  const cert = new X509Certificate(certPem);
+  const problems = [];
+  const { asymmetricKeyType } = cert.publicKey;
+  if (asymmetricKeyType !== 'ec' || cert.publicKey.asymmetricKeyDetails?.namedCurve !== 'secp384r1') {
+    problems.push('its key is not EC P-384');
+  }
+  let ownKey = false;
+  try { ownKey = cert.checkPrivateKey(createPrivateKey(keyPem)); } catch { ownKey = false; }
+  if (!ownKey) problems.push('the private key is not its key');
+  const validFrom = new Date(cert.validFrom);
+  const validTo = new Date(cert.validTo);
+  if (validFrom > now) problems.push(`it is not valid before ${validFrom.toISOString()}`);
+  const daysLeft = Math.floor((validTo.getTime() - now.getTime()) / 86_400_000);
+  if (daysLeft < SIGNING_CERT_MIN_DAYS) {
+    problems.push(`it ends ${validTo.toISOString()}, ${daysLeft} days from now (at least ${SIGNING_CERT_MIN_DAYS})`);
+  }
+  if (problems.length > 0) throw new Error(`the signing certificate ${cert.subject}: ${problems.join('; ')}`);
+  return pcr8Of(certPem);
+}
+
 /** One build's record: its config digest and its measurements. */
 function entryOf(digest, measurementsJson) {
   if (!CONFIG_DIGEST.test(digest)) throw new Error(`not a config digest: "${digest}"`);
   return { imageConfigDigest: digest, ...pcrsOf(measurementsJson) };
+}
+
+/** What scripts/build-eif.sh writes next to an EIF: the enclave, its build's record, and PCR8 when it is signed. */
+export function eifMeasurementsOf(service, digest, measurementsJson) {
+  const { pcr8 } = JSON.parse(measurementsJson);
+  if (pcr8 !== undefined && (typeof pcr8 !== 'string' || !SHA384_HEX.test(pcr8))) {
+    throw new Error('not a measurements object');
+  }
+  return { enclave: service, ...entryOf(digest, measurementsJson), ...(pcr8 === undefined ? {} : { pcr8 }) };
 }
 
 const EXPECTED = (root) => path.join(root, 'scripts/expected-digests.json');
@@ -156,6 +208,14 @@ function main([command, ...args]) {
     case 'image-name': return imageNameOf(stdin());
     case 'measurements': return JSON.stringify(measurementsOf(stdin()));
     case 'pcr0': return pcrsOf(stdin()).pcr0;
+    case 'signing-check': return signingCheck(readFileSync(args[0], 'utf8'), readFileSync(args[1], 'utf8'));
+    case 'pcr8-is': {
+      const { pcr8 } = JSON.parse(stdin());
+      if (pcr8 !== args[0]) {
+        throw new Error(`the EIF carries PCR8 ${pcr8 ?? '(none: it is unsigned)'}, not the certificate's ${args[0]}`);
+      }
+      return pcr8;
+    }
     case 'check': {
       const [service, digest] = args;
       const found = differences(readExpected()[service], entryOf(digest, stdin()));
@@ -170,6 +230,7 @@ function main([command, ...args]) {
       record(ROOT, service, entryOf(digest, stdin()));
       return `${service}: recorded in scripts/expected-digests.json`;
     }
+    case 'eif-measurements': return JSON.stringify(eifMeasurementsOf(args[0], args[1], stdin()), null, 2);
     default: throw new Error(`unknown command "${command}"`);
   }
 }

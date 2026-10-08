@@ -23,6 +23,14 @@ describe('the verification guide', () => {
     expect(GUIDE).toContain(getAwsNitroRootCa().fingerprint256);
   });
 
+  it('tells how to check PCR8 as the CLI checks it: its option, and the formula as a command (red)', () => {
+    expect(CLI).toContain("'--signing-cert <file>'");
+    expect(GUIDE).toContain('node dist/cli.js --service vies --attestation attestation.json --signing-cert signing-cert.pem');
+    // SHA-384(48 zero bytes || SHA-384(DER)): signing.test.ts proves it is the PCR8 nitro-cli computes
+    expect(GUIDE).toContain(
+      '{ head -c 48 /dev/zero; openssl x509 -in signing-cert.pem -outform DER | openssl dgst -sha384 -binary; }');
+  });
+
   it("names the PCR0 route the CLI reads (lock)", () => {
     const route = /`\$\{apiBaseUrl\}(\/api\/enclave\/pcr0)`/.exec(PCR0_API)?.[1];
     expect(route).toBe('/api/enclave/pcr0');

@@ -47,6 +47,17 @@ describe('the CI workflow', () => {
     expect(read(WORKFLOW)).toContain('run: bash scripts/test-determinism.sh "$ENCLAVE"');
   });
 
+  it("then signs each enclave's EIF with a throwaway certificate, as the deploy is to sign it (P1.6) (red)", () => {
+    const workflow = read(WORKFLOW);
+    const job = workflow.slice(workflow.indexOf('\n  determinism:'), workflow.indexOf('\n  pcr0-changes:'));
+    expect(job.indexOf('run: bash scripts/ci/test-signing.sh "$ENCLAVE"'))
+      .toBeGreaterThan(job.indexOf('run: bash scripts/test-determinism.sh "$ENCLAVE"'));
+    const script = read('scripts/ci/test-signing.sh');
+    expect(script).toContain('openssl ecparam -name secp384r1 -genkey -noout -out "$WORK/key.pem"');
+    expect(script).toContain('EIF_SIGNING_KEY="$WORK/key.pem" EIF_SIGNING_CERT="$WORK/cert.pem" \\\n'
+      + '  bash "$REPO_DIR/scripts/build-eif.sh" "$ENCLAVE" "$WORK/eif"');
+  });
+
   it('builds the parent image as the deploy builds it (red)', () => {
     expect(read(WORKFLOW)).toContain('run: bash scripts/build-service.sh parent ci');
   });

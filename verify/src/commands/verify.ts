@@ -10,8 +10,10 @@
  * 4. Verify the data binding: COSE user_data == bn254Hash; with --bn254, the vector's hashes
  * 5. Fetch PCR0 + commit from public API (uses trusted PCR0 for history lookup)
  * 6. Compare PCR0 against API
- * 7. Reproduce Docker build (unless --skip-build), always from the repository below
- * 8. Extract PCR0 from reproduced build + compare
+ * 7. The operator binding: with --signing-cert, PCR8 must be that certificate's (the EIF was signed with it); without
+ *    it, PCR8 is reported (lib/signing.ts)
+ * 8. Reproduce Docker build (unless --skip-build), always from the repository below
+ * 9. Extract PCR0 from reproduced build + compare
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -32,6 +34,8 @@ import {
 import { extractPcr0 } from '../lib/nitroCli.js';
 import * as report from '../lib/report.js';
 import { printReport } from '../lib/report.js';
+import { isEmptyPcr, pcr8OfCertificate } from '../lib/signing.js';
+import { validateSigningCertFile } from '../lib/validation.js';
 
 export interface VerifyOptions {
   service: ServiceName;
@@ -43,6 +47,8 @@ export interface VerifyOptions {
   pcr0?: string; // manual PCR0 override
   /** A file holding the BN254 vector (base64) the data holder received: its hashes are recomputed. */
   bn254?: string;
+  /** A file holding the EIF signing certificate (PEM) Tytle publishes: PCR8 must be its. */
+  signingCert?: string;
 }
 
 /**
@@ -322,9 +328,38 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
       report.fail('Cannot compare PCR0 — API unreachable and no --pcr0 provided');
     }
 
-    // --- Steps 8-9: Reproducible build (optional) ---
+    // --- Step 8: The operator binding (PCR8) ---
+    // PCR0 says which code ran, wherever it ran. An EIF signed with a certificate boots with PCR8 = that certificate's
+    // (lib/signing.ts); an unsigned one with PCR8 all zeroes. The certificate is one the person names: the document
+    // never chooses what it is compared with.
+    report.step(8, 'Checking the operator binding (PCR8)');
+
+    const trustedPcr8 = coseResult.pcrs.pcr8.toLowerCase();
+    const signedEif = !isEmptyPcr(trustedPcr8);
+    if (options.signingCert) {
+      const certificatePcr8 = pcr8OfCertificate(validateSigningCertFile(options.signingCert));
+      const bound = safeEqual(trustedPcr8, certificatePcr8);
+      checks.push({
+        name: "PCR8 is the signing certificate's (--signing-cert)",
+        passed: bound,
+        detail: bound
+          ? undefined
+          : signedEif
+            ? `PCR8: ${trustedPcr8.slice(0, 32)}..., the certificate's: ${certificatePcr8.slice(0, 32)}...`
+            : 'PCR8 is zero: the EIF that ran was not signed',
+      });
+      if (bound) report.pass("PCR8 is the signing certificate's: the EIF that ran was signed with it");
+      else if (signedEif) report.fail("PCR8 is NOT the signing certificate's: another key signed the EIF that ran");
+      else report.fail('PCR8 is zero: the EIF that ran was not signed');
+    } else if (signedEif) {
+      report.info(`PCR8 ${trustedPcr8.slice(0, 16)}...: a signed EIF. --signing-cert <pem> checks whose key signed it`);
+    } else {
+      report.info('PCR8 is zero: an unsigned EIF, so the document does not say whose EIF ran');
+    }
+
+    // --- Steps 9-10: Reproducible build (optional) ---
     if (!options.skipBuild) {
-      report.step(8, 'Reproducing Docker build');
+      report.step(9, 'Reproducing Docker build');
 
       if (!checkDocker()) {
         checks.push({
@@ -360,7 +395,7 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
           report.pass(`Image built: ${buildResult.imageTag}`);
 
           // Extract PCR0 from reproduced build and compare
-          report.step(9, 'Extracting and comparing reproduced PCR0');
+          report.step(10, 'Extracting and comparing reproduced PCR0');
 
           try {
             const buildPcr0 = extractPcr0(buildResult.imageTag);

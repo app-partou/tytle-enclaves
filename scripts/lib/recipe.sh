@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 #
 # The ONE build recipe of every image of this repository (enclave audit P2.2). Sourced, never run: each service's
-# build.sh (the deploy), scripts/test-determinism.sh (the determinism gate and CI) and scripts/rotate-pcr0.sh build
-# and measure through these functions and nothing else.
+# build.sh (the deploy), scripts/test-determinism.sh (the determinism gate and CI), scripts/build-eif.sh (an EIF,
+# signed or not) and scripts/rotate-pcr0.sh build and measure through these functions and nothing else.
 #
 # The values are scripts/build-recipe.json's:
 #   - platform: linux/amd64, what a Nitro host runs.
@@ -80,14 +80,63 @@ recipe_nitro_helper() {
   echo "$tag"
 }
 
-# recipe_measure <out.tar> - loads the image into Docker and prints its EIF measurements: {"pcr0","pcr1","pcr2"}.
+# recipe_signing_pcr8 - the EIF signing key and certificate (enclave audit P1.6): EIF_SIGNING_KEY and EIF_SIGNING_CERT
+# name them, PEM files, both or neither. With neither it prints nothing: the EIF is unsigned. With both it checks the
+# certificate (EC P-384, the key's own, valid, at least 60 days left: an EIF whose certificate has expired does not
+# start, and neither does a restart of it) and prints the PCR8 an EIF it signs carries. Call it before building.
+recipe_signing_pcr8() {
+  if [ -z "${EIF_SIGNING_KEY:-}${EIF_SIGNING_CERT:-}" ]; then
+    return 0
+  fi
+  if [ -z "${EIF_SIGNING_KEY:-}" ] || [ -z "${EIF_SIGNING_CERT:-}" ]; then
+    echo "recipe: set both EIF_SIGNING_KEY and EIF_SIGNING_CERT, or neither" >&2
+    return 1
+  fi
+  node "$RECIPE_LIB/recipe.mjs" signing-check "$EIF_SIGNING_CERT" "$EIF_SIGNING_KEY"
+}
+
+# recipe_measure <out.tar> [out.eif] - loads the image into Docker, makes its EIF with the nitro-cli helper and prints
+# the EIF's measurements: {"pcr0","pcr1","pcr2"}, and "pcr8" when it is signed. Given out.eif (its directory must
+# exist), the EIF is kept there; else it is gone with the helper.
+#
+# Signed when the signing key and certificate are set (recipe_signing_pcr8, checked again here): both files are
+# mounted read-only, and the EIF's PCR8 must be the certificate's. Signing changes no other PCR: PCR0, PCR1 and PCR2
+# are the unsigned build's, what a third party's rebuild gives. PCR8 says whose signed EIF ran.
 recipe_measure() {
-  local tar="$1" name helper
-  name="$(tar -xOf "$tar" manifest.json | node "$RECIPE_LIB/recipe.mjs" image-name)"
-  docker load -i "$tar" >/dev/null
-  helper="$(recipe_nitro_helper)"
-  docker run --rm --platform "$(recipe_value platform)" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    "$helper" build-enclave --docker-uri "$name" --output-file /tmp/measure.eif \
-    | node "$RECIPE_LIB/recipe.mjs" measurements
+  local tar="$1" eif="${2:-}" name helper pcr8 measurements
+  pcr8="$(recipe_signing_pcr8)" || return 1
+  name="$(tar -xOf "$tar" manifest.json | node "$RECIPE_LIB/recipe.mjs" image-name)" || return 1
+  docker load -i "$tar" >/dev/null || return 1
+  helper="$(recipe_nitro_helper)" || return 1
+
+  # The helper's arguments, in order (positional: an empty array is an unbound variable on bash 3.2 with set -u)
+  set -- --rm --platform "$(recipe_value platform)" -v /var/run/docker.sock:/var/run/docker.sock
+  if [ -n "$pcr8" ]; then
+    set -- "$@" -v "$(recipe_abs_path "$EIF_SIGNING_KEY"):/signing/key.pem:ro" \
+      -v "$(recipe_abs_path "$EIF_SIGNING_CERT"):/signing/cert.pem:ro"
+  fi
+  if [ -n "$eif" ]; then
+    set -- "$@" -v "$(recipe_abs_path "$(dirname "$eif")"):/out" \
+      "$helper" build-enclave --docker-uri "$name" --output-file "/out/$(basename "$eif")"
+  else
+    set -- "$@" "$helper" build-enclave --docker-uri "$name" --output-file /tmp/measure.eif
+  fi
+  if [ -n "$pcr8" ]; then
+    set -- "$@" --private-key /signing/key.pem --signing-certificate /signing/cert.pem
+  fi
+
+  measurements="$(docker run "$@" | node "$RECIPE_LIB/recipe.mjs" measurements)" || return 1
+  if [ -n "$pcr8" ]; then
+    node "$RECIPE_LIB/recipe.mjs" pcr8-is "$pcr8" <<<"$measurements" >/dev/null || return 1
+  fi
+  echo "$measurements"
+}
+
+# recipe_abs_path <path> - the absolute path of a file or directory that exists (docker -v takes no relative path).
+recipe_abs_path() {
+  if [ -d "$1" ]; then
+    (cd "$1" && pwd)
+  else
+    echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  fi
 }

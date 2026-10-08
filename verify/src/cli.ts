@@ -13,6 +13,7 @@
  *   node dist/cli.js --service vies --attestation attestation.json
  *   node dist/cli.js --service vies --attestation att.json --skip-build
  *   node dist/cli.js --service vies --attestation att.json --bn254 vector.b64
+ *   node dist/cli.js --service vies --attestation att.json --signing-cert signing-cert.pem
  */
 
 import { Command } from 'commander';
@@ -25,6 +26,7 @@ import {
   validateApiUrl,
   validatePcr0Hex,
   validateRepoDir,
+  validateSigningCertFile,
 } from './lib/validation.js';
 import { runVerification } from './commands/verify.js';
 
@@ -60,6 +62,10 @@ program
     '--bn254 <file>',
     'A file with the BN254 vector (base64) you received: checks it is the one signed',
   )
+  .option(
+    '--signing-cert <file>',
+    'The EIF signing certificate Tytle publishes (PEM): checks the EIF that ran was signed with it (PCR8)',
+  )
   .action(async (opts) => {
     let service: ServiceName = opts.service;
     let attestation: string = opts.attestation;
@@ -81,6 +87,7 @@ program
       if (opts.pcr0) opts.pcr0 = validatePcr0Hex(opts.pcr0);
       if (opts.repoDir) validateRepoDir(opts.repoDir);
       if (opts.bn254 && !existsSync(opts.bn254)) throw new Error(`--bn254 file not found: ${opts.bn254}`);
+      if (opts.signingCert) validateSigningCertFile(opts.signingCert);
     } catch (err: any) {
       console.error(`\n\x1b[31mValidation error:\x1b[0m ${err.message}`);
       process.exit(1);
@@ -107,6 +114,7 @@ program
         skipBuild: opts.skipBuild,
         pcr0: opts.pcr0,
         bn254: opts.bn254,
+        signingCert: opts.signingCert,
       });
 
       process.exit(success ? 0 : 1);

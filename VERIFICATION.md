@@ -47,10 +47,11 @@ Which checks each document allows:
 |-------|--------------------|---------------|
 | COSE_Sign1 signature and the AWS certificate chain | yes | yes |
 | PCR0: published value, reproduced build, not a debug-mode enclave | yes | yes |
+| PCR8: the EIF that ran was signed with Tytle's signing certificate (`--signing-cert`) | yes | yes |
 | user_data equals bn254Hash; the vector you received (`--bn254`) | yes | yes |
 | Nonce recomputed from responseHash, apiEndpoint, timestamp (and challenge) | no: it needs `apiEndpoint` | yes |
 
-The nonce recompute and the request binding wait for the subject re-key ("Phase 8"), which takes the identifiers out of those two fields; until then they need the full document. The CLI below recomputes the nonce, so it needs the full document: it refuses a document without `requestHash` and `apiEndpoint`. With the anonymous document, do the other checks by hand (Manual Verification, steps 1-5 and 7) or with any COSE library.
+The nonce recompute and the request binding wait for the subject re-key ("Phase 8"), which takes the identifiers out of those two fields; until then they need the full document. The CLI below recomputes the nonce, so it needs the full document: it refuses a document without `requestHash` and `apiEndpoint`. With the anonymous document, do the other checks by hand (Manual Verification, steps 1-5, 7 and 9) or with any COSE library.
 
 To download the document for independent verification (an employee's token gives the full document):
 
@@ -84,6 +85,9 @@ node dist/cli.js --service vies --attestation attestation.json --skip-build
 
 # Also check the BN254 vector you received (base64, in a file) is the one signed:
 node dist/cli.js --service vies --attestation attestation.json --bn254 vector.b64
+
+# Also check the EIF that ran was signed with Tytle's signing certificate (PCR8; Step 9):
+node dist/cli.js --service vies --attestation attestation.json --signing-cert signing-cert.pem
 ```
 
 Or as a single pipeline:
@@ -100,10 +104,11 @@ This will:
 3. Recompute the nonce (version 1 or 2), check it is the nonce in the signed document (a document without one fails), and check the document's `timestamp` is within 10 minutes of the signed time
 4. Check `user_data` equals `bn254Hash`; with `--bn254`, check the vector hashes to `bn254Hash` and, as base64, to `responseHash`
 5. Compare PCR0 against the published value from the API (or `--pcr0`), searching the published history for older releases
-6. Reproduce the Docker build from the published commit of https://github.com/app-partou/tytle-enclaves (unless `--skip-build`); the build never comes from a repository the API names
-7. Extract PCR0 from the reproduced build with the pinned nitro-cli helper (`verify/Dockerfile.nitro-cli`)
-8. Compare the reproduced PCR0 against the attestation
-9. Output a final pass/fail report
+6. With `--signing-cert`, check PCR8 is that certificate's: the EIF that ran was signed with it (without it, the report only says whether the EIF was signed)
+7. Reproduce the Docker build from the published commit of https://github.com/app-partou/tytle-enclaves (unless `--skip-build`); the build never comes from a repository the API names
+8. Extract PCR0 from the reproduced build with the pinned nitro-cli helper (`verify/Dockerfile.nitro-cli`)
+9. Compare the reproduced PCR0 against the attestation
+10. Output a final pass/fail report
 
 ## Manual Verification
 
@@ -257,6 +262,20 @@ To verify:
 
 The manifest describes every API query, every field derivation, and every validation policy. See [MANIFESTS.md](MANIFESTS.md) for the full specification.
 
+### Step 9: Check Whose EIF Ran - PCR8 (Optional)
+
+PCR0 says which code ran, not where: anyone can build this public EIF and run it in their own AWS account, and their documents carry the same PCR0. Tytle signs the EIFs it runs. A signed EIF boots with PCR8 = SHA-384(48 zero bytes || SHA-384(the signing certificate's DER)), and signing changes no other PCR. An unsigned EIF - the one you rebuild in steps 3 and 4 - has PCR8 all zeroes: compare PCR0, PCR1 and PCR2 with your rebuild, and PCR8 with the certificate.
+
+```bash
+# The PCR8 of an EIF signed with the certificate
+{ head -c 48 /dev/zero; openssl x509 -in signing-cert.pem -outform DER | openssl dgst -sha384 -binary; } \
+  | openssl dgst -sha384 | awk '{print $NF}'
+```
+
+It must equal PCR8 (index 8 of `pcrs` in the signed payload). PCR8 all zeroes means the EIF that ran was not signed. The CLI does this with `--signing-cert signing-cert.pem`.
+
+Tytle will publish its signing certificate next to the PCR0s (`GET https://api.tytle.io/api/enclave/pcr0`) when it starts to run signed EIFs. Until then its EIFs are unsigned, and PCR8 is all zeroes.
+
 ## Why This Works
 
 1. **PCR0 is deterministic**: Same source code + same base images + same dependencies = same PCR0
@@ -264,8 +283,9 @@ The manifest describes every API query, every field derivation, and every valida
 3. **The signature is unforgeable**: Only AWS Nitro hardware can produce valid COSE_Sign1 signatures that chain to the Nitro root CA
 4. **The nonce is bound**: The nonce commits the attestation to a specific API response (and, in version 2, to one request)
 5. **The data is bound**: `user_data` commits the attestation to the BN254 vector you receive
+6. **The operator is bound** (a signed EIF): PCR8 names the certificate whose key signed the EIF that ran
 
-Together, this proves: "This specific response came from this specific code running in genuine Nitro hardware."
+Together, this proves: "This specific response came from this specific code running in genuine Nitro hardware" - and, with PCR8, from an EIF Tytle signed.
 
 ## PCR0 Drift
 
@@ -274,6 +294,7 @@ Any change to the enclave code, dependencies, or base image produces a new PCR0.
 1. The new PCR0 is recorded and published via the public API: `GET https://api.tytle.io/api/enclave/pcr0`
 2. The `history` array in the API response contains all previous PCR0 values with their git commits and deployment timestamps
 3. Previous attestations remain valid against their respective PCR0 values - use the `history` array to find the matching entry
+4. A new signing certificate changes PCR8 only: PCR0 stays the same
 
 ## Tools
 

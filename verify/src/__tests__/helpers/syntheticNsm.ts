@@ -73,6 +73,8 @@ export interface DocOptions {
   apiEndpoint?: string;
   alg?: number;
   pcr0?: Buffer;
+  /** PCR8, who signed the EIF (default: zeroes, an unsigned EIF); `null` leaves it out of the map. */
+  pcr8?: Buffer | null;
   omit?: Array<'nonce' | 'user_data'>;
   signWith?: crypto.KeyObject;
   /** NSM user_data (default: the SHA-256 of the vector); `null` = the enclave encoded no BN254 vector. */
@@ -106,6 +108,8 @@ export function buildDoc(o: DocOptions = {}): SyntheticAttestation {
   for (let i = 0; i < 16; i++) {
     pcrs.set(i, i === 0 && o.pcr0 ? o.pcr0 : i < 3 ? crypto.randomBytes(48) : Buffer.alloc(48));
   }
+  if (o.pcr8) pcrs.set(8, o.pcr8);
+  if (o.pcr8 === null) pcrs.delete(8);
   const payload = new Map<string, unknown>([
     ['module_id', 'i-0synthetic0000000-enc0123456789abcdef'],
     ['digest', 'SHA384'],

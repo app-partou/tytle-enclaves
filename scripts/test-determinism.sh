@@ -16,6 +16,8 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source-path=SCRIPTDIR source=lib/recipe.sh
 source "$REPO_DIR/scripts/lib/recipe.sh"
+# The gate measures the unsigned build, whatever this shell holds: it never reads a signing key (P1.6)
+unset EIF_SIGNING_KEY EIF_SIGNING_CERT
 
 ENCLAVES=("vies" "sicae" "stripe-payment" "monerium-payment")
 UPDATE_MODE=false

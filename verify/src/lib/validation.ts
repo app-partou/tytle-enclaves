@@ -3,6 +3,8 @@
  * Every value that touches a shell command or comparison MUST be validated here first.
  */
 
+import { X509Certificate } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import type { ServiceName } from './types.js';
 import { VALID_SERVICES } from './types.js';
 
@@ -82,6 +84,20 @@ export function validateApiUrl(url: string): string {
   }
 
   return url;
+}
+
+/** Validate --signing-cert: a file holding an X.509 certificate in PEM. Returns the PEM. */
+export function validateSigningCertFile(file: string): string {
+  if (!existsSync(file)) {
+    throw new Error(`--signing-cert file not found: ${file}`);
+  }
+  const pem = readFileSync(file, 'utf-8');
+  try {
+    new X509Certificate(pem);
+  } catch {
+    throw new Error(`--signing-cert is not an X.509 certificate in PEM: ${file}`);
+  }
+  return pem;
 }
 
 /** Validate a directory path exists and is a git repo. */

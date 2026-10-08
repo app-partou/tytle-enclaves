@@ -14,7 +14,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import crypto from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { runVerification, type VerifyOptions } from '../commands/verify.js';
@@ -365,6 +365,59 @@ describe('PCR0', () => {
     expect(r.output).toContain(
       'WARN The API names https://github.com/someone/fork as the source; the build always comes from https://github.com/app-partou/tytle-enclaves',
     );
+  });
+});
+
+describe('PCR8, the operator binding (--signing-cert)', () => {
+  // The certificate and the PCR8 nitro-cli 1.4.4 itself printed for an EIF signed with it (fixtures/signing)
+  const signerPem = readFileSync(new URL('./fixtures/signing/signer.pem', import.meta.url), 'utf8');
+  const signedOutput = readFileSync(new URL('./fixtures/signing/nitro-cli-1.4.4-signed.stdout.txt', import.meta.url), 'utf8');
+  const REAL_PCR8 = Buffer.from((JSON.parse(signedOutput) as { Measurements: { PCR8: string } }).Measurements.PCR8, 'hex');
+  const CHECK = "PCR8 is the signing certificate's (--signing-cert)";
+  const withCert = () => ({ signingCert: write('signing-cert.pem', signerPem) });
+
+  it("a document from an EIF signed with the certificate passes, and the report names the check (red)", async () => {
+    const r = await runGenuine({ pcr8: REAL_PCR8 }, () => {}, withCert());
+    expect(r.checks).toEqual([...ALL_CHECKS.slice(0, -1), CHECK, ALL_CHECKS[ALL_CHECKS.length - 1]].map((name) => [name, true]));
+    expect(r.output).toContain("PASS PCR8 is the signing certificate's: the EIF that ran was signed with it");
+    expect(r.ok).toBe(true);
+  });
+
+  it('an unsigned EIF (PCR8 zeroes) fails only that check, and says why (red)', async () => {
+    const r = await runGenuine({}, () => {}, withCert());
+    expect(r.failed).toEqual([CHECK]);
+    expect(r.detail(CHECK)).toBe('PCR8 is zero: the EIF that ran was not signed');
+  });
+
+  it("an EIF signed with another key fails only that check (red)", async () => {
+    const other = crypto.randomBytes(48);
+    const r = await runGenuine({ pcr8: other }, () => {}, withCert());
+    expect(r.failed).toEqual([CHECK]);
+    expect(r.detail(CHECK)).toBe(`PCR8: ${other.toString('hex').slice(0, 32)}..., the certificate's: ${REAL_PCR8.toString('hex').slice(0, 32)}...`);
+    expect(r.output).toContain("FAIL PCR8 is NOT the signing certificate's: another key signed the EIF that ran");
+  });
+
+  it('a document with no PCR8 at all is unsigned too (red)', async () => {
+    const r = await runGenuine({ pcr8: null }, () => {}, withCert());
+    expect(r.failed).toEqual([CHECK]);
+    expect(r.detail(CHECK)).toBe('PCR8 is zero: the EIF that ran was not signed');
+  });
+
+  it('without --signing-cert there is no PCR8 check: the run says whether the EIF was signed (red)', async () => {
+    const signed = await runGenuine({ pcr8: REAL_PCR8 });
+    expect(signed.checks.map(([name]) => name)).toEqual(ALL_CHECKS);
+    expect(signed.output).toContain(`INFO PCR8 ${REAL_PCR8.toString('hex').slice(0, 16)}...: a signed EIF. --signing-cert <pem> checks whose key signed it`);
+    const unsigned = await runGenuine();
+    expect(unsigned.checks.map(([name]) => name)).toEqual(ALL_CHECKS);
+    expect(unsigned.output).toContain('INFO PCR8 is zero: an unsigned EIF, so the document does not say whose EIF ran');
+  });
+
+  it('a --signing-cert that is not a certificate is refused (red)', async () => {
+    const key = readFileSync(new URL('./fixtures/signing/signer-TESTONLY.key.pem', import.meta.url), 'utf8');
+    await expect(runGenuine({}, () => {}, { signingCert: write('key.pem', key) }))
+      .rejects.toThrow('--signing-cert is not an X.509 certificate in PEM');
+    await expect(runGenuine({}, () => {}, { signingCert: path.join(dir, 'missing.pem') }))
+      .rejects.toThrow('--signing-cert file not found');
   });
 });
 

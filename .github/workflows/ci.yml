@@ -5,7 +5,9 @@
 #   - the Rust addon's tests and clippy, warnings as errors (scripts/ci/test-native.sh);
 #   - the parent image, built as the deploy builds it (its Dockerfile runs a smoke test);
 #   - the determinism gate for each enclave (scripts/test-determinism.sh): built twice with the one recipe, its EIF
-#     measured, and both compared with scripts/expected-digests.json.
+#     measured, and both compared with scripts/expected-digests.json;
+#   - then its EIF signed as the deploy is to sign it, with a throwaway certificate (scripts/ci/test-signing.sh): the
+#     signed EIF is still the committed build, and its PCR8 is the certificate's.
 # A pull request also gets its PCR0 changes as a table (scripts/ci/pcr0-changes.mjs) in the job summary, and as a
 # comment when it comes from this repository. That job fails when an enclave's PCR0 changes and none of its inputs did.
 #
@@ -88,6 +90,10 @@ jobs:
           node-version: 22.23.3
       - name: Build twice, measure, compare with scripts/expected-digests.json
         run: bash scripts/test-determinism.sh "$ENCLAVE"
+        env:
+          ENCLAVE: ${{ matrix.enclave }}
+      - name: Sign the EIF with a throwaway certificate - the committed build, and PCR8 the certificate's
+        run: bash scripts/ci/test-signing.sh "$ENCLAVE"
         env:
           ENCLAVE: ${{ matrix.enclave }}
 

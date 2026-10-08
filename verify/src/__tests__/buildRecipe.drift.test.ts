@@ -82,9 +82,10 @@ describe('one build recipe', () => {
       '    --provenance=false --sbom=false \\',
       '    --output "type=docker,dest=$out,rewrite-timestamp=true,name=$name" \\',
     ].join('\n'));
-    // The helper: built and run for the recipe's platform
+    // The helper: built and run for the recipe's platform (the run's arguments: buildEif.test.ts runs it)
     expect(shell).toContain('docker build --platform "$(recipe_value platform)" -t "$tag"');
-    expect(shell).toContain('docker run --rm --platform "$(recipe_value platform)"');
+    expect(shell).toContain('set -- --rm --platform "$(recipe_value platform)" -v /var/run/docker.sock:/var/run/docker.sock');
+    expect(shell).toContain('measurements="$(docker run "$@" | node "$RECIPE_LIB/recipe.mjs" measurements)"');
   });
 
   it('no script but scripts/lib/recipe.sh runs a docker build (red)', () => {

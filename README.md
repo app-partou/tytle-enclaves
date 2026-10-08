@@ -81,9 +81,14 @@ cd vies && ./build.sh [tag] [ecr-uri]                    # each service: vies, s
 ./scripts/test-determinism.sh [service]                  # build twice, compare, check scripts/expected-digests.json
 ./scripts/test-determinism.sh --update [service]         # record a meant change, then commit the file
 ./scripts/rotate-pcr0.sh <service|all>                   # the PCR0 of a build and the published one
+./scripts/build-eif.sh <enclave> <out-dir>               # its EIF + measurements, written only if it is the record
+EIF_SIGNING_KEY=key.pem EIF_SIGNING_CERT=cert.pem \
+  ./scripts/build-eif.sh <enclave> <out-dir>             # the same EIF, signed: it adds PCR8
 ```
 
 The scripts need Docker with buildx, and Node.js (the recipe reads its values with it). The verify CLI rebuilds with the same values (`verify/src/lib/buildRecipe.ts`).
+
+A signed EIF carries PCR8, its signing certificate's, and every other PCR of the unsigned build (SECURITY.md, Operator Binding). The certificate must be EC P-384, the key's own, and valid for 60 more days at least: an EIF whose certificate has expired does not start. CI signs each enclave's EIF with a throwaway certificate on every pull request (`scripts/ci/test-signing.sh`).
 
 ## Handler Manifests
 
