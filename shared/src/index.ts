@@ -1,7 +1,13 @@
 export { startEnclave } from './createEnclave.js';
 export { createRequestHandler } from './requestHandler.js';
 export { proxyFetch, proxyFetchPlain } from './httpProxy.js';
-export { attest, assertChallenge, CHALLENGE_PATTERN, InvalidChallengeError } from './attestor.js';
+export { attest, assertChallenge, CHALLENGE_PATTERN, InvalidChallengeError, recipientAttestation } from './attestor.js';
+export {
+  unsealSecret, isSealedSecretText, SealedSecretError, KMS_HOST, KMS_REGION, SEALED_SECRET_TTL_MS, SEALED_SECRET_MAX_BYTES,
+} from './sealedSecret.js';
+export { openEnvelopedData, CmsError } from './cms.js';
+export { signRequest } from './sigv4.js';
+export type { AwsCredentials, SignableRequest, SigningScope } from './sigv4.js';
 export {
   encodeFieldElements,
   hashFieldElements,

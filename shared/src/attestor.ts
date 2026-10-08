@@ -153,6 +153,22 @@ export async function attest(
 }
 
 /**
+ * An attestation document whose public_key is `publicKeyDer` (an SPKI DER key) and that carries nothing else: the
+ * Recipient of a KMS Decrypt (sealedSecret.ts, enclave audit P1.7). KMS encrypts its answer to that key, and the key
+ * policy accepts only a document of an enclave image it names. The data attestations (attest) keep public_key null:
+ * their nonce, user_data and verifiers are untouched by this one.
+ */
+export function recipientAttestation(publicKeyDer: Buffer): Buffer {
+  const request = cbor.encode({ Attestation: { nonce: null, user_data: null, public_key: publicKeyDer } });
+  const envelope = cbor.decodeFirstSync(nsmRequest(Buffer.from(request)));
+  const documentBytes = envelope.Attestation?.document;
+  if (!documentBytes) {
+    throw new Error('NSM response missing Attestation.document');
+  }
+  return Buffer.from(documentBytes);
+}
+
+/**
  * Request an NSM attestation document from /dev/nsm.
  *
  * @param nonceHex - Hex-encoded nonce to include in attestation

@@ -28,6 +28,22 @@ export const HANDLER_MANIFEST: HandlerManifest = {
         strippedBeforeAttestation: true,
       },
     },
+    {
+      id: 'kms_decrypt',
+      description: 'KMS Decrypt of a sealed API key (only when the request sends sealedApiKey), with this enclave\'s attestation document as the Recipient: the answer is the key encrypted to that document\'s public key, opened only inside the enclave',
+      method: 'POST',
+      host: 'kms.eu-central-1.amazonaws.com',
+      path: '/',
+      headers: {
+        'Content-Type': 'application/x-amz-json-1.1',
+        'X-Amz-Target': 'TrentService.Decrypt',
+      },
+      auth: {
+        header: 'Authorization',
+        scheme: 'AWS4-HMAC-SHA256',
+        strippedBeforeAttestation: true,
+      },
+    },
   ],
 
   schema: {
@@ -55,8 +71,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'api_key_required',
-      check: { type: 'field_required', paths: ['apiKey'] },
-      reason: 'Stripe API key is required for authentication',
+      check: { type: 'behavioral', description: 'Exactly one of apiKey (the key) or sealedApiKey (the key sealed to this enclave with KMS, encryption context enclave=stripe_payment); a sealed key is opened through KMS with the attestation of this enclave and must be a Stripe sk_ or rk_ key' },
+      reason: 'Stripe API key is required for authentication; sealed, it never crosses the host in clear (enclave audit P1.7)',
     },
     {
       id: 'resource_id_for_get_ops',

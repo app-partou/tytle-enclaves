@@ -20,11 +20,12 @@ import { createHash } from 'node:crypto';
 vi.mock('@tytle-enclaves/native', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).nativeModule);
 vi.mock('node:tls', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).tlsModule);
 
-import { createHandler } from '@tytle-enclaves/shared';
+import { createHandler, KMS_HOST } from '@tytle-enclaves/shared';
 import type { EnclaveResponse } from '@tytle-enclaves/shared';
 import { encodeFieldElements, hashFieldElements, STRIPE_PAYMENT_SCHEMA } from '../../../shared/src/bn254Codec.js';
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
-import { stripePaymentHandlerDef, STRIPE_HOSTS } from '../stripePaymentHandler.js';
+import { fakeKms } from '../../../shared/src/__tests__/helpers/fakeKms.js';
+import { stripePaymentHandlerDef, STRIPE_HOSTS, SEALED_KEY_CONTEXT } from '../stripePaymentHandler.js';
 import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
 
 /**
@@ -295,6 +296,132 @@ describe('a JSON body that is not an object (red: it read as a wrong object type
   it('is an error that says so', async () => {
     fakeIo.reply(STRIPE_PORT, json(200, '[]'));
     await expectError({ operation: 'list_charges', apiKey: API_KEY }, /Stripe API returned JSON that is not an object/);
+  });
+});
+
+describe('a key sealed to this enclave (sealedApiKey, enclave audit P1.7) (red)', () => {
+  /** KMS, through the host's vsock-proxy port for it (shared/src/sealedSecret.ts KMS_HOST). */
+  const KMS_PORT = 8000;
+  /** What a caller sends: `aws kms encrypt` output. Opaque to the enclave; the fake KMS seals the key it is told to. */
+  const SEALED = Buffer.from('a KMS ciphertext blob, opaque to the enclave').toString('base64');
+  const CREDENTIALS = { accessKeyId: 'ASIAEXAMPLEEXAMPLE01', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', sessionToken: 'IQoJb3JpZ2luX2VjEXAMPLETOKEN==' };
+  let n = 0;
+  /** A ciphertext no other test used: the enclave keeps an opened key for an hour, keyed by its ciphertext. */
+  const sealedOnce = () => Buffer.from(`a KMS ciphertext blob ${++n}`).toString('base64');
+
+  /** A request as the parent sends one for this enclave: with the host role's credentials, unless a test leaves them out. */
+  function callWithCredentials(body: unknown, parentAdds: { awsCredentials?: unknown } = { awsCredentials: CREDENTIALS }): Promise<EnclaveResponse> {
+    return handler({ id: 'req-1', url: 'https://api.stripe.com/v1/charges', method: 'POST', headers: {}, body: JSON.stringify(body), ...parentAdds } as Parameters<typeof handler>[0]);
+  }
+
+  /** Every line the enclave wrote to stdout and stderr during the test (its logs). */
+  const logged = () => [...vi.mocked(process.stdout.write).mock.calls, ...vi.mocked(process.stderr.write).mock.calls].map((c) => String(c[0])).join('\n');
+
+  it('names KMS in its allowlist exactly as shared does, and does not start without it', () => {
+    expect(STRIPE_HOSTS).toContainEqual(KMS_HOST);
+    expect(() => createHandler(stripePaymentHandlerDef, STRIPE_HOSTS.filter((h) => h.hostname !== KMS_HOST.hostname)))
+      .toThrow(/requires host "kms\.eu-central-1\.amazonaws\.com"/);
+  });
+
+  it('declares each call it makes in its manifest: Stripe, and the KMS Decrypt with its signature stripped', () => {
+    expect(HANDLER_MANIFEST.queries.map((q) => [q.id, q.method, q.host, q.path])).toEqual([
+      ['stripe_api', 'GET', 'api.stripe.com', '/v1/{resource}/{resourceId?}'],
+      ['kms_decrypt', 'POST', 'kms.eu-central-1.amazonaws.com', '/'],
+    ]);
+    expect(HANDLER_MANIFEST.queries[1].auth).toEqual({ header: 'Authorization', scheme: 'AWS4-HMAC-SHA256', strippedBeforeAttestation: true });
+    for (const query of HANDLER_MANIFEST.queries) expect(STRIPE_HOSTS.map((h) => h.hostname)).toContain(query.host);
+  });
+
+  it('opens the key through KMS first, then asks Stripe with it; the signed answer is the one the key in clear gets', async () => {
+    const kms = fakeKms({ sealed: API_KEY });
+    fakeIo.reply(KMS_PORT, kms.reply);
+    fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
+    const sealed = await callWithCredentials({ operation: 'list_charges', sealedApiKey: SEALED, stripeAccount: ACCT });
+
+    expect(kms.requests).toHaveLength(1);
+    expect(kms.requests[0].body).toMatchObject({ CiphertextBlob: SEALED, EncryptionContext: { enclave: 'stripe_payment' } });
+    expect(SEALED_KEY_CONTEXT).toBe('stripe_payment');
+    const [request] = fakeIo.requests(STRIPE_PORT);
+    expect(request).toContain(`Authorization: Bearer ${API_KEY}\r\n`);
+    // Two documents, in order: the recipient document (its public key, nothing signed), then the answer's
+    expect(fakeIo.nsmAsks.map((a) => [a.publicKey !== null, a.userData !== null])).toEqual([[true, false], [false, true]]);
+
+    fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
+    const clear = await call({ operation: 'list_charges', apiKey: API_KEY, stripeAccount: ACCT });
+    expect(sealed).toMatchObject({ success: true, status: 200, rawBody: clear.rawBody, upstreamBody: LIST_CHARGES });
+    expect(sealed.attestation?.requestHash).toBe(clear.attestation?.requestHash);
+  });
+
+  it('the key is in no answer and no log line', async () => {
+    fakeIo.reply(KMS_PORT, fakeKms({ sealed: API_KEY }).reply);
+    fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
+    const res = await callWithCredentials({ operation: 'list_charges', sealedApiKey: sealedOnce() });
+    expect(res.success).toBe(true);
+    expect(JSON.stringify(res)).not.toContain(API_KEY);
+    expect(logged()).not.toContain(API_KEY);
+    expect(logged()).not.toContain(CREDENTIALS.secretAccessKey);
+  });
+
+  it.each([
+    ['a restricted key', 'rk_live_51Example00000000000000'],
+    ['a live secret key', 'sk_live_51Example00000000000000'],
+  ])('opens %s', async (_label, key) => {
+    fakeIo.reply(KMS_PORT, fakeKms({ sealed: key }).reply);
+    fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
+    expect((await callWithCredentials({ operation: 'list_charges', sealedApiKey: sealedOnce() })).success).toBe(true);
+    expect(fakeIo.requests(STRIPE_PORT)[0]).toContain(`Authorization: Bearer ${key}\r\n`);
+  });
+
+  it.each([
+    ['not a Stripe key', 'pk_live_publishable_not_secret'],
+    ['a key with a line break (sealed from a file that ends in one)', `${API_KEY}\n`],
+  ])('a sealed value that is %s: an error that names no byte of it, and Stripe is never asked', async (_label, value) => {
+    fakeIo.reply(KMS_PORT, fakeKms({ sealed: value }).reply);
+    const res = await callWithCredentials({ operation: 'list_charges', sealedApiKey: sealedOnce() });
+    expect(res).toMatchObject({ success: false, status: 502 });
+    expect(res.error).toMatch(/the sealed key is not a Stripe secret or restricted key \(sk_ or rk_\)/);
+    expect(res.error).not.toContain(value.trim());
+    expect(fakeIo.requests(STRIPE_PORT)).toEqual([]);
+  });
+
+  it('KMS refuses: an error with KMS\'s reason, and Stripe is never asked', async () => {
+    fakeIo.reply(KMS_PORT, fakeKms({ status: 400, body: JSON.stringify({ __type: 'AccessDeniedException', message: 'not authorized to perform: kms:Decrypt' }) }).reply);
+    const res = await callWithCredentials({ operation: 'list_charges', sealedApiKey: sealedOnce() });
+    expect(res).toMatchObject({ success: false, status: 502 });
+    expect(res.error).toMatch(/KMS refused the Decrypt \(400 AccessDeniedException\)/);
+    expect(fakeIo.requests(STRIPE_PORT)).toEqual([]);
+    expect(res.attestation).toBeUndefined();
+  });
+
+  it('the parent sent no AWS credentials: an error, and neither KMS nor Stripe is asked', async () => {
+    const res = await callWithCredentials({ operation: 'list_charges', sealedApiKey: sealedOnce() }, {});
+    expect(res).toMatchObject({ success: false, status: 502 });
+    expect(res.error).toMatch(/the parent sent no AWS credentials/);
+    expect(fakeIo.requests(KMS_PORT)).toEqual([]);
+    expect(fakeIo.requests(STRIPE_PORT)).toEqual([]);
+    expect(fakeIo.nsmAsks).toHaveLength(0);
+  });
+
+  it.each([
+    ['both keys', { apiKey: API_KEY, sealedApiKey: SEALED }, /apiKey and sealedApiKey: send one, not both/],
+    ['a sealed key that is not base64', { sealedApiKey: 'sk_live_in_clear_by_mistake!' }, /sealedApiKey must be a KMS ciphertext/],
+    ['a sealed key longer than KMS allows', { sealedApiKey: Buffer.alloc(6145).toString('base64') }, /sealedApiKey must be a KMS ciphertext: base64 of at most 6144 bytes/],
+    ['a sealed key that is not text', { sealedApiKey: 42 }, /sealedApiKey must be a KMS ciphertext/],
+  ])('%s is a 400, and nothing is asked', async (_label, key, error) => {
+    const res = await callWithCredentials({ operation: 'list_charges', ...key });
+    expect(res).toMatchObject({ success: false, status: 400 });
+    expect(res.error).toMatch(error);
+    expect(fakeIo.requests(KMS_PORT)).toEqual([]);
+    expect(fakeIo.requests(STRIPE_PORT)).toEqual([]);
+  });
+
+  it.each([
+    ['null', null],
+    ['empty', ''],
+  ])('a sealedApiKey that is %s is no sealed key: apiKey is used as before (lock)', async (_label, empty) => {
+    fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
+    expect((await call({ operation: 'list_charges', apiKey: API_KEY, sealedApiKey: empty })).success).toBe(true);
+    expect(fakeIo.requests(KMS_PORT)).toEqual([]);
   });
 });
 

@@ -1,3 +1,5 @@
+import type { AwsCredentials } from './sigv4.js';
+
 /** Allowlisted host entry with its vsock-proxy port. */
 export interface AllowedHost {
   hostname: string;
@@ -28,6 +30,11 @@ export interface EnclaveRequest {
    * Mixed into the NSM nonce (nonce version 2), so the signed document answers THIS request and no other.
    */
   challenge?: string;
+  /**
+   * The host role's temporary AWS credentials, which the parent adds (from IMDSv2) for an enclave that opens sealed
+   * secrets (sealedSecret.ts, enclave audit P1.7): they sign the KMS Decrypt and nothing else. Never logged.
+   */
+  awsCredentials?: AwsCredentials;
 }
 
 /** Response from enclave to parent server via vsock. */

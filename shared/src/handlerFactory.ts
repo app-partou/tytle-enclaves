@@ -13,6 +13,7 @@ import { toErrorMessage } from './errorUtils.js';
 import { proxyFetch, proxyFetchPlain, type HttpResponse } from './httpProxy.js';
 import { proxyFetchWithRetry, type RetryConfig } from './retryProxy.js';
 import { getHeadersToStrip, redactError } from './policyEngine.js';
+import { unsealSecret } from './sealedSecret.js';
 import { stripSensitiveHeaders } from './sanitize.js';
 import type { FieldDef } from './bn254Codec.js';
 import type { PolicyDef } from './manifest.js';
@@ -46,6 +47,12 @@ export interface HandlerContext {
   log: Logger;
   fetch(host: AllowedHost, method: string, path: string, headers: Record<string, string>, body?: string, timeoutMs?: number): Promise<HttpResponse>;
   fetchWithRetry(host: AllowedHost, method: string, path: string, headers: Record<string, string>, body?: string, timeoutMs?: number, retryConfig?: RetryConfig): Promise<HttpResponse>;
+  /**
+   * The secret a ciphertext sealed for the enclave named `context` holds (sealedSecret.ts, enclave audit P1.7),
+   * opened through KMS - which the enclave's allowlist must name - with the AWS credentials the parent sent with THIS
+   * request.
+   */
+  unsealSecret(ciphertext: string, context: string): Promise<string>;
 }
 
 export interface HandlerDef<TParams> {
@@ -82,7 +89,7 @@ export function createHandler<TParams>(
   const headersToStrip = getHeadersToStrip(def.policies);
   const log = createLogger(def.name);
 
-  const ctx: HandlerContext = {
+  const ctx: Omit<HandlerContext, 'unsealSecret'> = {
     hosts,
     log,
     fetch(host, method, path, headers, body, timeoutMs) {
@@ -110,7 +117,10 @@ export function createHandler<TParams>(
       }
 
       const startMs = Date.now();
-      const result = await def.execute(params, ctx);
+      const result = await def.execute(params, {
+        ...ctx,
+        unsealSecret: (ciphertext, context) => unsealSecret(ciphertext, context, request.awsCredentials, hosts),
+      });
       const executeMs = Date.now() - startMs;
 
       if (result.rawPassthrough) {

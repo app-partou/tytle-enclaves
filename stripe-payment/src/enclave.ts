@@ -1,7 +1,7 @@
 /**
  * Stripe Payment Enclave
  *
- * Allowlist: api.stripe.com only (HTTPS)
+ * Allowlist: api.stripe.com, and kms.eu-central-1.amazonaws.com to open a sealed API key (both HTTPS)
  *
  * Custom handler maps operation names to Stripe REST paths, makes the API call,
  * encodes key fields as BN254 field elements (6 x 32 = 192 bytes) before

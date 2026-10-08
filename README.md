@@ -66,9 +66,9 @@ Set `tls: false` on an `AllowedHost` to skip TLS and send plain HTTP over the vs
 | CID | 16 | 17 | 18 | 19 |
 | ECR tag | `vies` | `sicae` | `stripe-payment` | `monerium-payment` |
 | PCR0 SSM | `/tytle/{env}/enclave/vies/pcr0` | `/tytle/{env}/enclave/sicae/pcr0` | `/tytle/{env}/enclave/stripe_payment/pcr0` | `/tytle/{env}/enclave/monerium_payment/pcr0` |
-| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `www.sicae.pt` | `api.stripe.com` | `api.monerium.app`, `rpc.gnosischain.com` |
+| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `www.sicae.pt` | `api.stripe.com`, `kms.eu-central-1.amazonaws.com` (to open a sealed key: SECURITY.md, Sealed Secrets) | `api.monerium.app`, `rpc.gnosischain.com` |
 | Transport | HTTPS (TLS) | HTTP (plain) | HTTPS (TLS) | HTTPS (TLS) |
-| vsock-proxy ports | 8443, 8444 | 8445 | 8446 | 8447, 8448 |
+| vsock-proxy ports | 8443, 8444 | 8445 | 8446, 8000 | 8447, 8448 |
 
 Each enclave image contains ONLY shared core + its service config. PCR0 proves exactly which code ran. A VIES attestation's PCR0 can only match the VIES enclave image.
 

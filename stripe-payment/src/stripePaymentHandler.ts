@@ -8,7 +8,7 @@
  * Request body (JSON):
  *   {
  *     "operation": "list_charges" | "list_customers" | "list_invoices" | "get_payment_intent" | "get_account" | "get_charge",
- *     "apiKey": "sk_...",
+ *     "apiKey": "sk_..."  OR  "sealedApiKey": "<base64>" (exactly one),
  *     "stripeAccount": "acct_..." (optional),
  *     "queryParams": { "limit": "100", "created[gte]": "..." } (optional),
  *     "resourceId": "pi_..." (optional, for get_* operations)
@@ -22,6 +22,11 @@
  *   [128..159] totalCount   uint
  *   [160..191] hasMore      uint (1 = true, 0 = false)
  *
+ * sealedApiKey is the platform key sealed to this enclave with KMS (`aws kms encrypt --encryption-context
+ * enclave=stripe_payment`, enclave audit P1.7): only an enclave image the key policy names opens it, with the AWS
+ * credentials the parent sends, so the key itself never crosses the host or data-bridge. apiKey (the key in clear)
+ * stays accepted until every caller sends the sealed one.
+ *
  * Only Stripe's own answer is signed (enclave audit 2026-10, P1.4): a 404 only when Stripe says the object does not
  * exist, a single object only when it is the one asked, a list only with its data array and has_more. The signed
  * answer carries Stripe's body beside it (upstreamBody): its SHA-256 is the signed dataHash, so a reader can use the
@@ -29,13 +34,17 @@
  */
 
 import crypto from 'node:crypto';
-import { STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
+import { STRIPE_PAYMENT_SCHEMA, isSealedSecretText, SEALED_SECRET_MAX_BYTES } from '@tytle-enclaves/shared';
 import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost } from '@tytle-enclaves/shared';
 import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
 
-/** The enclave's allowlist: Stripe's API over its host vsock-proxy port, HTTPS. */
+/**
+ * The enclave's allowlist, each over its host vsock-proxy port, HTTPS: Stripe's API, and KMS to open a sealed key
+ * (shared KMS_HOST; the main repo's host test reads these literals to build the host's proxies).
+ */
 export const STRIPE_HOSTS: AllowedHost[] = [
   { hostname: 'api.stripe.com', vsockProxyPort: 8446 },
+  { hostname: 'kms.eu-central-1.amazonaws.com', vsockProxyPort: 8000 },
 ];
 
 // =============================================================================
@@ -50,13 +59,15 @@ type StripeOperation =
   | 'get_account'
   | 'get_charge';
 
-interface StripeParams {
+/** Where the API key comes from: the key itself, or the key sealed to this enclave (opened in execute). */
+type StripeKey = { apiKey: string } | { sealedApiKey: string };
+
+type StripeParams = StripeKey & {
   operation: StripeOperation;
-  apiKey: string;
   stripeAccount?: string;
   queryParams?: Record<string, string>;
   resourceId?: string;
-}
+};
 
 // =============================================================================
 // Constants
@@ -88,6 +99,12 @@ const VALID_OPERATIONS = new Set<string>(Object.keys(OPERATION_PATH_MAP));
 
 const STRIPE_API_VERSION = '2025-12-15.clover';
 
+/** The encryption context `enclave` of a key sealed for this enclave: the key policy's name for it. */
+export const SEALED_KEY_CONTEXT = 'stripe_payment';
+
+/** A Stripe secret key (sk_) or restricted key (rk_), the two kinds that can make this handler's calls: what a sealed key must open to. */
+const STRIPE_KEY = /^(sk|rk)_[0-9A-Za-z_]+$/;
+
 /** A Stripe account id (the Stripe-Account header's value): acct_ followed by letters and digits. */
 const STRIPE_ACCOUNT_ID = /^acct_[0-9A-Za-z]+$/;
 
@@ -106,6 +123,22 @@ function optionalText(value: unknown, name: string): string | undefined {
   if (value === undefined || value === null || value === '') return undefined;
   if (typeof value !== 'string') throw new Error(`${name} must be text`);
   return value;
+}
+
+/**
+ * The API key: in clear (apiKey, as every release before took it, with the same refusal when it is missing), or sealed
+ * to this enclave (sealedApiKey, opened in execute). Never both: a caller that sends both does not know which is used.
+ */
+function keyOf(apiKey: unknown, sealedApiKey: unknown): StripeKey {
+  if (sealedApiKey === undefined || sealedApiKey === null || sealedApiKey === '') {
+    if (typeof apiKey !== 'string' || apiKey === '') throw new Error('apiKey is required');
+    return { apiKey };
+  }
+  if (apiKey !== undefined && apiKey !== null && apiKey !== '') throw new Error('apiKey and sealedApiKey: send one, not both');
+  if (!isSealedSecretText(sealedApiKey)) {
+    throw new Error(`sealedApiKey must be a KMS ciphertext: base64 of at most ${SEALED_SECRET_MAX_BYTES} bytes`);
+  }
+  return { sealedApiKey };
 }
 
 /** Query parameters: an object of text values (they go into Stripe's query string as they are). */
@@ -155,19 +188,17 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
   schema: STRIPE_PAYMENT_SCHEMA,
   manifestHash: MANIFEST_HASH,
   policies: HANDLER_MANIFEST.policies,
-  requiredHosts: ['api.stripe.com'],
+  requiredHosts: ['api.stripe.com', 'kms.eu-central-1.amazonaws.com'],
 
   parseParams(body: unknown): StripeParams {
     const b = (body ?? {}) as Record<string, unknown>;
-    const { operation, apiKey } = b;
+    const { operation } = b;
 
     if (typeof operation !== 'string' || !VALID_OPERATIONS.has(operation)) {
       throw new Error(`Invalid operation: "${String(operation)}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
     }
 
-    if (typeof apiKey !== 'string' || apiKey === '') {
-      throw new Error('apiKey is required');
-    }
+    const key = keyOf(b.apiKey, b.sealedApiKey);
 
     // Checked before the fetch: the value goes into the Stripe-Account header, and a value that is not an account id
     // is never asked (audit 2026-10 agent 1 §2.3a).
@@ -183,7 +214,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
 
     return {
       operation: operation as StripeOperation,
-      apiKey,
+      ...key,
       stripeAccount,
       queryParams: queryParamsOf(b.queryParams),
       resourceId,
@@ -191,7 +222,12 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
   },
 
   async execute(params: StripeParams, ctx: HandlerContext): Promise<HandlerResult> {
-    const { operation, apiKey, stripeAccount, queryParams, resourceId } = params;
+    const { operation, stripeAccount, queryParams, resourceId } = params;
+    // A sealed key is opened before anything is asked of Stripe; a failure names no byte of it
+    const apiKey = 'apiKey' in params ? params.apiKey : await ctx.unsealSecret(params.sealedApiKey, SEALED_KEY_CONTEXT);
+    if ('sealedApiKey' in params && !STRIPE_KEY.test(apiKey)) {
+      throw new Error('the sealed key is not a Stripe secret or restricted key (sk_ or rk_)');
+    }
 
     const stripeHost = ctx.hosts.find((h: { hostname: string }) => h.hostname === 'api.stripe.com')!;
 
