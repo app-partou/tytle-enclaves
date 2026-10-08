@@ -58,6 +58,16 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       reason: 'Both countryCode and vatNumber are required for lookup',
     },
     {
+      id: 'vat_number_format',
+      check: { type: 'field_matches', path: 'vatNumber', pattern: '^[0-9A-Za-z+*.]{2,12}$' },
+      reason: 'The register\'s own rule, checked before any fetch: VIES checkVatService.wsdl "[0-9A-Za-z\\+\\*\\.]{2,12}"',
+    },
+    {
+      id: 'gb_vat_number_format',
+      check: { type: 'behavioral', description: 'countryCode === "GB": vatNumber must be 9 or 12 digits (HMRC targetVrn), else 400 before any fetch' },
+      reason: 'HMRC refuses any other targetVrn; a refused value is never asked and never signed',
+    },
+    {
       id: 'routing',
       check: { type: 'behavioral', description: 'countryCode === "GB" routes to hmrc_rest; all others route to vies_soap' },
       reason: 'UK VAT is verified via HMRC REST API, EU VAT via VIES SOAP',
@@ -65,7 +75,17 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     {
       id: 'hmrc_404_is_invalid',
       check: { type: 'status_attest', code: 404, overrides: { valid: 0 } },
-      reason: 'HMRC 404 means VAT number does not exist (valid=false, attested)',
+      reason: 'Only HMRC\'s 404 whose JSON body code is NOT_FOUND ("targetVrn does not match a registered company") is valid=false, attested; any other 404 throws 502',
+    },
+    {
+      id: 'hmrc_200_needs_target',
+      check: { type: 'behavioral', description: 'An HMRC 200 without a target object throws 502 (never valid=true)' },
+      reason: 'A 200 that names no registered company is no answer',
+    },
+    {
+      id: 'vies_valid_required',
+      check: { type: 'field_matches', path: 'responseBody', pattern: '<(?:\\w+:)?valid>(true|false)</(?:\\w+:)?valid>' },
+      reason: 'A VIES reply without <valid>true|false</valid> throws 502 (a parse miss is never valid=false)',
     },
     {
       id: 'hmrc_non_200_error',

@@ -72,18 +72,28 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'form_variant_fallback',
-      check: { type: 'behavioral', description: 'Tries multiple ASP.NET form field names until one returns results' },
+      check: { type: 'behavioral', description: 'Tries the next ASP.NET form variant only while SICAE processed none (no results grid, no error label, or a non-200)' },
       reason: 'SICAE has changed form field names over time; handler supports both variants',
     },
     {
       id: 'not_found',
       check: { type: 'status_attest', code: 404, overrides: {} },
-      reason: 'NIF not found or no CAE data is a valid, attestable answer (success: true, status: 404)',
+      reason: 'SICAE\'s own "no data" row or its "NIPC not valid" refusal is a definitive answer, attested (success: true, status: 404; nif set, every other field null)',
+    },
+    {
+      id: 'no_data_row',
+      check: { type: 'field_matches', path: 'responseBody', pattern: 'Não existem dados para o critério de pesquisa indicado\\.' },
+      reason: 'The results grid\'s only row, with this exact text as its only text, is SICAE saying it holds nothing for the number (not_found)',
     },
     {
       id: 'html_error_detection',
-      check: { type: 'field_matches', path: 'responseBody', pattern: 'ClassErro' },
-      reason: 'HTML responses containing ClassErro indicate validation errors (treated as not found)',
+      check: { type: 'field_matches', path: 'responseBody', pattern: "O campo 'NIPC' não é válido" },
+      reason: 'Only this exact text in SICAE\'s error label (class ClassErro), with no results grid, is not_found; any other error text throws 502',
+    },
+    {
+      id: 'parse_miss_is_error',
+      check: { type: 'behavioral', description: 'A results grid or error label the handler cannot read, a results row for another NIPC, or no form variant processed throws 502 - never not_found' },
+      reason: 'A page that is not one of SICAE\'s known answers is no answer (audit 2026-10 P1.4)',
     },
     {
       id: 'http_transport',
