@@ -9,14 +9,10 @@
  */
 
 import { startEnclave, createHandler } from '@tytle-enclaves/shared';
-import { stripePaymentHandlerDef } from './stripePaymentHandler.js';
-
-const hosts = [
-  { hostname: 'api.stripe.com', vsockProxyPort: 8446 },
-];
+import { stripePaymentHandlerDef, STRIPE_HOSTS } from './stripePaymentHandler.js';
 
 startEnclave({
   name: 'stripe-payment',
-  hosts,
-  customHandler: createHandler(stripePaymentHandlerDef, hosts),
+  hosts: STRIPE_HOSTS,
+  customHandler: createHandler(stripePaymentHandlerDef, STRIPE_HOSTS),
 });

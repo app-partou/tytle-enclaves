@@ -9,7 +9,7 @@ import {
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.0.0',
+  version: '1.1.0',
 
   queries: [
     {
@@ -67,6 +67,36 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       id: 'object_type_validation',
       check: { type: 'field_matches', path: 'object', pattern: '^(list|payment_intent|account|charge)$' },
       reason: 'Response object type must match expected type for the requested operation',
+    },
+    {
+      id: 'stripe_account_format',
+      check: { type: 'field_matches', path: 'stripeAccount', pattern: '^acct_[0-9A-Za-z]+$' },
+      reason: 'The Stripe-Account header carries a Stripe account id; any other value is refused before the fetch',
+    },
+    {
+      id: 'account_is_the_one_asked',
+      check: { type: 'behavioral', description: 'accountId is the Stripe-Account the request named (null when it named none). Stripe refuses a Stripe-Account the API key cannot act as (error code account_invalid): that 4xx is never signed. When the answer names an account in its own Stripe-Account header, it must be the one asked, else the answer is an error' },
+      reason: 'The signed account is the one Stripe acted as, never a value the caller only claimed',
+    },
+    {
+      id: 'single_object_is_the_one_asked',
+      check: { type: 'behavioral', description: 'get_payment_intent, get_account and get_charge: the answer\'s id must be the resourceId asked, else the answer is an error' },
+      reason: 'A signed object is the object the request asked for',
+    },
+    {
+      id: 'list_shape',
+      check: { type: 'behavioral', description: 'A list answer must carry its data array and has_more (boolean): totalCount and hasMore are read from them; otherwise the answer is an error' },
+      reason: 'A list the handler cannot read is never signed as an empty one',
+    },
+    {
+      id: 'not_found_is_stripes_own',
+      check: { type: 'behavioral', description: 'A 404 is signed (objectType not_found) only when its body is Stripe\'s error object with code resource_missing; any other 404 is an error' },
+      reason: 'A path Stripe does not know, or a proxy\'s page, is not Stripe saying the object does not exist',
+    },
+    {
+      id: 'body_beside_the_answer',
+      check: { type: 'behavioral', description: 'The signed answer carries Stripe\'s body beside it (upstreamBody, not signed); its SHA-256 is the signed dataHash' },
+      reason: 'A reader uses the body as attested data only when it matches the signed dataHash',
     },
   ],
 

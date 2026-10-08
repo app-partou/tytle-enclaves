@@ -21,12 +21,22 @@
  *   [96..127]  dataHash     sha256 (full JSON response)
  *   [128..159] totalCount   uint
  *   [160..191] hasMore      uint (1 = true, 0 = false)
+ *
+ * Only Stripe's own answer is signed (enclave audit 2026-10, P1.4): a 404 only when Stripe says the object does not
+ * exist, a single object only when it is the one asked, a list only with its data array and has_more. The signed
+ * answer carries Stripe's body beside it (upstreamBody): its SHA-256 is the signed dataHash, so a reader can use the
+ * body as attested data.
  */
 
 import crypto from 'node:crypto';
 import { STRIPE_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
-import type { HandlerDef, HandlerResult, HandlerContext } from '@tytle-enclaves/shared';
+import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost } from '@tytle-enclaves/shared';
 import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
+
+/** The enclave's allowlist: Stripe's API over its host vsock-proxy port, HTTPS. */
+export const STRIPE_HOSTS: AllowedHost[] = [
+  { hostname: 'api.stripe.com', vsockProxyPort: 8446 },
+];
 
 // =============================================================================
 // Types
@@ -78,6 +88,64 @@ const VALID_OPERATIONS = new Set<string>(Object.keys(OPERATION_PATH_MAP));
 
 const STRIPE_API_VERSION = '2025-12-15.clover';
 
+/** A Stripe account id (the Stripe-Account header's value): acct_ followed by letters and digits. */
+const STRIPE_ACCOUNT_ID = /^acct_[0-9A-Za-z]+$/;
+
+/**
+ * Stripe's error code for "the object does not exist": "The ID provided isn't valid. Either the resource doesn't
+ * exist, or an ID for a different resource has been provided." (docs.stripe.com/error-codes, read 2026-10-07).
+ */
+const NO_SUCH_OBJECT = 'resource_missing';
+
+// =============================================================================
+// Caller input and answer rules
+// =============================================================================
+
+/** An optional text field: absent, null or '' is absent; any other non-text value is refused. */
+function optionalText(value: unknown, name: string): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') throw new Error(`${name} must be text`);
+  return value;
+}
+
+/** Query parameters: an object of text values (they go into Stripe's query string as they are). */
+function queryParamsOf(value: unknown): Record<string, string> | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('queryParams must be an object of text values');
+  const params: Record<string, string> = {};
+  for (const [key, v] of Object.entries(value)) {
+    if (typeof v !== 'string') throw new Error(`queryParams.${key} must be text`);
+    params[key] = v;
+  }
+  return params;
+}
+
+/** Stripe's error code in an error body (`{"error": {"code": ...}}`), or undefined when the body has none. */
+function stripeErrorCodeOf(body: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  const error = typeof parsed === 'object' && parsed !== null ? (parsed as { error?: unknown }).error : undefined;
+  const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/**
+ * The account the answer belongs to: the Stripe-Account the request named, or null (the API key's own account).
+ * Stripe refuses a Stripe-Account the key cannot act as (error code account_invalid: a 4xx, never signed). When
+ * Stripe's answer names an account in its own Stripe-Account header, it must be the one asked.
+ */
+function answeredAccount(asked: string | undefined, responseHeaders: Record<string, string>): string | null {
+  const named = responseHeaders['stripe-account'];
+  if (asked !== undefined && named !== undefined && named !== asked) {
+    throw new Error(`Stripe answered for account ${named}, not the one asked`);
+  }
+  return asked ?? null;
+}
+
 // =============================================================================
 // Handler Definition
 // =============================================================================
@@ -90,22 +158,26 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
   requiredHosts: ['api.stripe.com'],
 
   parseParams(body: unknown): StripeParams {
-    const b = body as Record<string, unknown>;
-    const operation = b.operation as string | undefined;
-    const apiKey = b.apiKey as string | undefined;
-    const stripeAccount = b.stripeAccount as string | undefined;
-    const queryParams = b.queryParams as Record<string, string> | undefined;
-    const resourceId = b.resourceId as string | undefined;
+    const b = (body ?? {}) as Record<string, unknown>;
+    const { operation, apiKey } = b;
 
-    if (!operation || !VALID_OPERATIONS.has(operation)) {
-      throw new Error(`Invalid operation: "${operation}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
+    if (typeof operation !== 'string' || !VALID_OPERATIONS.has(operation)) {
+      throw new Error(`Invalid operation: "${String(operation)}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
     }
 
-    if (!apiKey) {
+    if (typeof apiKey !== 'string' || apiKey === '') {
       throw new Error('apiKey is required');
     }
 
-    if (SINGLE_RESOURCE_OPS.has(operation) && !resourceId) {
+    // Checked before the fetch: the value goes into the Stripe-Account header, and a value that is not an account id
+    // is never asked (audit 2026-10 agent 1 §2.3a).
+    const stripeAccount = optionalText(b.stripeAccount, 'stripeAccount');
+    if (stripeAccount !== undefined && !STRIPE_ACCOUNT_ID.test(stripeAccount)) {
+      throw new Error('Invalid stripeAccount: a Stripe account id is acct_ followed by letters and digits');
+    }
+
+    const resourceId = optionalText(b.resourceId, 'resourceId');
+    if (SINGLE_RESOURCE_OPS.has(operation) && resourceId === undefined) {
       throw new Error(`${operation} requires resourceId`);
     }
 
@@ -113,7 +185,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
       operation: operation as StripeOperation,
       apiKey,
       stripeAccount,
-      queryParams,
+      queryParams: queryParamsOf(b.queryParams),
       resourceId,
     };
   },
@@ -169,14 +241,21 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
       };
     }
 
-    // 404 - resource not found. Attest with objectType='not_found'.
+    const accountId = answeredAccount(stripeAccount, response.headers);
+    const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
+
+    // 404 - Stripe's own "no such object" is signed with objectType='not_found'. Any other 404 (a path Stripe does
+    // not know, a proxy's page) is no answer: an error, never signed.
     if (response.status === 404) {
-      const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
+      const code = stripeErrorCodeOf(response.body);
+      if (code !== NO_SUCH_OBJECT) {
+        throw new Error(`Stripe answered 404 without its "${NO_SUCH_OBJECT}" code (code: ${code ?? 'none'})`);
+      }
 
       return {
         values: {
           operation,
-          accountId: stripeAccount || null,
+          accountId,
           objectType: 'not_found',
           dataHash,
           totalCount: 0,
@@ -188,7 +267,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
         requestHeaders: headers,
         responseHeaders: {
           'x-stripe-operation': operation,
-          'x-stripe-account-id': stripeAccount || '',
+          'x-stripe-account-id': accountId ?? '',
           'x-stripe-object-type': 'not_found',
           'x-stripe-data-hash': dataHash,
           'x-stripe-total-count': '0',
@@ -198,33 +277,46 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
         bn254Headers: {
           'x-stripe-data-hash': dataHash,
         },
+        upstreamBody: response.body,
       };
     }
 
     // Parse and validate response
-    let jsonData: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      jsonData = JSON.parse(response.body) as Record<string, unknown>;
+      parsed = JSON.parse(response.body);
     } catch {
       throw new Error('Stripe API returned invalid JSON');
     }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('Stripe API returned JSON that is not an object');
+    }
+    const jsonData = parsed as Record<string, unknown>;
 
     const expectedType = OPERATION_OBJECT_TYPE[operation];
     if (jsonData.object !== expectedType) {
       throw new Error(`Unexpected Stripe object type: expected "${expectedType}", got "${String(jsonData.object)}"`);
     }
 
-    // Compute attestation fields
-    const dataHash = crypto.createHash('sha256').update(response.body, 'utf8').digest('hex');
+    // A single object is signed only as the one asked.
+    if (SINGLE_RESOURCE_OPS.has(operation) && jsonData.id !== resourceId) {
+      throw new Error(`Stripe answered ${operation} with "${String(jsonData.id)}", not the object asked`);
+    }
+
+    // A list is signed only with what its count and has_more are read from.
     const isListOp = expectedType === 'list';
-    const listData = jsonData.data as unknown[] | undefined;
-    const totalCount = isListOp ? (listData?.length ?? 0) : 0;
-    const hasMore = isListOp ? (jsonData.has_more ? 1 : 0) : 0;
+    if (isListOp && (!Array.isArray(jsonData.data) || typeof jsonData.has_more !== 'boolean')) {
+      throw new Error('Stripe answered a list without its data array and has_more');
+    }
+
+    // Compute attestation fields
+    const totalCount = isListOp ? (jsonData.data as unknown[]).length : 0;
+    const hasMore = isListOp && jsonData.has_more === true ? 1 : 0;
 
     return {
       values: {
         operation,
-        accountId: stripeAccount || null,
+        accountId,
         objectType: String(jsonData.object),
         dataHash,
         totalCount,
@@ -236,7 +328,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
       requestHeaders: headers,
       responseHeaders: {
         'x-stripe-operation': operation,
-        'x-stripe-account-id': stripeAccount || '',
+        'x-stripe-account-id': accountId ?? '',
         'x-stripe-object-type': String(jsonData.object),
         'x-stripe-data-hash': dataHash,
         'x-stripe-total-count': String(totalCount),
@@ -245,6 +337,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
       bn254Headers: {
         'x-stripe-data-hash': dataHash,
       },
+      upstreamBody: response.body,
     };
   },
 };

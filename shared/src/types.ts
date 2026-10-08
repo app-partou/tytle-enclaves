@@ -62,4 +62,9 @@ export interface EnclaveResponse {
   bn254?: string;
   /** Human-readable values for sha256 fields (from custom handler) */
   bn254Headers?: Record<string, string>;
+  /**
+   * The upstream body the signed dataHash commits to, when the handler's data is that body (Stripe's JSON). Not signed:
+   * a reader uses it only when its SHA-256 is the vector's dataHash.
+   */
+  upstreamBody?: string;
 }

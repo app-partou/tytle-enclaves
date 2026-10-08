@@ -34,6 +34,11 @@ export interface HandlerResult {
   status?: number;
   skipAttestation?: boolean;
   rawPassthrough?: { status: number; headers: Record<string, string>; rawBody: string };
+  /**
+   * The upstream body the signed `dataHash` commits to, for a handler whose data IS that body (Stripe's JSON): sent
+   * beside the signed answer, never signed itself. A reader uses it only when its SHA-256 is the vector's dataHash.
+   */
+  upstreamBody?: string;
 }
 
 export interface HandlerContext {
@@ -167,6 +172,7 @@ export function createHandler<TParams>(
         attestation: attestResult.attestation,
         bn254: attestResult.rawBody,
         bn254Headers: result.bn254Headers,
+        ...(result.upstreamBody !== undefined ? { upstreamBody: result.upstreamBody } : {}),
       };
     } catch (err: unknown) {
       const safeMessage = redactError(def.policies, toErrorMessage(err));
