@@ -13,7 +13,7 @@ import {
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.0.0',
+  version: '1.1.0',
 
   queries: [
     {
@@ -88,6 +88,26 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       id: 'rpc_result_required',
       check: { type: 'field_required', paths: ['result'] },
       reason: 'Gnosis RPC response must contain result field with non-empty hex value',
+    },
+    {
+      id: 'order_id_format',
+      check: { type: 'field_matches', path: 'orderId', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' },
+      reason: 'A Monerium order id is a UUID; any other value is refused before the fetch',
+    },
+    {
+      id: 'order_is_the_one_asked',
+      check: { type: 'behavioral', description: 'The answered order\'s id must be the orderId asked, and id, state, amount and currency must be text; otherwise the answer is an error' },
+      reason: 'A signed order is the order the request asked for',
+    },
+    {
+      id: 'not_found_is_moneriums_own',
+      check: { type: 'behavioral', description: 'A 404 is signed (state not_found) only when its body is Monerium\'s error object with code 404; any other 404 is an error' },
+      reason: 'A proxy\'s page, or a 404 in another shape, is not Monerium saying the order does not exist',
+    },
+    {
+      id: 'rpc_answer_is_this_call',
+      check: { type: 'behavioral', description: 'The JSON-RPC answer must carry the id of the balanceOf call (1) and a 0x-hex uint256 result; otherwise the answer is an error' },
+      reason: 'The signed balance is the chain\'s answer to this call',
     },
   ],
 

@@ -25,12 +25,21 @@
  *   [96..127]  currency     shortString (e.g. "eur")
  *   [128..159] balance      uint        (raw EURe balance, 18 decimals)
  *   [160..191] dataHash     sha256      (combined order + RPC response)
+ *
+ * Only Monerium's and the chain's own answers are signed (enclave audit 2026-10, P1.4): the order asked (its id is
+ * the orderId), a 404 only as Monerium's error body, a balance only from the JSON-RPC answer to this call.
  */
 
 import crypto from 'node:crypto';
 import { MONERIUM_PAYMENT_SCHEMA } from '@tytle-enclaves/shared';
-import type { HandlerDef, HandlerResult, HandlerContext } from '@tytle-enclaves/shared';
+import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost } from '@tytle-enclaves/shared';
 import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
+
+/** The enclave's allowlist: Monerium's API and the Gnosis RPC, each over its own host vsock-proxy port, both HTTPS. */
+export const MONERIUM_HOSTS: AllowedHost[] = [
+  { hostname: 'api.monerium.app', vsockProxyPort: 8447 },
+  { hostname: 'rpc.gnosischain.com', vsockProxyPort: 8448 },
+];
 
 // =============================================================================
 // Constants
@@ -45,6 +54,19 @@ const BALANCE_OF_SELECTOR = '0x70a08231';
 const VALID_OPERATIONS = new Set(['get_order_with_balance']);
 
 const VALID_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+
+/**
+ * A Monerium order id is a UUID (docs.monerium.com/api, read 2026-10-07: the Order object's id is "string, UUID", and
+ * the order's payments call answers 400 "the order ID is not a valid UUID"). Any version: the docs' own examples are
+ * version-1 UUIDs.
+ */
+const ORDER_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+/** The JSON-RPC id of the one call this handler makes (a JSON-RPC answer carries the id of the call it answers). */
+const RPC_CALL_ID = 1;
+
+/** A balanceOf answer: one ABI word (uint256), as 0x-hex. */
+const RPC_UINT256_RE = /^0x[0-9a-fA-F]{1,64}$/;
 
 // =============================================================================
 // ERC-20 Helpers
@@ -65,8 +87,41 @@ function buildBalanceOfRpcBody(address: string): string {
       { to: EURE_CONTRACT, data: encodeBalanceOfCall(address) },
       'latest',
     ],
-    id: 1,
+    id: RPC_CALL_ID,
   });
+}
+
+/** A JSON body that must be an object; anything else is an error naming the service. */
+function jsonObjectOf(body: string, service: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new Error(`${service} returned invalid JSON`);
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`${service} returned JSON that is not an object`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+/** The `code` of Monerium's error body ({code, status, message, errors}), or undefined when the body is not one. */
+function moneriumErrorCodeOf(body: string): unknown {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return typeof parsed === 'object' && parsed !== null ? (parsed as { code?: unknown }).code : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A field that must be non-empty text, else the answer is no answer. */
+function requiredText(data: Record<string, unknown>, field: string): string {
+  const value = data[field];
+  if (typeof value !== 'string' || value === '') {
+    throw new Error(`Monerium order response has no "${field}" text`);
+  }
+  return value;
 }
 
 // =============================================================================
@@ -87,19 +142,21 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
   requiredHosts: ['api.monerium.app', 'rpc.gnosischain.com'],
 
   parseParams(body: unknown): MoneriumPaymentParams {
-    const b = body as Record<string, unknown>;
-    const operation = b.operation as string | undefined;
-    const accessToken = b.accessToken as string | undefined;
-    const orderId = b.orderId as string | undefined;
+    const b = (body ?? {}) as Record<string, unknown>;
+    const { operation, accessToken, orderId } = b;
 
-    if (!operation || !VALID_OPERATIONS.has(operation)) {
-      throw new Error(`Invalid operation: "${operation}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
+    if (typeof operation !== 'string' || !VALID_OPERATIONS.has(operation)) {
+      throw new Error(`Invalid operation: "${String(operation)}". Supported: ${[...VALID_OPERATIONS].join(', ')}`);
     }
-    if (!accessToken) {
+    if (typeof accessToken !== 'string' || accessToken === '') {
       throw new Error('accessToken is required');
     }
-    if (!orderId) {
+    if (orderId === undefined || orderId === null || orderId === '') {
       throw new Error('orderId is required');
+    }
+    // Checked before the fetch: a value that is not an order id is never asked (audit 2026-10, caller inputs).
+    if (typeof orderId !== 'string' || !ORDER_ID_RE.test(orderId)) {
+      throw new Error('Invalid orderId: a Monerium order id is a UUID');
     }
 
     return { operation, accessToken, orderId };
@@ -146,16 +203,13 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
       throw new Error(`Monerium API returned unexpected status ${orderResponse.status}`);
     }
 
-    // Parse order response
-    let orderData: Record<string, unknown>;
-    try {
-      orderData = JSON.parse(orderResponse.body) as Record<string, unknown>;
-    } catch {
-      throw new Error('Monerium API returned invalid JSON');
-    }
-
-    // 404 = order not found - a valid, definitive answer. Attest it.
+    // 404 = order not found - a valid, definitive answer, signed. Monerium documents no 404 for this call; its error
+    // body is {code, status, message, errors} (docs.monerium.com/api). Only that body with code 404 is Monerium's own
+    // answer; any other 404 (a proxy's page, another shape) is an error, never signed.
     if (orderResponse.status === 404) {
+      if (moneriumErrorCodeOf(orderResponse.body) !== 404) {
+        throw new Error('Monerium answered 404 without its error body (code 404)');
+      }
       const dataHash = crypto.createHash('sha256').update(orderResponse.body, 'utf8').digest('hex');
 
       return {
@@ -186,19 +240,18 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
       };
     }
 
-    // Validate required order fields
-    if (!orderData.id) {
-      throw new Error('Monerium order response missing "id" field');
+    // Parse order response
+    const orderData = jsonObjectOf(orderResponse.body, 'Monerium API');
+
+    // Validate required order fields: each is text (docs.monerium.com/api: id, state, amount and currency are strings),
+    // and the order is the one asked.
+    const answeredId = requiredText(orderData, 'id');
+    if (answeredId !== orderId) {
+      throw new Error(`Monerium answered order ${answeredId}, not the one asked`);
     }
-    if (!orderData.state) {
-      throw new Error('Monerium order response missing "state" field');
-    }
-    if (!orderData.amount) {
-      throw new Error('Monerium order response missing "amount" field');
-    }
-    if (!orderData.currency) {
-      throw new Error('Monerium order response missing "currency" field');
-    }
+    const state = requiredText(orderData, 'state');
+    const amount = requiredText(orderData, 'amount');
+    const currency = requiredText(orderData, 'currency');
     if (orderData.chain !== 'gnosis') {
       throw new Error(`Only gnosis chain is supported, got "${orderData.chain as string}"`);
     }
@@ -219,23 +272,23 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
       throw new Error(`Gnosis RPC returned HTTP ${rpcResponse.status}`);
     }
 
-    let rpcData: Record<string, unknown>;
-    try {
-      rpcData = JSON.parse(rpcResponse.body) as Record<string, unknown>;
-    } catch {
-      throw new Error('Gnosis RPC returned invalid JSON');
-    }
+    const rpcData = jsonObjectOf(rpcResponse.body, 'Gnosis RPC');
 
     if (rpcData.error) {
       const rpcError = rpcData.error as Record<string, unknown>;
       throw new Error(`Gnosis RPC error: ${(rpcError.message as string) || JSON.stringify(rpcData.error)}`);
     }
 
-    if (!rpcData.result || rpcData.result === '0x') {
-      throw new Error('balanceOf returned empty result');
+    // The answer to THIS call: a JSON-RPC answer carries the id of the call it answers.
+    if (rpcData.id !== RPC_CALL_ID) {
+      throw new Error(`Gnosis RPC answered call ${JSON.stringify(rpcData.id)}, not this one`);
     }
 
-    const balance = BigInt(rpcData.result as string);
+    if (typeof rpcData.result !== 'string' || !RPC_UINT256_RE.test(rpcData.result)) {
+      throw new Error(`balanceOf returned no uint256 result (${JSON.stringify(rpcData.result)})`);
+    }
+
+    const balance = BigInt(rpcData.result);
 
     // 3. Compute dataHash from combined raw responses
     const combinedBody = orderResponse.body + '\n' + rpcResponse.body;
@@ -243,10 +296,10 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
 
     return {
       values: {
-        orderId: orderData.id as string,
-        state: orderData.state as string,
-        orderAmount: orderData.amount as string,
-        currency: orderData.currency as string,
+        orderId: answeredId,
+        state,
+        orderAmount: amount,
+        currency,
         balance,
         dataHash,
       },
@@ -258,10 +311,10 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
         'Accept': 'application/vnd.monerium.api-v2+json',
       },
       responseHeaders: {
-        'x-monerium-order-id': orderData.id as string,
-        'x-monerium-state': orderData.state as string,
-        'x-monerium-order-amount': orderData.amount as string,
-        'x-monerium-currency': orderData.currency as string,
+        'x-monerium-order-id': answeredId,
+        'x-monerium-state': state,
+        'x-monerium-order-amount': amount,
+        'x-monerium-currency': currency,
         'x-monerium-balance': balance.toString(),
         'x-monerium-data-hash': dataHash,
       },

@@ -10,15 +10,10 @@
  */
 
 import { startEnclave, createHandler } from '@tytle-enclaves/shared';
-import { moneriumPaymentHandlerDef } from './moneriumPaymentHandler.js';
-
-const hosts = [
-  { hostname: 'api.monerium.app', vsockProxyPort: 8447 },
-  { hostname: 'rpc.gnosischain.com', vsockProxyPort: 8448 },
-];
+import { moneriumPaymentHandlerDef, MONERIUM_HOSTS } from './moneriumPaymentHandler.js';
 
 startEnclave({
   name: 'monerium-payment',
-  hosts,
-  customHandler: createHandler(moneriumPaymentHandlerDef, hosts),
+  hosts: MONERIUM_HOSTS,
+  customHandler: createHandler(moneriumPaymentHandlerDef, MONERIUM_HOSTS),
 });
