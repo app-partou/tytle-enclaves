@@ -30,10 +30,14 @@ for pkg in shared vies sicae stripe-payment monerium-payment parent; do
 
   tmp_dir=$(mktemp -d)
   cp "$pkg_dir/package.json" "$tmp_dir/package.json"
-  cp "$pkg_dir/package-lock.json" "$tmp_dir/package-lock.json"
+  # Start from the package's current docker lockfile: npm then changes only what package.json changed, so a
+  # regeneration never re-resolves the runtime dependencies that ship in the image (its PCR0 covers them).
+  # A package without one is resolved from scratch.
+  if [ -f "$pkg_dir/package-lock.docker.json" ]; then
+    cp "$pkg_dir/package-lock.docker.json" "$tmp_dir/package-lock.json"
+  fi
 
-  # Strip file: deps from package.json only. Delete the lockfile and let
-  # npm regenerate it cleanly from the stripped package.json.
+  # Strip file: deps from package.json only.
   DEPS_TO_STRIP="$deps_to_strip" TMP_DIR="$tmp_dir" node -e '
     const fs = require("fs");
     const depsToStrip = process.env.DEPS_TO_STRIP.split(" ");
@@ -46,9 +50,8 @@ for pkg in shared vies sicae stripe-payment monerium-payment parent; do
     fs.writeFileSync(dir + "/package.json", JSON.stringify(pkg, null, 2) + "\n");
   '
 
-  # Generate a fresh lockfile from the stripped package.json.
+  # Bring the lockfile in line with the stripped package.json.
   # Empty .npmrc prevents npm from walking up to a parent workspace.
-  rm "$tmp_dir/package-lock.json"
   touch "$tmp_dir/.npmrc"
   (cd "$tmp_dir" && npm install --package-lock-only --ignore-scripts)
 

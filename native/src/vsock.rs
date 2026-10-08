@@ -27,7 +27,9 @@ const ACCEPTED_IO_TIMEOUT_SECS: u32 = 10;
 /// `fd` must be an open socket owned by the caller.
 pub(crate) unsafe fn set_io_timeouts(fd: i32, secs: u32) -> std::io::Result<()> {
     let tv = libc::timeval {
-        tv_sec: secs.max(1) as libc::time_t,
+        // `as _`: the field's own type. libc deprecates naming `time_t` on musl targets (rust-lang/libc#1848), the
+        // enclave's target; the type itself is 64-bit on x86_64 either way.
+        tv_sec: secs.max(1) as _,
         tv_usec: 0,
     };
     for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {

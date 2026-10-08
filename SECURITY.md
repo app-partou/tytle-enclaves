@@ -12,7 +12,7 @@
 2. **Man-in-the-middle**: The host cannot MITM API calls because:
    - TLS is negotiated end-to-end between the enclave and the remote server
    - The vsock-proxy is a blind TCP tunnel — it only sees encrypted bytes
-   - The CA bundle is baked into the enclave image (part of PCR0)
+   - The trusted roots are Node.js's bundled Mozilla CA store (`tls.rootCertificates`, compiled into the node binary of the digest-pinned image, so part of PCR0); the Alpine ca-certificates bundle is not used, and no `ca` option overrides the store. A bump of the Node image digest is a bump of the CA store: every upstream host is re-checked then (2026-10-08, Node 22.23.3: 119 roots; all five TLS upstreams verify)
    - `rejectUnauthorized: true` is hardcoded (not configurable)
 
 3. **Code substitution**: An attacker cannot run different code while claiming the same attestation because:

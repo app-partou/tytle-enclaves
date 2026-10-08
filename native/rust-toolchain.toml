@@ -1,0 +1,6 @@
+# The Rust toolchain of every build of this addon (enclave audit P1.4, "runtime + build pins"). The enclave and
+# parent images pin the compiler by image digest (rust:1.83-alpine, rust:1.83-slim); this file makes a local or CI
+# cargo build use the same release. Keep it equal to the images' tag (verify/src/__tests__/buildPins.drift.test.ts).
+[toolchain]
+channel = "1.83.0"
+profile = "minimal"
