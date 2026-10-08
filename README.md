@@ -10,9 +10,11 @@ Each service directory contains a thin config that defines which API hosts the e
 Fargate (data-bridge)
     |  POST /attest/fetch {id, url, method, headers, body, challenge}   (JSON, at most 64 KB)
     |  GET /health -> {healthy, enclaves, proxies}                     (503 when an enclave does not answer)
+    |  Authorization: Bearer <ENCLAVE_PARENT_AUTH_TOKEN>                (when the parent has one; not on /health)
     v
 Parent Server (EC2 host, port 5001)     <- generic router
     |  vsock (CID 16, port 5000)
+    |  + the host role's AWS credentials (IMDSv2), only to an enclave that opens sealed secrets (Stripe)
     v
 Nitro Enclave                            <- this repo
     |  1. Validate URL against allowlist

@@ -28,6 +28,7 @@ vi.mock('node:fs/promises', async (importOriginal) => ({
 
 import { createApp } from '../app.js';
 import { getAllRoutes } from '../enclaveRouter.js';
+import { startFakeImds, imdsCredentials } from './helpers/fakeImds.js';
 
 /** The bytes the shared protocol writes for `message`: what an enclave sends. */
 async function frame(message: unknown): Promise<Buffer> {
@@ -453,5 +454,168 @@ describe('GET /health', () => {
     await host({ unitFiles: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) });
     expect((await health()).body.proxies).toEqual({});
     expect(io.execFile).not.toHaveBeenCalled();
+  });
+});
+
+/** An app of its own on an ephemeral port: its base URL, and how to close it. */
+async function listen(app: ReturnType<typeof createApp>): Promise<{ url: string; close(): Promise<void> }> {
+  const own = app.listen(0, '127.0.0.1');
+  await new Promise<void>((r) => own.once('listening', () => r()));
+  return {
+    url: `http://127.0.0.1:${(own.address() as AddressInfo).port}`,
+    close: () => new Promise<void>((r) => own.close(() => r())),
+  };
+}
+
+describe('the parent token: ENCLAVE_PARENT_AUTH_TOKEN (enclave audit P1.7, the interim guard) (red)', () => {
+  const TOKEN = 'testonly-parent-token-0123456789abcdef';
+  let guarded: { url: string; close(): Promise<void> };
+  beforeAll(async () => { guarded = await listen(createApp({ authToken: TOKEN })); });
+  afterAll(async () => { await guarded.close(); });
+
+  const send = (path: string, init: RequestInit = {}) => fetch(`${guarded.url}${path}`, init);
+  const postFetch = (headers: Record<string, string>, body = JSON.stringify(request())) =>
+    send('/attest/fetch', { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body });
+
+  it('without it, /attest/fetch is a JSON 401, its body is never read, and no enclave is called', async () => {
+    for (const res of [await postFetch({}), await postFetch({}, '{"id":')]) {
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ success: false, error: 'This route needs the parent token' });
+    }
+    expect(io.vsockConnectAsync).not.toHaveBeenCalled();
+    expect(errors).toEqual(Array(2).fill('[parent] Refused POST "/attest/fetch": no parent token'));
+  });
+
+  it.each([
+    ['a wrong token', { Authorization: 'Bearer testonly-parent-token-0123456789abcdeX' }],
+    ['a prefix of the token', { Authorization: `Bearer ${TOKEN.slice(0, -1)}` }],
+    ['the token without its scheme', { Authorization: TOKEN }],
+    ['the token in another scheme', { Authorization: `Basic ${TOKEN}` }],
+    ['the token in another scheme as long as "Bearer "', { Authorization: `Digest ${TOKEN}` }],
+    ['the token in another header', { 'X-Parent-Token': TOKEN }],
+  ])('%s: 401', async (_label, headers) => {
+    expect((await postFetch(headers)).status).toBe(401);
+    expect(io.vsockConnectAsync).not.toHaveBeenCalled();
+  });
+
+  it('with it: forwarded as before, and nothing of it reaches the enclave or a log line (lock)', async () => {
+    const conn = await enclaveConnection(ANSWER);
+    io.vsockConnectAsync.mockResolvedValue(conn);
+    const res = await postFetch({ Authorization: `Bearer ${TOKEN}` });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(ANSWER);
+    expect(await framedRequest(conn)).toEqual(request());
+    expect(conn.sent().toString('utf-8')).not.toContain(TOKEN);
+    expect([...logs, ...errors].join('\n')).not.toContain(TOKEN);
+  });
+
+  it('another spelling of the path is guarded too', async () => {
+    for (const path of ['/ATTEST/FETCH', '/Attest/Fetch', '/attest/fetch/']) {
+      const res = await send(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(request()) });
+      expect(res.status, path).toBe(401);
+    }
+    expect(io.vsockConnectAsync).not.toHaveBeenCalled();
+  });
+
+  it('/metrics and /routes need it; /health does not (the host watchdog, the reload script and data-bridge read it)', async () => {
+    expect((await send('/metrics')).status).toBe(401);
+    expect((await send('/routes')).status).toBe(401);
+    expect((await send('/metrics', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+    expect((await send('/routes', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
+    io.execSync.mockReturnValue('[]');
+    io.readdir.mockResolvedValue([]);
+    const health = await send('/health');
+    expect(health.status).toBe(503); // answered without the token: no enclave runs in this test
+    expect(await health.json()).toMatchObject({ healthy: false });
+  });
+});
+
+describe('the host role\'s credentials go only to an enclave that opens sealed secrets (enclave audit P1.7)', () => {
+  const STRIPE = 'https://api.stripe.com/v1/charges';
+  const EXPIRES = Date.now() + 6 * 3600_000;
+  const CREDS = { accessKeyId: 'ASIATESTONLY00000001', secretAccessKey: 'testonly-secret-access-key-1', sessionToken: 'testonly-session-token-1' };
+  const opened: Array<{ close(): Promise<void> }> = [];
+  afterEach(async () => {
+    for (const each of opened.splice(0)) await each.close();
+  });
+
+  /**
+   * The parent with the real IMDSv2 reader over a fake IMDS. The reader is loaded here, not at the top: on the release
+   * before this one the module does not exist, and only the tests that use it may fail for it.
+   */
+  async function withImds(failing = false) {
+    const imds = await startFakeImds({ answer: (read) => imdsCredentials(read, EXPIRES) });
+    if (failing) imds.failWith(500);
+    const { createHostCredentials } = await import('../hostCredentials.js');
+    const app = await listen(createApp({ hostCredentials: createHostCredentials({ endpoint: imds.url }) }));
+    opened.push(app, imds);
+    return { imds, url: app.url };
+  }
+
+  /** The parent with a stand-in reader that gives CREDS and counts its calls. */
+  async function withReader() {
+    const reader = { calls: 0, get: async () => { reader.calls++; return CREDS; } };
+    const app = await listen(createApp({ hostCredentials: reader } as Parameters<typeof createApp>[0]));
+    opened.push(app);
+    return { reader, url: app.url };
+  }
+
+  /** POST `body` to the parent at `url`; what it framed to the enclave. */
+  async function forwardTo(url: string, body: unknown) {
+    const conn = await enclaveConnection(ANSWER);
+    io.vsockConnectAsync.mockResolvedValue(conn);
+    const res = await fetch(`${url}/attest/fetch`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    return { res, framed: await framedRequest(conn) };
+  }
+
+  it('a request to the Stripe enclave carries them, read from IMDSv2 (red)', async () => {
+    const { imds, url } = await withImds();
+    const { res, framed } = await forwardTo(url, request({ url: STRIPE }));
+    expect(res.status).toBe(200);
+    expect(io.vsockConnectAsync).toHaveBeenCalledWith(18, 5000, expect.any(Number));
+    expect(framed).toEqual({ ...request({ url: STRIPE }), awsCredentials: CREDS });
+    expect(imds.calls).toContain('GET /latest/meta-data/iam/security-credentials/tytle-staging-enclave-host token');
+  });
+
+  it('they are kept: the next Stripe requests do not read IMDS again (red)', async () => {
+    const { imds, url } = await withImds();
+    await forwardTo(url, request({ url: STRIPE }));
+    await forwardTo(url, request({ url: STRIPE }));
+    await forwardTo(url, request({ url: STRIPE }));
+    expect(imds.reads()).toBe(1);
+  });
+
+  it.each([
+    ['VIES', 'https://ec.europa.eu/x'],
+    ['SICAE', 'http://www.sicae.pt/Consulta.aspx'],
+  ])('a request to %s never carries them, and the reader is not asked for it (lock)', async (_name, url) => {
+    const { reader, url: parent } = await withReader();
+    const { framed } = await forwardTo(parent, request({ url }));
+    expect(framed).toEqual(request({ url }));
+    expect(reader.calls).toBe(0);
+  });
+
+  it('a caller\'s own awsCredentials field is dropped: only the parent sets one (red)', async () => {
+    const { url } = await withReader();
+    const forged = { accessKeyId: 'AKIAFORGEDFORGEDFORG', secretAccessKey: 'forged', sessionToken: 'forged' };
+    expect((await forwardTo(url, { ...request(), awsCredentials: forged })).framed).not.toHaveProperty('awsCredentials');
+    expect((await forwardTo(url, { ...request({ url: STRIPE }), awsCredentials: forged })).framed.awsCredentials).toEqual(CREDS);
+  });
+
+  it('they never reach a log line (red)', async () => {
+    const { url } = await withImds();
+    const { framed } = await forwardTo(url, request({ url: STRIPE }));
+    expect(framed.awsCredentials).toEqual(CREDS);
+    const all = [...logs, ...errors].join('\n');
+    expect(all).not.toContain(CREDS.secretAccessKey);
+    expect(all).not.toContain(CREDS.sessionToken);
+  });
+
+  it('IMDS down: the Stripe request still goes, without them (only a sealed key then fails, in the enclave) (red)', async () => {
+    const { url } = await withImds(true);
+    const { res, framed } = await forwardTo(url, request({ url: STRIPE }));
+    expect(res.status).toBe(200);
+    expect(framed).toEqual(request({ url: STRIPE }));
+    expect(errors).toEqual(['[parent] IMDSv2: no host role credentials: "IMDS answered 500 to PUT /latest/api/token"']);
   });
 });

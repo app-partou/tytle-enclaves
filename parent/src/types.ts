@@ -1,3 +1,5 @@
+import type { AwsCredentials } from './hostCredentials.js';
+
 /** Enclave routing entry. */
 export interface EnclaveRoute {
   /** Enclave CID (unique per enclave instance) */
@@ -17,6 +19,11 @@ export interface EnclaveRequest {
   body?: string;
   /** The caller's challenge (64 lowercase hex), forwarded untouched; the enclave signs it into the nonce. */
   challenge?: string;
+  /**
+   * The host role's credentials (hostCredentials.ts), set by the parent itself and only for an enclave that opens
+   * sealed secrets (enclaveRouter.ts opensSealedSecrets). Never taken from a caller, never logged.
+   */
+  awsCredentials?: AwsCredentials;
 }
 
 /** Response from an enclave. */

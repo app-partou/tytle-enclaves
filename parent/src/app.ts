@@ -11,10 +11,11 @@
 
 import express from 'express';
 import crypto from 'node:crypto';
-import { findRoute, getAllRoutes } from './enclaveRouter.js';
+import { findRoute, getAllRoutes, opensSealedSecrets } from './enclaveRouter.js';
 import { sendToEnclave } from './vsockClient.js';
 import { checkHealth } from './healthCheck.js';
 import { MAX_REQUEST_BODY, parseFetchRequest } from './requestSchema.js';
+import type { HostCredentials } from './hostCredentials.js';
 import type { EnclaveRequest } from './types.js';
 
 // ---------------------------------------------------------------------------
@@ -56,13 +57,53 @@ function statusOf(err: unknown): number | undefined {
   return typeof status === 'number' ? status : undefined;
 }
 
+const sha256 = (text: string): Buffer => crypto.createHash('sha256').update(text, 'utf-8').digest();
+
+/**
+ * Whether `header` is `Bearer <token>`. Compared as SHA-256 digests with timingSafeEqual: equal lengths, so neither
+ * the time nor a length check tells a caller how much of a guess was right.
+ */
+function carriesToken(header: string | undefined, token: string): boolean {
+  if (header === undefined || !header.startsWith('Bearer ')) return false;
+  return crypto.timingSafeEqual(sha256(header.slice('Bearer '.length)), sha256(token));
+}
+
+export interface ParentOptions {
+  /**
+   * The shared secret data-bridge sends as `Authorization: Bearer <token>` (ENCLAVE_PARENT_AUTH_TOKEN, enclave audit
+   * P1.7 "interim"): when set, /attest/fetch, /metrics and /routes answer only a request that carries it. /health
+   * stays open: the host's watchdog and reload script and data-bridge's health probe read it. Unset: every route is
+   * open, as before.
+   */
+  authToken?: string;
+  /** The host role's credentials, for an enclave that opens sealed secrets (hostCredentials.ts). Unset: none sent. */
+  hostCredentials?: HostCredentials;
+}
+
+/** The routes the parent token guards. */
+export const GUARDED_PATHS: readonly string[] = ['/attest/fetch', '/metrics', '/routes'];
+
 // ---------------------------------------------------------------------------
 // Express app
 // ---------------------------------------------------------------------------
 
-export function createApp(): express.Express {
+export function createApp(options: ParentOptions = {}): express.Express {
   const metrics = new Map<number, EnclaveMetrics>();
   const app = express();
+  const { authToken, hostCredentials } = options;
+
+  // Before the body is read: a request without the token costs no parsing
+  if (authToken) {
+    app.use(GUARDED_PATHS as string[], (req, res, next) => {
+      if (carriesToken(req.get('authorization'), authToken)) {
+        next();
+        return;
+      }
+      // req.path is relative to the guard's mount point: log the path as the caller sent it
+      console.error(`[parent] Refused ${req.method} ${JSON.stringify(req.originalUrl.split('?')[0])}: no parent token`);
+      res.status(401).json({ success: false, error: 'This route needs the parent token' });
+    });
+  }
   app.use(express.json({ limit: MAX_REQUEST_BODY }));
 
   /**
@@ -90,7 +131,10 @@ export function createApp(): express.Express {
 
     const start = Date.now();
     try {
-      const enclaveRequest: EnclaveRequest = { ...parsed.request, id: requestId };
+      // The host role's credentials go only to an enclave that opens sealed secrets; without them the request still
+      // goes, and only a sealed secret fails, in the enclave (NO_CREDENTIALS)
+      const awsCredentials = hostCredentials && opensSealedSecrets(route) ? await hostCredentials.get() : null;
+      const enclaveRequest: EnclaveRequest = { ...parsed.request, id: requestId, ...(awsCredentials ? { awsCredentials } : {}) };
 
       const response = await sendToEnclave(route.cid, route.port, enclaveRequest);
       const durationMs = Date.now() - start;

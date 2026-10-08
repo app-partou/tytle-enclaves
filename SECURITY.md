@@ -48,12 +48,16 @@ A provider key (Stripe's platform key) reaches the enclave without crossing the 
 
 1. The deploy role encrypts the key once with the KMS key `alias/tytle-<env>-enclave-secrets` and the encryption context `enclave=<name>` (`stripe_payment`). A caller sends only that ciphertext (`sealedApiKey`). Seal the key's exact bytes: a trailing newline makes it a value the enclave refuses.
 2. To open it, the enclave makes an RSA-2048 key pair in its own memory (once per process), asks the NSM for an attestation document that carries the public key and nothing else, and calls KMS `Decrypt` with that document as the `Recipient` (`RSAES_OAEP_SHA_256`). KMS answers with the key encrypted to that public key (`CiphertextForRecipient`, CMS EnvelopedData: RSAES-OAEP SHA-256, then AES-256-CBC), which only the enclave's private key opens. An answer that carries a `Plaintext` is refused.
-3. The call is signed (SigV4) with the host role's temporary credentials, which the parent sends with each request for such an enclave, and it goes through the host's vsock-proxy for KMS (vsock port 8000, `kms.eu-central-1.amazonaws.com:443`), TLS end to end. Only an enclave whose own allowlist names KMS can make it: the Stripe Payment enclave.
+3. The call is signed (SigV4) with the host role's temporary credentials, which the parent reads from IMDSv2 (`parent/src/hostCredentials.ts`) and sends with each request to such an enclave, and to no other (a caller cannot send its own), and it goes through the host's vsock-proxy for KMS (vsock port 8000, `kms.eu-central-1.amazonaws.com:443`), TLS end to end. Only an enclave whose own allowlist names KMS can make it: the Stripe Payment enclave.
 4. The key policy grants the host role `kms:Decrypt` only with `kms:RecipientAttestation:ImageSha384` equal to the PCR0 of a named image of that enclave (the current one, and the previous one during a rotation) and with that enclave's encryption context. Without a `Recipient`, the condition key is absent, so a plain `Decrypt` by the host role is refused. The key and its policy are made outside this repository.
 
 What this gives: the key is never in clear on the host, in data-bridge, in the parent or in a log. A compromised host can still send requests that make the enclave use the key, but only for the handler's own read-only Stripe calls: it cannot take the key and use it for anything else. Another image (a changed enclave, or one the policy no longer names) gets no `Decrypt`; a new release opens the key only after the policy names its PCR0. An opened key is kept in the enclave's memory for at most an hour; a refusal is never kept.
 
 What it does not give: until every caller sends the sealed key, `apiKey` (the key in clear) is still accepted.
+
+## The Parent Token
+
+The parent on the host (port 5001) is outside every enclave's trust boundary, and each enclave checks what it is asked on its own. Until a caller can check the parent itself, the parent answers `/attest/fetch`, `/metrics` and `/routes` only to a caller that sends `Authorization: Bearer <ENCLAVE_PARENT_AUTH_TOKEN>`, when the host sets that token: data-bridge sends it. `/health` stays open for the host's watchdog and data-bridge's health probe. Without the token set, every route is open, and the parent says so when it starts.
 
 ## URL Allowlist
 
