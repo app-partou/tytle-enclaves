@@ -1,0 +1,129 @@
+# CI of the enclave repository (enclave audit P2.2; decision D-P2-1 A: every enclave's EIF on every pull request).
+#
+# Every pull request and every push to main runs:
+#   - each package's tests on Node.js 22 (scripts/ci/test-package.sh);
+#   - the Rust addon's tests and clippy, warnings as errors (scripts/ci/test-native.sh);
+#   - the parent image, built as the deploy builds it (its Dockerfile runs a smoke test);
+#   - the determinism gate for each enclave (scripts/test-determinism.sh): built twice with the one recipe, its EIF
+#     measured, and both compared with scripts/expected-digests.json.
+# A pull request also gets its PCR0 changes as a table (scripts/ci/pcr0-changes.mjs) in the job summary, and as a
+# comment when it comes from this repository. That job fails when an enclave's PCR0 changes and none of its inputs did.
+#
+# Each step runs a script of this repository, so a person can run the same check on their own machine. Every action
+# is pinned by commit. The token reads only, except in the job that comments; no job reads a secret.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  packages:
+    name: tests (${{ matrix.package }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [shared, parent, vies, sicae, stripe-payment, monerium-payment, verify]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.3
+      - name: Install and test
+        run: bash scripts/ci/test-package.sh "$PACKAGE"
+        env:
+          PACKAGE: ${{ matrix.package }}
+
+  native:
+    name: native (cargo test, clippy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test and lint
+        run: bash scripts/ci/test-native.sh
+
+  parent-image:
+    name: parent image (its smoke test runs in the build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.3
+      - name: Build with the recipe, as the deploy does
+        run: bash scripts/build-service.sh parent ci
+
+  determinism:
+    name: determinism and PCR0 (${{ matrix.enclave }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        enclave: [vies, sicae, stripe-payment, monerium-payment]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.3
+      - name: Build twice, measure, compare with scripts/expected-digests.json
+        run: bash scripts/test-determinism.sh "$ENCLAVE"
+        env:
+          ENCLAVE: ${{ matrix.enclave }}
+
+  pcr0-changes:
+    name: PCR0 changes
+    if: github.event_name == 'pull_request'
+    needs: determinism
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.3
+      - name: The table, and the rule that each change has a changed input
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          status=0
+          changed="$(node scripts/ci/pcr0-changes.mjs "$BASE_SHA" pcr0-changes.md)" || status=$?
+          if [ -f pcr0-changes.md ]; then
+            cat pcr0-changes.md >> "$GITHUB_STEP_SUMMARY"
+            # A fork's pull request gets a read-only token: its table is in the job summary only
+            if [ "$SAME_REPO" = true ] && [ "${changed:-0}" -gt 0 ]; then
+              gh pr comment "$PR_NUMBER" --edit-last --body-file pcr0-changes.md \
+                || gh pr comment "$PR_NUMBER" --body-file pcr0-changes.md
+            fi
+          fi
+          exit "$status"

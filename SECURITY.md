@@ -47,12 +47,13 @@ Requests to any other host are rejected with HTTP 403. Since the allowlist is in
 - Base images are pinned by digest (not tag)
 - System packages are pinned by version
 - npm dependencies are locked via `package-lock.json`
-- Rust dependencies are pinned in `Cargo.toml` (`Cargo.lock` is generated during Docker build)
+- Rust dependencies are locked via the committed `Cargo.lock`: the build fails when it does not match `Cargo.toml` (`cargo fetch --locked`)
 
 ### Reproducibility
 
-- `SOURCE_DATE_EPOCH` eliminates filesystem timestamp variation
-- BuildKit `rewrite-timestamp=true` normalizes Docker layer timestamps
+- ONE recipe builds every image (`scripts/lib/recipe.sh`, values in `scripts/build-recipe.json`): linux/amd64, and a BuildKit pinned by digest, run as its own builder
+- A fixed `SOURCE_DATE_EPOCH` and BuildKit `rewrite-timestamp=true` give every new file the same time: an image, and its PCR0, changes only when what goes into it changes
+- `scripts/expected-digests.json` records each enclave's image config digest and PCR0; CI builds every enclave twice on each pull request and fails unless both builds are that record
 - Fixed UID (1000) avoids `/etc/passwd` differences
 
 ## Reporting

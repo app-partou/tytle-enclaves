@@ -74,34 +74,16 @@ Each enclave image contains ONLY shared core + its service config. PCR0 proves e
 
 ## Building
 
-### VIES Enclave
+Every image is built by ONE recipe, `scripts/lib/recipe.sh`, with the values of `scripts/build-recipe.json`: linux/amd64; a fixed `SOURCE_DATE_EPOCH=1767225600` (2026-01-01T00:00:00Z), so an image - and its PCR0 - changes only when what goes into it changes; and BuildKit `moby/buildkit:v0.27.1@sha256:1e110c71d389d6d24f67b9438e2f7b8da749a6ff407b22a1631e025c95599368`, run as its own docker-container builder. The image goes to a docker tarball (`type=docker,dest=...,rewrite-timestamp=true`) and is then loaded into Docker.
 
 ```bash
-cd vies
-./build.sh [tag] [ecr-uri]
-
-# Or manually:
-SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct) \
-docker buildx build \
-  --output type=docker,rewrite-timestamp=true \
-  --platform linux/amd64 \
-  -t tytle-enclave-vies:latest \
-  -f Dockerfile ..
+cd vies && ./build.sh [tag] [ecr-uri]                    # each service: vies, sicae, stripe-payment, monerium-payment, parent
+./scripts/test-determinism.sh [service]                  # build twice, compare, check scripts/expected-digests.json
+./scripts/test-determinism.sh --update [service]         # record a meant change, then commit the file
+./scripts/rotate-pcr0.sh <service|all>                   # the PCR0 of a build and the published one
 ```
 
-### SICAE Enclave
-
-```bash
-cd sicae
-./build.sh [tag] [ecr-uri]
-```
-
-### Parent Server
-
-```bash
-cd parent
-docker build -t tytle-enclave-parent:latest .
-```
+The scripts need Docker with buildx, and Node.js (the recipe reads its values with it). The verify CLI rebuilds with the same values (`verify/src/lib/buildRecipe.ts`).
 
 ## Handler Manifests
 

@@ -5,7 +5,6 @@ import {
   validateServiceName,
   validatePcr0Hex,
   validateApiUrl,
-  validateSourceDateEpoch,
 } from '../lib/validation.js';
 
 describe('validateCommitHash', () => {
@@ -109,19 +108,5 @@ describe('validateApiUrl', () => {
 
   it('rejects ftp', () => {
     expect(() => validateApiUrl('ftp://server.com')).toThrow('http:// or https://');
-  });
-});
-
-describe('validateSourceDateEpoch', () => {
-  it('accepts numeric timestamps', () => {
-    expect(validateSourceDateEpoch('1711612200')).toBe('1711612200');
-  });
-
-  it('rejects non-numeric', () => {
-    expect(() => validateSourceDateEpoch('abc')).toThrow('numeric');
-  });
-
-  it('rejects negative', () => {
-    expect(() => validateSourceDateEpoch('-1')).toThrow('numeric');
   });
 });

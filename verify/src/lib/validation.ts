@@ -84,16 +84,6 @@ export function validateApiUrl(url: string): string {
   return url;
 }
 
-/** Validate SOURCE_DATE_EPOCH is a numeric unix timestamp. */
-export function validateSourceDateEpoch(value: string): string {
-  if (!/^\d+$/.test(value)) {
-    throw new Error(
-      `Invalid SOURCE_DATE_EPOCH: "${value}". Must be a numeric Unix timestamp.`,
-    );
-  }
-  return value;
-}
-
 /** Validate a directory path exists and is a git repo. */
 export function validateRepoDir(dir: string): string {
   // Resolved at call site via existsSync + git rev-parse

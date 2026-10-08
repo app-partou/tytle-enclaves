@@ -152,34 +152,40 @@ git checkout "$COMMIT"
 
 ### Step 3: Reproduce the Build
 
-Build the enclave Docker image with deterministic timestamps:
+Build the enclave image with the build recipe of the commit you checked out, `scripts/build-recipe.json`: linux/amd64 (what a Nitro host runs), a fixed file time (`SOURCE_DATE_EPOCH`, the same for every commit: an image changes only when what goes into it changes) and a BuildKit pinned by digest, run as its own builder. `scripts/lib/recipe.sh` builds every image of this repository with these values, and the verify CLI rebuilds with them. The image goes to a tarball, then into Docker: Docker's containerd image store (Docker Desktop's default) refuses `rewrite-timestamp` on a direct load.
 
 ```bash
-SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct) \
-docker buildx build \
-  --output type=docker,rewrite-timestamp=true \
+# The pinned BuildKit, as its own builder (one-time)
+docker buildx create --name tytle-repro --driver docker-container \
+  --driver-opt image=moby/buildkit:v0.27.1@sha256:1e110c71d389d6d24f67b9438e2f7b8da749a6ff407b22a1631e025c95599368
+
+SOURCE_DATE_EPOCH=1767225600 docker buildx build \
+  --builder tytle-repro \
   --platform linux/amd64 \
-  -t "verify-$SERVICE:latest" \
+  --provenance=false --sbom=false \
+  --output "type=docker,dest=verify-$SERVICE.tar,rewrite-timestamp=true,name=verify-$SERVICE:latest" \
   -f "$SERVICE/Dockerfile" .
+
+docker load -i "verify-$SERVICE.tar"
 ```
+
+If the values in the commit's `scripts/build-recipe.json` differ from these, use the commit's. A commit without the file was built before the fixed recipe, with the time of its own commit.
 
 ### Step 4: Compute and Compare PCR0
 
-Convert the Docker image to an EIF (Enclave Image Format) and extract PCR0. This uses `nitro-cli`, which only runs on Amazon Linux - but you can run it inside Docker on any machine. The `verify/Dockerfile.nitro-cli` in this repo pins the base image by digest and the nitro-cli version, so you get the same helper binary regardless of when you run it (the CLI builds its helper from the same file):
+Convert the Docker image to an EIF (Enclave Image Format) and extract PCR0. This uses `nitro-cli`, which only runs on Amazon Linux - but you can run it inside Docker on any machine. The `verify/Dockerfile.nitro-cli` in this repo pins the base image by digest and the nitro-cli version, so you get the same helper binary regardless of when you run it (the CLI builds its helper from the same file). Build and run it for linux/amd64 on every machine: on an arm64 machine (an Apple Silicon Mac) Docker picks the arm64 variant, and that nitro-cli cannot read an amd64 image (error E48).
 
 ```bash
 # Build the portable nitro-cli helper container (one-time)
-# Uses the pinned Dockerfile from this repo (amazonlinux:2023 pinned by digest,
-# aws-nitro-enclaves-cli pinned to an exact version).
-docker build -t nitro-cli-helper -f verify/Dockerfile.nitro-cli verify/
+docker build --platform linux/amd64 -t nitro-cli-helper -f verify/Dockerfile.nitro-cli verify/
 
-# Convert Docker image to EIF and extract PCR0
-docker run --rm \
+# Convert the image to an EIF; nitro-cli prints its measurements as one JSON object
+docker run --rm --platform linux/amd64 \
   -v /var/run/docker.sock:/var/run/docker.sock \
   nitro-cli-helper build-enclave \
     --docker-uri "verify-$SERVICE:latest" \
-    --output-file /tmp/verify.eif 2>&1 \
-  | grep -o '"PCR0": "[^"]*"'
+    --output-file /tmp/verify.eif \
+  | jq -r .Measurements.PCR0
 ```
 
 Compare the output PCR0 against the expected value from Step 1:
@@ -188,6 +194,8 @@ Compare the output PCR0 against the expected value from Step 1:
 Your PCR0:        abc123...
 Expected PCR0:    abc123...  <- must match
 ```
+
+The commit's `scripts/expected-digests.json` records the same PCR0 (and the image's config digest) for each enclave: CI builds every enclave twice on each pull request and fails unless both builds are that record.
 
 ### Step 5: Verify the COSE_Sign1 Signature and the Certificate Chain
 
