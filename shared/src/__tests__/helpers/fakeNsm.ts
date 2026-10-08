@@ -20,7 +20,12 @@ export interface NsmAsk {
   publicKey: Buffer | null;
 }
 
-export function createFakeNsm(timestampMs = 1_760_000_000_000) {
+/**
+ * `timestampMs` is the payload's signed time. A number is encoded as the NSM encodes its uint64 (CBOR major type 0,
+ * read back as a number); a bigint as a CBOR bignum (read back as a bigint); null as CBOR null (a document without
+ * a signed time).
+ */
+export function createFakeNsm(timestampMs: number | bigint | null = 1_760_000_000_000) {
   const asks: NsmAsk[] = [];
   function nsmRequest(request: Buffer): Buffer {
     const decoded = cbor.decodeFirstSync(request) as { Attestation?: { nonce?: Buffer | null; user_data?: Buffer | null; public_key?: Buffer | null } };

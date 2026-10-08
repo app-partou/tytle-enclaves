@@ -41,6 +41,11 @@ interface EnclaveStatus {
   hosts: string[];
   state: string;
   connectivity: 'responsive' | 'unresponsive' | 'untested';
+  /**
+   * The enclave's clock minus this host's, in ms (vsockClient PingResult), from its pong; null when it was not
+   * pinged or did not say (audit §5.1 F1). The host's watchdog publishes the largest and alarms on it.
+   */
+  clockDriftMs: number | null;
   healthy: boolean;
 }
 
@@ -62,9 +67,11 @@ export async function checkHealth(): Promise<HealthStatus> {
         const isRunning = state?.State === 'RUNNING';
 
         let connectivity: EnclaveStatus['connectivity'] = 'untested';
+        let clockDriftMs: number | null = null;
         if (isRunning) {
-          const pongReceived = await pingEnclave(route.cid, route.port);
-          connectivity = pongReceived ? 'responsive' : 'unresponsive';
+          const ping = await pingEnclave(route.cid, route.port);
+          connectivity = ping.responsive ? 'responsive' : 'unresponsive';
+          clockDriftMs = ping.clockDriftMs;
         }
 
         return {
@@ -72,6 +79,7 @@ export async function checkHealth(): Promise<HealthStatus> {
           hosts: route.hosts,
           state: state?.State || 'NOT_FOUND',
           connectivity,
+          clockDriftMs,
           healthy: isRunning && connectivity === 'responsive',
         };
       }),

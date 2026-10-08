@@ -87,6 +87,15 @@ describe('startEnclave', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it('the pong carries the enclave\'s own clock, which the parent compares with its own (lock)', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_760_000_123_456);
+    const conn = new ScriptedConnection(frame({ type: 'ping' }), 65536);
+    pending.push(conn);
+    startEnclave({ name: 'test-pong-clock', hosts: [], customHandler: vi.fn() });
+    await conn.done;
+    expect(conn.reply()).toEqual({ type: 'pong', timestamp: 1_760_000_123_456 });
+  });
+
   it('hands a request to the handler and writes its answer back (lock)', async () => {
     const conn = new ScriptedConnection(frame(REQUEST), 65536);
     pending.push(conn);

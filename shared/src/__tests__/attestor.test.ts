@@ -53,6 +53,61 @@ describe('attest - nonce version 1, no challenge (the preimage of every stored r
   });
 });
 
+describe('the attestation time: the hypervisor\'s signed time, never the enclave clock (P1.4, audit §5.1 F1)', () => {
+  const SIGNED_MS = 1_760_000_000_000; // the fake NSM's signed time
+  const RESPONSE_HASH = sha256('BASE64VECTOR==');
+
+  /** attest() from a freshly loaded attestor: an enclave just launched. */
+  async function launchedAttest() {
+    vi.resetModules();
+    const { attest: fresh } = await import('../attestor.js');
+    return () => fresh('ec.europa.eu/checkVatService', 'POST', 'BASE64VECTOR==', 'https://ec.europa.eu/x', { countryCode: 'PT' });
+  }
+
+  it('the first attestation after a launch signs the enclave clock as it is (lock)', async () => {
+    vi.useFakeTimers({ now: SIGNED_MS - 90_000 });
+    const doc = await (await launchedAttest())();
+    expect(doc.timestamp).toBe((SIGNED_MS - 90_000) / 1000);
+    expect(doc.nonce).toBe(sha256(`${RESPONSE_HASH}|ec.europa.eu/checkVatService|${doc.timestamp}`));
+  });
+
+  it.each([
+    ['90 s behind', -90_000],
+    ['2 min ahead', 120_000],
+  ])('an enclave clock %s: the next attestation signs the clock plus the gap its last document showed (red)', async (_label, offBy) => {
+    vi.useFakeTimers({ now: SIGNED_MS + offBy });
+    const attestNow = await launchedAttest();
+    await attestNow();
+    const second = await attestNow();
+    expect(second.timestamp).toBe(SIGNED_MS / 1000);
+    expect(second.nonce).toBe(sha256(`${RESPONSE_HASH}|ec.europa.eu/checkVatService|${SIGNED_MS / 1000}`));
+    // The clock moves on, and the gap goes with it: the time is the clock plus the gap, not the last signed time.
+    vi.advanceTimersByTime(30_000);
+    expect((await attestNow()).timestamp).toBe(SIGNED_MS / 1000 + 30);
+  });
+
+  it('a signed time the NSM encodes as a bignum is read too (red)', async () => {
+    fake.current = createFakeNsm(BigInt(SIGNED_MS));
+    vi.useFakeTimers({ now: SIGNED_MS - 90_000 });
+    const attestNow = await launchedAttest();
+    await attestNow();
+    expect((await attestNow()).timestamp).toBe(SIGNED_MS / 1000);
+  });
+
+  it.each([
+    ['no signed time', null],
+    ['a signed time of 0', 0],
+    ['a signed time that is not a whole number', 1_760_000_000_000.5],
+  ])('a document with %s is refused, and sets no gap (red)', async (_label, signed) => {
+    fake.current = createFakeNsm(signed);
+    vi.useFakeTimers({ now: SIGNED_MS - 90_000 });
+    const attestNow = await launchedAttest();
+    await expect(attestNow()).rejects.toThrow('NSM document has no valid signed timestamp');
+    fake.current = createFakeNsm();
+    expect((await attestNow()).timestamp).toBe((SIGNED_MS - 90_000) / 1000);
+  });
+});
+
 describe('attest - nonce version 2, the caller challenge (P1.3)', () => {
   it('says which preimage it signed: version 1 without a challenge', async () => {
     const doc = await callAttest();

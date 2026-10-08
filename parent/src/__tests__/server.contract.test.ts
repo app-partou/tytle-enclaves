@@ -344,12 +344,22 @@ describe('GET /health', () => {
     'vsock-proxy-stripe.service.bak',
   ];
 
-  /** The host: nitro-cli lists `running`, each listed enclave answers its ping, systemd says `active` units are active. */
-  async function host({ running = ALL_RUNNING, active = ['vsock-proxy-vies', 'vsock-proxy-hmrc', 'vsock-proxy-sicae', 'vsock-proxy-stripe'], unitFiles = UNIT_FILES as string[] | Error } = {}) {
+  /**
+   * The host: nitro-cli lists `running`; each listed enclave answers its ping with its clock `drift` ms from this
+   * host's (no clock in its pong when null), except the `silent` ones; systemd says `active` units are active.
+   */
+  async function host({
+    running = ALL_RUNNING,
+    active = ['vsock-proxy-vies', 'vsock-proxy-hmrc', 'vsock-proxy-sicae', 'vsock-proxy-stripe'],
+    unitFiles = UNIT_FILES as string[] | Error,
+    drift = { 16: 0, 17: 0, 18: 0 } as Record<number, number | null>,
+    silent = [] as number[],
+  } = {}) {
     io.execSync.mockReturnValue(JSON.stringify(running));
-    const pong = await frame({ type: 'pong' });
-    io.vsockConnectAsync.mockImplementation(async () => {
-      const reply = bytesStream(pong);
+    io.vsockConnectAsync.mockImplementation(async (cid: number) => {
+      if (silent.includes(cid)) throw new Error('connection refused');
+      const off = drift[cid];
+      const reply = bytesStream(await frame(off === null || off === undefined ? { type: 'pong' } : { type: 'pong', timestamp: Date.now() + off }));
       return { read: (size: number) => reply.read(size), write: (data: Buffer) => data.length, close: () => {} };
     });
     if (unitFiles instanceof Error) io.readdir.mockRejectedValue(unitFiles);
@@ -369,7 +379,7 @@ describe('GET /health', () => {
     const { status, body } = await health();
     expect(status).toBe(200);
     expect(body.healthy).toBe(true);
-    expect(body.enclaves).toEqual([
+    expect(body.enclaves).toMatchObject([
       { cid: 16, hosts: ['ec.europa.eu', 'api.service.hmrc.gov.uk'], state: 'RUNNING', connectivity: 'responsive', healthy: true },
       { cid: 17, hosts: ['www.sicae.pt'], state: 'RUNNING', connectivity: 'responsive', healthy: true },
       { cid: 18, hosts: ['api.stripe.com'], state: 'RUNNING', connectivity: 'responsive', healthy: true },
@@ -382,9 +392,30 @@ describe('GET /health', () => {
     const { status, body } = await health();
     expect(status).toBe(503);
     expect(body.healthy).toBe(false);
-    expect((body.enclaves as Array<Record<string, unknown>>)[2]).toEqual(
+    expect((body.enclaves as Array<Record<string, unknown>>)[2]).toMatchObject(
       { cid: 18, hosts: ['api.stripe.com'], state: 'NOT_FOUND', connectivity: 'untested', healthy: false },
     );
+  });
+
+  it('an enclave that does not answer its ping: 503, unresponsive (lock)', async () => {
+    await host({ silent: [17] });
+    const { status, body } = await health();
+    expect(status).toBe(503);
+    expect((body.enclaves as Array<Record<string, unknown>>)[1]).toMatchObject(
+      { cid: 17, state: 'RUNNING', connectivity: 'unresponsive', healthy: false },
+    );
+  });
+
+  it('each enclave reports its clock\'s drift from this host, from its pong; null when it was not pinged or did not say (red)', async () => {
+    await host({ running: ALL_RUNNING.slice(0, 2), drift: { 16: 90_000, 17: null } });
+    const enclaves = (await health()).body.enclaves as Array<{ clockDriftMs: number | null }>;
+    expect(Math.abs((enclaves[0].clockDriftMs as number) - 90_000)).toBeLessThan(1_000);
+    expect(enclaves[1].clockDriftMs).toBeNull();
+    expect(enclaves[2].clockDriftMs).toBeNull();
+    await host({ drift: { 16: 0, 17: -45_000, 18: 0 }, silent: [18] });
+    const later = (await health()).body.enclaves as Array<{ clockDriftMs: number | null }>;
+    expect(Math.abs((later[1].clockDriftMs as number) + 45_000)).toBeLessThan(1_000);
+    expect(later[2].clockDriftMs).toBeNull();
   });
 
   it('every proxy unit on the host is reported up or down by its name, sorted (red)', async () => {

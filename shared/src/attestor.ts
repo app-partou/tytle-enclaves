@@ -50,6 +50,7 @@ export interface AttestationDocument {
   requestHash: string;
   apiEndpoint: string;
   apiMethod: string;
+  /** Unix seconds, in the nonce: the hypervisor's time as the enclave last read it (see attestationTimeSec). */
   timestamp: number;
   nsmDocument: string; // Base64 COSE_Sign1
   pcrs: {
@@ -62,6 +63,23 @@ export interface AttestationDocument {
   nonceVersion: 1 | 2;
   /** The caller's challenge, echoed; present exactly when nonceVersion is 2. */
   challenge?: string;
+}
+
+/**
+ * The attestation time comes from the hypervisor, never from the enclave's own clock (P1.4 row "canonical
+ * timestamp", audit §5.1 F1). An enclave has no NTP and no RTC: its Date.now() runs free from the host's time it
+ * started with, 0.5-0.9 s a day in the field, and the verifiers refuse a document whose time is more than
+ * 10 minutes from its signed one. The NSM payload's `timestamp` is stamped by the Nitro hypervisor and signed -
+ * the time every verifier reads - but it exists only after the NSM call, and the nonce needs its time before.
+ * So each attestation reads the signed time of its own document and keeps its gap to the enclave's clock, and
+ * the next one signs the enclave's clock plus that gap. The first one after a launch signs the clock as it is.
+ * Date.now() alone is diagnostic only: the pong carries it, and the parent reports its drift.
+ */
+let hypervisorGapMs = 0;
+
+/** The time an attestation signs, in Unix seconds: the enclave's clock plus its last measured gap to the hypervisor. */
+function attestationTimeSec(): number {
+  return Math.floor((Date.now() + hypervisorGapMs) / 1000);
 }
 
 /**
@@ -86,7 +104,7 @@ export async function attest(
   // Before anything is signed: a malformed challenge is refused, never signed into a nonce.
   assertChallenge(challenge);
 
-  const timestamp = Math.floor(Date.now() / 1000);
+  const timestamp = attestationTimeSec();
   const attestationId = `enc-${crypto.randomUUID()}`;
 
   // Hash the response body
@@ -115,7 +133,9 @@ export async function attest(
   const nonce = nonceHash.digest('hex');
 
   // Request NSM attestation with the nonce and optional user_data
-  const { nsmDocument, pcrs } = await requestNsmAttestation(nonce, userDataHex);
+  const { nsmDocument, pcrs, signedAtMs, answeredAtMs } = await requestNsmAttestation(nonce, userDataHex);
+  // This document's signed time sets the gap for the next attestation.
+  hypervisorGapMs = signedAtMs - answeredAtMs;
 
   return {
     attestationId,
@@ -137,11 +157,15 @@ export async function attest(
  *
  * @param nonceHex - Hex-encoded nonce to include in attestation
  * @param userDataHex - Optional hex-encoded user_data (e.g., SHA-256 of BN254 field elements)
- * @returns Base64 NSM document and extracted PCR values
+ * @returns Base64 NSM document, its PCR values, its signed time, and the enclave's clock when the NSM answered
  */
 async function requestNsmAttestation(nonceHex: string, userDataHex?: string): Promise<{
   nsmDocument: string;
   pcrs: { pcr0: string; pcr1: string; pcr2: string };
+  /** The payload's `timestamp`: milliseconds, stamped by the hypervisor and signed. */
+  signedAtMs: number;
+  /** The enclave's own clock right after the NSM answered, before anything is decoded. */
+  answeredAtMs: number;
 }> {
   // CBOR encode the NSM request
   const request = cbor.encode({
@@ -154,6 +178,7 @@ async function requestNsmAttestation(nonceHex: string, userDataHex?: string): Pr
 
   // Call native ioctl
   const responseBytes = nsmRequest(Buffer.from(request));
+  const answeredAtMs = Date.now();
 
   // Decode the outer CBOR response envelope: {"Attestation": {"document": <bytes>}}
   const envelope = cbor.decodeFirstSync(responseBytes);
@@ -167,57 +192,73 @@ async function requestNsmAttestation(nonceHex: string, userDataHex?: string): Pr
   // We return the full COSE_Sign1 as base64 (verifiers will decode it themselves)
   const nsmDocument = Buffer.from(documentBytes).toString('base64');
 
-  // Also extract PCRs from the payload for convenience
-  const pcrs = extractPcrs(documentBytes);
+  // One decode of the signed payload: its PCRs, and its time.
+  let payload: SignedPayload;
+  try {
+    payload = payloadOf(documentBytes);
+  } catch (err: unknown) {
+    throw new Error(`Failed to extract PCRs from COSE_Sign1 document: ${err instanceof Error ? err.message : String(err)}`);
+  }
 
-  return { nsmDocument, pcrs };
+  return { nsmDocument, pcrs: pcrsOf(payload), signedAtMs: signedTimestampOf(payload), answeredAtMs };
+}
+
+/** The payload fields this enclave reads from its own document. */
+interface SignedPayload {
+  pcrs?: Map<number, Uint8Array> | Record<number, Uint8Array>;
+  timestamp?: unknown;
 }
 
 /**
- * Extract PCR0-2 from a COSE_Sign1 document.
+ * The payload of a COSE_Sign1 document.
  *
  * COSE_Sign1 structure: CBOR Tag 18 → [protected_headers, unprotected_headers, payload, signature]
- * Payload is CBOR-encoded and contains: { pcrs: Map<number, Buffer>, ... }
+ * Payload is CBOR-encoded and contains: { pcrs: Map<number, Buffer>, timestamp, ... }
  */
-function extractPcrs(coseSign1Bytes: Buffer): {
-  pcr0: string;
-  pcr1: string;
-  pcr2: string;
-} {
-  try {
-    // Decode COSE_Sign1 array
-    const coseArray = cbor.decodeFirstSync(coseSign1Bytes);
-    // coseArray is [protected, unprotected, payload, signature]
-    // For tagged CBOR, it may be a Tagged object
-    const arr = coseArray.value || coseArray;
+function payloadOf(coseSign1Bytes: Buffer): SignedPayload {
+  // Decode COSE_Sign1 array
+  const coseArray = cbor.decodeFirstSync(coseSign1Bytes);
+  // coseArray is [protected, unprotected, payload, signature]
+  // For tagged CBOR, it may be a Tagged object
+  const arr = coseArray.value || coseArray;
 
-    if (!Array.isArray(arr) || arr.length < 4) {
-      throw new Error('Invalid COSE_Sign1 structure');
-    }
-
-    // Payload is at index 2
-    const payloadBytes = arr[2];
-    const payload = cbor.decodeFirstSync(payloadBytes);
-
-    // PCRs are a Map<number, Buffer> in the payload
-    const pcrsMap = payload.pcrs;
-
-    const getPcr = (idx: number): string => {
-      if (pcrsMap instanceof Map) {
-        const val = pcrsMap.get(idx);
-        return val ? Buffer.from(val).toString('hex') : '';
-      }
-      // Object fallback
-      const val = pcrsMap?.[idx];
-      return val ? Buffer.from(val).toString('hex') : '';
-    };
-
-    return {
-      pcr0: getPcr(0),
-      pcr1: getPcr(1),
-      pcr2: getPcr(2),
-    };
-  } catch (err: any) {
-    throw new Error(`Failed to extract PCRs from COSE_Sign1 document: ${err.message}`);
+  if (!Array.isArray(arr) || arr.length < 4) {
+    throw new Error('Invalid COSE_Sign1 structure');
   }
+
+  // Payload is at index 2
+  return cbor.decodeFirstSync(arr[2]) as SignedPayload;
+}
+
+/**
+ * The payload's `timestamp`: milliseconds since the epoch (a uint64), stamped by the hypervisor. A document
+ * without a valid one is refused here, as every verifier refuses it (attestation-core nsmVerification step 4).
+ */
+function signedTimestampOf(payload: SignedPayload): number {
+  const raw = payload.timestamp;
+  const ms = typeof raw === 'bigint' ? Number(raw) : raw;
+  if (typeof ms !== 'number' || !Number.isSafeInteger(ms) || ms <= 0) {
+    throw new Error('NSM document has no valid signed timestamp');
+  }
+  return ms;
+}
+
+/** PCR0-2 of the payload, as hex ('' for one it lacks). PCRs are a Map<number, Buffer> in the payload. */
+function pcrsOf(payload: SignedPayload): { pcr0: string; pcr1: string; pcr2: string } {
+  const pcrsMap = payload.pcrs;
+  const getPcr = (idx: number): string => {
+    if (pcrsMap instanceof Map) {
+      const val = pcrsMap.get(idx);
+      return val ? Buffer.from(val).toString('hex') : '';
+    }
+    // Object fallback
+    const val = pcrsMap?.[idx];
+    return val ? Buffer.from(val).toString('hex') : '';
+  };
+
+  return {
+    pcr0: getPcr(0),
+    pcr1: getPcr(1),
+    pcr2: getPcr(2),
+  };
 }

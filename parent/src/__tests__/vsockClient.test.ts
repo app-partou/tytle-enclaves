@@ -69,16 +69,39 @@ describe('sendToEnclave', () => {
   });
 });
 
-describe('pingEnclave', () => {
-  it('a prompt pong is healthy (lock)', async () => {
-    vsockConnectAsync.mockResolvedValue(enclaveAnswering(frame({ type: 'pong', timestamp: 1 }), 65536));
-    await expect(pingEnclave(16, 5000)).resolves.toBe(true);
+describe('pingEnclave: whether the enclave answers, and how far its clock is from this host (audit §5.1 F1)', () => {
+  it('a prompt pong is responsive, with the enclave clock\'s drift from the middle of the round trip (red)', async () => {
+    let now = 9_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    // Sent at 9 000 000, answered after two reads of 200 ms: the middle of the round trip is 9 000 200.
+    vsockConnectAsync.mockResolvedValue(enclaveAnswering(frame({ type: 'pong', timestamp: 9_090_200 }), 65536, () => { now += 200; }));
+    await expect(pingEnclave(16, 5000)).resolves.toEqual({ responsive: true, clockDriftMs: 90_000 });
   });
 
-  it('a pong trickled past the 2 s budget is unhealthy', async () => {
+  it('an enclave clock behind this host is a negative drift (red)', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(9_000_000);
+    vsockConnectAsync.mockResolvedValue(enclaveAnswering(frame({ type: 'pong', timestamp: 8_955_000 }), 65536));
+    await expect(pingEnclave(16, 5000)).resolves.toEqual({ responsive: true, clockDriftMs: -45_000 });
+  });
+
+  it('a pong without a clock is responsive, its drift unknown (red)', async () => {
+    vsockConnectAsync.mockResolvedValue(enclaveAnswering(frame({ type: 'pong' }), 65536));
+    await expect(pingEnclave(16, 5000)).resolves.toEqual({ responsive: true, clockDriftMs: null });
+    vsockConnectAsync.mockResolvedValue(enclaveAnswering(frame({ type: 'pong', timestamp: 'noon' }), 65536));
+    await expect(pingEnclave(16, 5000)).resolves.toEqual({ responsive: true, clockDriftMs: null });
+  });
+
+  it('a pong trickled past the 2 s budget is unresponsive (red)', async () => {
     let now = 9_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
     vsockConnectAsync.mockResolvedValue(enclaveAnswering(frame({ type: 'pong', timestamp: 1 }), 1, () => { now += 1_000; }));
-    await expect(pingEnclave(16, 5000)).resolves.toBe(false);
+    await expect(pingEnclave(16, 5000)).resolves.toEqual({ responsive: false, clockDriftMs: null });
+  });
+
+  it('an answer that is not a pong, or no connection, is unresponsive (red)', async () => {
+    vsockConnectAsync.mockResolvedValue(enclaveAnswering(frame({ type: 'busy', timestamp: 1 }), 65536));
+    await expect(pingEnclave(16, 5000)).resolves.toEqual({ responsive: false, clockDriftMs: null });
+    vsockConnectAsync.mockRejectedValue(new Error('connection refused'));
+    await expect(pingEnclave(16, 5000)).resolves.toEqual({ responsive: false, clockDriftMs: null });
   });
 });

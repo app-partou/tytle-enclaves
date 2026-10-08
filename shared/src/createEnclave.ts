@@ -97,6 +97,8 @@ export function startEnclave(config: EnclaveConfig): void {
       );
 
       if ('type' in message && (message as { type: string }).type === 'ping') {
+        // The enclave's own clock: the parent reports how far it drifted (audit §5.1 F1). Diagnostic only - the
+        // attestation time follows the hypervisor's signed one (attestor.ts).
         await writeMessage(conn, { type: 'pong', timestamp: Date.now() });
         return;
       }

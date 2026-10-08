@@ -47,35 +47,52 @@ export async function sendToEnclave(
   }
 }
 
+/** What a ping found: whether the enclave answered, and how far its clock is from this host's. */
+export interface PingResult {
+  responsive: boolean;
+  /**
+   * The enclave's clock (the pong's `timestamp`) minus this host's at the middle of the round trip, in ms;
+   * null when it did not answer or its pong carries no clock. This host keeps NTP time; an enclave has no NTP
+   * and drifts (audit §5.1 F1). Diagnostic: the attestation time follows the hypervisor (attestor.ts).
+   */
+  clockDriftMs: number | null;
+}
+
 /**
  * Send a lightweight ping to an enclave and wait for pong.
- * Used by the health check to verify vsock connectivity beyond nitro-cli state.
+ * Used by the health check to verify vsock connectivity beyond nitro-cli state, and to read the enclave's clock.
  */
 export async function pingEnclave(
   cid: number,
   port: number,
   timeoutMs: number = 2_000,
-): Promise<boolean> {
+): Promise<PingResult> {
   try {
     const deadlineMs = Date.now() + timeoutMs;
     const timeoutSecs = Math.max(1, Math.ceil(timeoutMs / 1000));
     const conn = await vsockConnectAsync(cid, port, timeoutSecs);
     try {
-      const result = await withTimeout(
-        async () => {
+      return await withTimeout(
+        async (): Promise<PingResult> => {
+          const sentAtMs = Date.now();
           await writeMessage(conn, { type: 'ping' });
-          const resp = await readMessage<{ type: string }>(conn, { deadlineMs });
-          return resp.type === 'pong';
+          const resp = await readMessage<{ type?: unknown; timestamp?: unknown }>(conn, { deadlineMs });
+          const receivedAtMs = Date.now();
+          if (resp.type !== 'pong') return { responsive: false, clockDriftMs: null };
+          const clock = resp.timestamp;
+          return {
+            responsive: true,
+            clockDriftMs: typeof clock === 'number' && Number.isFinite(clock) ? Math.round(clock - (sentAtMs + receivedAtMs) / 2) : null,
+          };
         },
         timeoutMs,
         'ping timeout',
       );
-      return result;
     } finally {
       try { conn.close(); } catch { /* ignore */ }
     }
   } catch {
-    return false;
+    return { responsive: false, clockDriftMs: null };
   }
 }
 
