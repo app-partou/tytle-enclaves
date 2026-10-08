@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 
 /**
- * @tytle-enclaves/verify — CLI tool to verify Tytle Nitro Enclave attestations.
+ * @tytle-enclaves/verify - CLI tool to verify Tytle Nitro Enclave attestations.
  *
- * End-to-end verification: COSE signature, certificate chain, nonce, PCR0, and
- * optionally reproduces the Docker build to confirm code identity.
+ * End-to-end verification: COSE signature, certificate chain, nonce, data binding
+ * (user_data, --bn254), PCR0, and optionally reproduces the Docker build to confirm
+ * code identity. It needs the FULL attestation document (with apiEndpoint, which the
+ * nonce covers); see VERIFICATION.md for who gets which document.
  *
- * Usage:
- *   npx @tytle-enclaves/verify --service vies --attestation attestation.json
- *   npx @tytle-enclaves/verify --service vies --attestation att.json --skip-build
+ * Not on npm yet. Build it from this repository:
+ *   cd verify && npm ci && npm run build
+ *   node dist/cli.js --service vies --attestation attestation.json
+ *   node dist/cli.js --service vies --attestation att.json --skip-build
+ *   node dist/cli.js --service vies --attestation att.json --bn254 vector.b64
  */
 
 import { Command } from 'commander';
