@@ -38,11 +38,11 @@ export interface Pcr0ApiResponse {
   verificationGuide: string;
 }
 
-export type ServiceName = 'vies' | 'sicae' | 'stripe-payment';
+export type ServiceName = 'vies' | 'sicae' | 'stripe-payment' | 'monerium-payment';
 
-export const VALID_SERVICES: ServiceName[] = ['vies', 'sicae', 'stripe-payment'];
+export const VALID_SERVICES: ServiceName[] = ['vies', 'sicae', 'stripe-payment', 'monerium-payment'];
 
-/** Map service name to the key used in the API response (stripe-payment -> stripe_payment) */
+/** Map service name to the key used in the API response and SSM (stripe-payment -> stripe_payment) */
 export function apiKeyForService(service: ServiceName): string {
   return service.replace('-', '_');
 }

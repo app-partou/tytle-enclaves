@@ -10,7 +10,7 @@
 #   ./scripts/rotate-pcr0.sh <enclave> --apply    # Also update SSM parameter
 #   ./scripts/rotate-pcr0.sh all                  # Print PCR0 for all enclaves
 #
-# Enclaves: vies, sicae, stripe-payment
+# Enclaves: vies, sicae, stripe-payment, monerium-payment
 #
 # Prerequisites:
 #   - Docker with BuildKit
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENCLAVES=("vies" "sicae" "stripe-payment")
+ENCLAVES=("vies" "sicae" "stripe-payment" "monerium-payment")
 
 # Pinned nitro-cli image for reproducible PCR0 extraction (no Nitro instance needed)
 NITRO_CLI_IMAGE="docker.io/tytle/nitro-cli:1.4.4"
@@ -33,6 +33,7 @@ ssm_param_name() {
     vies) key="vies" ;;
     sicae) key="sicae" ;;
     stripe-payment) key="stripe_payment" ;;
+    monerium-payment) key="monerium_payment" ;;
     *) echo "Unknown enclave: $enclave" >&2; exit 1 ;;
   esac
   echo "/tytle/${env}/enclave/${key}/pcr0"

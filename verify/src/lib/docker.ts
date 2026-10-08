@@ -1,6 +1,6 @@
 /**
  * Docker build orchestration for reproducible enclave builds.
- * Mirrors the pattern from vies/build.sh, sicae/build.sh, stripe-payment/build.sh.
+ * Mirrors the pattern from vies/build.sh, sicae/build.sh, stripe-payment/build.sh, monerium-payment/build.sh.
  *
  * SECURITY: All shell commands use execFileSync with argument arrays (not string interpolation)
  * to prevent command injection from user-provided or API-provided inputs.

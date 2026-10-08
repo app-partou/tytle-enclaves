@@ -18,14 +18,14 @@ EXPECTED_FILE="$REPO_DIR/scripts/expected-digests.json"
 SOURCE_DATE_EPOCH=$(git -C "$REPO_DIR" log -1 --pretty=%ct)
 export SOURCE_DATE_EPOCH
 
-ENCLAVES=("vies" "sicae" "stripe-payment")
+ENCLAVES=("vies" "sicae" "stripe-payment" "monerium-payment")
 UPDATE_MODE=false
 
 # Parse args
 for arg in "$@"; do
   case "$arg" in
     --update) UPDATE_MODE=true ;;
-    vies|sicae|stripe-payment) ENCLAVES=("$arg") ;;
+    vies|sicae|stripe-payment|monerium-payment) ENCLAVES=("$arg") ;;
   esac
 done
 
