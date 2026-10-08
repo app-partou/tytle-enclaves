@@ -9,6 +9,7 @@ vi.mock('../httpProxy.js', () => ({
 }));
 
 import { proxyFetchWithRetry } from '../retryProxy.js';
+import { IncompleteBodyError, ResponseTooLargeError } from '../httpErrors.js';
 
 function makeResponse(status: number, body = '') {
   return { status, headers: {}, body };
@@ -120,6 +121,33 @@ describe('proxyFetchWithRetry', () => {
     );
     expect(result.status).toBe(503);
     expect(result.body).toBe('service unavailable');
+    expect(mockProxyFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('never retries a reply that was too large: the same request would pull the same bytes again', async () => {
+    mockProxyFetch.mockRejectedValueOnce(new ResponseTooLargeError('example.com', 4_194_305, 4_194_304));
+
+    await expect(
+      proxyFetchWithRetry(
+        8443, 'example.com', 'GET', '/', {},
+        undefined, undefined, true,
+        { maxRetries: 2, baseDelayMs: 1 },
+      ),
+    ).rejects.toBeInstanceOf(ResponseTooLargeError);
+    expect(mockProxyFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a reply cut short (IncompleteBodyError) and returns the complete one', async () => {
+    mockProxyFetch
+      .mockRejectedValueOnce(new IncompleteBodyError('Content-Length 100, received 60'))
+      .mockResolvedValueOnce(makeResponse(200, 'complete'));
+
+    const result = await proxyFetchWithRetry(
+      8443, 'example.com', 'GET', '/', {},
+      undefined, undefined, true,
+      { maxRetries: 1, baseDelayMs: 1 },
+    );
+    expect(result.body).toBe('complete');
     expect(mockProxyFetch).toHaveBeenCalledTimes(2);
   });
 

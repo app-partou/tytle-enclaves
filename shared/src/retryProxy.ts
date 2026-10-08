@@ -3,10 +3,13 @@
  *
  * Lightweight retry inside the enclave avoids the full vsock roundtrip
  * when external APIs return transient errors. Only retries on 5xx status
- * codes or network errors - never on 4xx (client errors).
+ * codes or network errors - never on 4xx (client errors), and never on a
+ * reply that was too large (the same request would pull the same bytes).
+ * Thrown errors are judged by class (httpErrors.ts), never by message text.
  */
 
 import { proxyFetch, proxyFetchPlain, type HttpResponse } from './httpProxy.js';
+import { ResponseTooLargeError } from './httpErrors.js';
 import { toErrorMessage } from './errorUtils.js';
 
 export interface RetryConfig {
@@ -51,6 +54,7 @@ export async function proxyFetchWithRetry(
       }
       lastResponse = response;
     } catch (err: unknown) {
+      if (err instanceof ResponseTooLargeError) throw err;
       if (attempt === cfg.maxRetries) {
         if (lastResponse) return lastResponse;
         throw err;

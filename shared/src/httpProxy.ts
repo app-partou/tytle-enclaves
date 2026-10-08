@@ -16,6 +16,9 @@ import * as tls from 'node:tls';
 import { Duplex } from 'node:stream';
 import { VsockStream } from '@tytle-enclaves/native';
 import { VsockDuplex } from './vsockStream.js';
+import { ResponseCollector, type HttpResponse } from './httpParse.js';
+
+export type { HttpResponse } from './httpParse.js';
 
 /** CID 3 = host parent from inside the enclave */
 const HOST_CID = 3;
@@ -27,12 +30,6 @@ const HOST_CID = 3;
  * Node.js TLS falls back to a full handshake if a cached ticket is rejected.
  */
 const tlsSessionCache = new Map<string, Buffer>();
-
-export interface HttpResponse {
-  status: number;
-  headers: Record<string, string>;
-  body: string;
-}
 
 /**
  * Make an HTTPS request through a vsock-proxy tunnel.
@@ -110,18 +107,23 @@ export async function proxyFetch(
         tlsSessionCache.set(hostname, session);
       });
 
-      // Step 3: Collect response (as bytes - decode to string after de-chunking)
-      const chunks: Buffer[] = [];
+      // Step 3: Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules
+      const collector = new ResponseCollector(hostname);
       tlsSocket.on('data', (chunk: Buffer) => {
-        chunks.push(chunk);
+        try {
+          collector.push(chunk);
+        } catch (err) {
+          clearTimeout(timer);
+          tlsSocket.destroy();
+          duplex?.destroy();
+          reject(err);
+        }
       });
 
       tlsSocket.on('end', () => {
         clearTimeout(timer);
         try {
-          const raw = Buffer.concat(chunks);
-          const response = parseHttpResponse(raw);
-          resolve(response);
+          resolve(collector.finish());
         } catch (err) {
           reject(err);
         }
@@ -201,26 +203,31 @@ export async function proxyFetchPlain(
 
       duplex.write(httpReq);
 
-      // Collect response
-      const chunks: Buffer[] = [];
-      duplex.on('data', (chunk: Buffer) => {
-        chunks.push(chunk);
+      // Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules
+      const collector = new ResponseCollector(hostname);
+      const plain = duplex;
+      plain.on('data', (chunk: Buffer) => {
+        try {
+          collector.push(chunk);
+        } catch (err) {
+          clearTimeout(timer);
+          plain.destroy();
+          reject(err);
+        }
       });
 
-      duplex.on('end', () => {
+      plain.on('end', () => {
         clearTimeout(timer);
         try {
-          const raw = Buffer.concat(chunks);
-          const response = parseHttpResponse(raw);
-          resolve(response);
+          resolve(collector.finish());
         } catch (err) {
           reject(err);
         }
       });
 
-      duplex.on('error', (err: Error) => {
+      plain.on('error', (err: Error) => {
         clearTimeout(timer);
-        duplex?.destroy();
+        plain.destroy();
         reject(new Error(`Plain HTTP error to ${hostname}: ${err.message}`));
       });
     } catch (err) {
@@ -229,85 +236,4 @@ export async function proxyFetchPlain(
       reject(err);
     }
   });
-}
-
-/**
- * Parse raw HTTP/1.1 response into structured object.
- * Operates on Buffer to correctly handle chunked encoding with multi-byte characters.
- * Headers are ASCII, so safe to split as string. Body is decoded after de-chunking.
- */
-function parseHttpResponse(raw: Buffer): HttpResponse {
-  // Find header/body separator (\r\n\r\n) at byte level
-  const separator = Buffer.from('\r\n\r\n');
-  const headerEnd = raw.indexOf(separator);
-  if (headerEnd === -1) {
-    throw new Error('Malformed HTTP response: no header/body separator');
-  }
-
-  // Headers are ASCII — safe to decode as string
-  const headerSection = raw.subarray(0, headerEnd).toString('ascii');
-  const bodyBuf = raw.subarray(headerEnd + 4);
-
-  const lines = headerSection.split('\r\n');
-  const statusLine = lines[0];
-
-  // Parse status line: "HTTP/1.1 200 OK"
-  const statusMatch = statusLine.match(/^HTTP\/\d\.\d\s+(\d+)/);
-  if (!statusMatch) {
-    throw new Error(`Malformed status line: ${statusLine}`);
-  }
-  const status = parseInt(statusMatch[1], 10);
-
-  // Parse headers
-  const headers: Record<string, string> = {};
-  for (let i = 1; i < lines.length; i++) {
-    const colonIdx = lines[i].indexOf(':');
-    if (colonIdx > 0) {
-      const key = lines[i].substring(0, colonIdx).trim().toLowerCase();
-      const value = lines[i].substring(colonIdx + 1).trim();
-      headers[key] = value;
-    }
-  }
-
-  // Handle chunked transfer encoding at byte level, then decode to string
-  let responseBody: string;
-  if (headers['transfer-encoding']?.includes('chunked')) {
-    responseBody = decodeChunked(bodyBuf).toString('utf-8');
-  } else {
-    responseBody = bodyBuf.toString('utf-8');
-  }
-
-  return { status, headers, body: responseBody };
-}
-
-/**
- * Decode chunked transfer encoding.
- * Operates on Buffer so chunk sizes (byte counts) correctly index the data,
- * even when the body contains multi-byte UTF-8 characters.
- */
-function decodeChunked(raw: Buffer): Buffer {
-  const parts: Buffer[] = [];
-  let offset = 0;
-  const crlf = Buffer.from('\r\n');
-
-  while (offset < raw.length) {
-    const lineEnd = raw.indexOf(crlf, offset);
-    if (lineEnd === -1) break;
-
-    const chunkSizeHex = raw.subarray(offset, lineEnd).toString('ascii').trim();
-    const chunkSize = parseInt(chunkSizeHex, 16);
-
-    if (chunkSize === 0) break; // Terminal chunk
-    if (!Number.isFinite(chunkSize) || chunkSize < 0) {
-      throw new Error(`Invalid chunk size: "${chunkSizeHex}"`);
-    }
-
-    const chunkStart = lineEnd + 2;
-    const chunkEnd = chunkStart + chunkSize;
-    parts.push(raw.subarray(chunkStart, chunkEnd));
-
-    offset = chunkEnd + 2; // Skip \r\n after chunk data
-  }
-
-  return Buffer.concat(parts);
 }
