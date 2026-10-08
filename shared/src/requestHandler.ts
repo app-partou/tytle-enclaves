@@ -8,7 +8,7 @@
  */
 
 import { proxyFetch, proxyFetchPlain } from './httpProxy.js';
-import { attest } from './attestor.js';
+import { assertChallenge, attest } from './attestor.js';
 import type { EnclaveConfig, EnclaveRequest, EnclaveResponse } from './types.js';
 
 /**
@@ -19,6 +19,12 @@ export function createRequestHandler(
   config: EnclaveConfig,
 ): (request: EnclaveRequest) => Promise<EnclaveResponse> {
   return async (request: EnclaveRequest): Promise<EnclaveResponse> => {
+    try {
+      assertChallenge(request.challenge);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return { success: false, status: 400, headers: {}, rawBody: '', error: `Invalid request: ${msg}` };
+    }
     try {
       const parsedUrl = new URL(request.url);
       const hostname = parsedUrl.hostname;
@@ -53,6 +59,7 @@ export function createRequestHandler(
         response.body,
         request.url,
         request.headers,
+        { challenge: request.challenge },
       );
 
       return {

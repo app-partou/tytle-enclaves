@@ -23,6 +23,11 @@ export interface EnclaveRequest {
   method: string;
   headers: Record<string, string>;
   body?: string;
+  /**
+   * 32 random bytes as 64 lowercase hex, minted by the caller (data-bridge) for this one request.
+   * Mixed into the NSM nonce (nonce version 2), so the signed document answers THIS request and no other.
+   */
+  challenge?: string;
 }
 
 /** Response from enclave to parent server via vsock. */
@@ -46,6 +51,10 @@ export interface EnclaveResponse {
       pcr2: string;
     };
     nonce: string;
+    /** 1 = SHA-256(responseHash|apiEndpoint|timestamp); 2 = SHA-256(responseHash|apiEndpoint|timestamp|challenge). */
+    nonceVersion: 1 | 2;
+    /** The caller's challenge, echoed; present exactly when nonceVersion is 2. */
+    challenge?: string;
     /** SHA-256 of BN254 field elements (included in NSM user_data) */
     bn254Hash?: string;
   };

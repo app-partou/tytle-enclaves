@@ -15,6 +15,35 @@ import crypto from 'node:crypto';
 import cbor from 'cbor';
 import { nsmRequest } from '@tytle-enclaves/native';
 
+/**
+ * A caller challenge: 32 bytes as 64 lowercase hex. The same rule as the verifier's CHALLENGE_PATTERN
+ * (packages/attestation-core in the main repo), so a challenge the enclave signs is one it can check.
+ */
+export const CHALLENGE_PATTERN = /^[0-9a-f]{64}$/;
+
+/** A challenge that is not 64 lowercase hex: refused before anything is fetched or signed. */
+export class InvalidChallengeError extends Error {
+  readonly code = 'INVALID_CHALLENGE' as const;
+  constructor() {
+    super('challenge must be 32 bytes of lowercase hex (64 characters)');
+    this.name = 'InvalidChallengeError';
+  }
+}
+
+/** Throws InvalidChallengeError unless `challenge` is absent or 64 lowercase hex. */
+export function assertChallenge(challenge: unknown): asserts challenge is string | undefined {
+  if (challenge !== undefined && (typeof challenge !== 'string' || !CHALLENGE_PATTERN.test(challenge))) {
+    throw new InvalidChallengeError();
+  }
+}
+
+export interface AttestOptions {
+  /** Hex for NSM user_data (e.g., SHA-256 of the BN254 field elements). */
+  userDataHex?: string;
+  /** The caller's challenge (64 lowercase hex): mixed into the nonce as version 2. */
+  challenge?: string;
+}
+
 export interface AttestationDocument {
   attestationId: string;
   responseHash: string;
@@ -29,6 +58,10 @@ export interface AttestationDocument {
     pcr2: string;
   };
   nonce: string;
+  /** 1 = SHA-256(responseHash|apiEndpoint|timestamp); 2 = the same with `|challenge` appended. */
+  nonceVersion: 1 | 2;
+  /** The caller's challenge, echoed; present exactly when nonceVersion is 2. */
+  challenge?: string;
 }
 
 /**
@@ -39,7 +72,7 @@ export interface AttestationDocument {
  * @param rawBody - Raw response body
  * @param url - Full request URL
  * @param requestHeaders - Request headers (for request hash)
- * @param userDataHex - Optional hex string for NSM user_data (e.g., SHA-256 of BN254 field elements)
+ * @param options - `userDataHex` for NSM user_data; `challenge` (64 lowercase hex) for nonce version 2
  */
 export async function attest(
   apiEndpoint: string,
@@ -47,8 +80,12 @@ export async function attest(
   rawBody: string,
   url: string,
   requestHeaders: Record<string, string>,
-  userDataHex?: string,
+  options: AttestOptions = {},
 ): Promise<AttestationDocument> {
+  const { userDataHex, challenge } = options;
+  // Before anything is signed: a malformed challenge is refused, never signed into a nonce.
+  assertChallenge(challenge);
+
   const timestamp = Math.floor(Date.now() / 1000);
   const attestationId = `enc-${crypto.randomUUID()}`;
 
@@ -64,12 +101,18 @@ export async function attest(
     .update(`${url}|${apiMethod}|${JSON.stringify(requestHeaders)}`)
     .digest('hex');
 
-  // Compute nonce: SHA-256(responseHash|apiEndpoint|timestamp)
-  // Pipe delimiter prevents domain collisions from field concatenation
-  const nonce = crypto
-    .createHash('sha256')
-    .update(`${responseHash}|${apiEndpoint}|${timestamp}`)
-    .digest('hex');
+  // Compute nonce. Version 1: SHA-256(responseHash|apiEndpoint|timestamp). Version 2 appends the
+  // caller's challenge, so the document answers THIS request (P1.3). Pipe delimiter prevents domain
+  // collisions from field concatenation. The two preimages are written out in full: the main repo's
+  // nonceFormula.drift.test.ts reads them as text and holds them to the verifier's nsmNonceOf.
+  const nonceVersion: 1 | 2 = challenge === undefined ? 1 : 2;
+  const nonceHash = crypto.createHash('sha256');
+  if (challenge === undefined) {
+    nonceHash.update(`${responseHash}|${apiEndpoint}|${timestamp}`);
+  } else {
+    nonceHash.update(`${responseHash}|${apiEndpoint}|${timestamp}|${challenge}`);
+  }
+  const nonce = nonceHash.digest('hex');
 
   // Request NSM attestation with the nonce and optional user_data
   const { nsmDocument, pcrs } = await requestNsmAttestation(nonce, userDataHex);
@@ -84,6 +127,8 @@ export async function attest(
     nsmDocument,
     pcrs,
     nonce,
+    nonceVersion,
+    ...(challenge === undefined ? {} : { challenge }),
   };
 }
 

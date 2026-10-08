@@ -15,6 +15,8 @@ export interface EnclaveRequest {
   method: string;
   headers: Record<string, string>;
   body?: string;
+  /** The caller's challenge (64 lowercase hex), forwarded untouched; the enclave signs it into the nonce. */
+  challenge?: string;
 }
 
 /** Response from an enclave. */
@@ -38,6 +40,10 @@ export interface EnclaveResponse {
       pcr2: string;
     };
     nonce: string;
+    /** 1 = SHA-256(responseHash|apiEndpoint|timestamp); 2 = the same with `|challenge` appended. */
+    nonceVersion?: 1 | 2;
+    /** The caller's challenge, echoed (nonce version 2). */
+    challenge?: string;
     /** SHA-256 of BN254 field elements (included in NSM user_data) */
     bn254Hash?: string;
   };

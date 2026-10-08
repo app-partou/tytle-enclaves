@@ -7,6 +7,7 @@
  */
 
 import { encodeBn254AndAttest } from './enclaveHelpers.js';
+import { assertChallenge } from './attestor.js';
 import { errorResponse } from './enclaveHelpers.js';
 import { toErrorMessage } from './errorUtils.js';
 import { proxyFetch, proxyFetchPlain, type HttpResponse } from './httpProxy.js';
@@ -95,6 +96,8 @@ export function createHandler<TParams>(
     try {
       let params: TParams;
       try {
+        // A malformed challenge is refused before any upstream call (and attest() refuses it again).
+        assertChallenge(request.challenge);
         const body = JSON.parse(request.body || '{}');
         params = def.parseParams(body);
       } catch (err: unknown) {
@@ -139,6 +142,7 @@ export function createHandler<TParams>(
           method: result.method,
           url: result.url,
           requestHeaders: { ...attestHeaders, 'x-manifest-hash': def.manifestHash },
+          challenge: request.challenge,
         },
       );
 
