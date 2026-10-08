@@ -27,6 +27,9 @@ export async function sendToEnclave(
   request: EnclaveRequest,
   timeoutMs: number = 30_000,
 ): Promise<EnclaveResponse> {
+  // Reads are blocking libc calls: withTimeout's timer cannot fire while one waits, and a peer that
+  // sends one byte at a time resets the socket's per-read timeout. The deadline bounds the whole answer.
+  const deadlineMs = Date.now() + timeoutMs;
   const timeoutSecs = Math.max(1, Math.ceil(timeoutMs / 1000));
   const conn = await vsockConnectAsync(cid, port, timeoutSecs);
 
@@ -34,7 +37,7 @@ export async function sendToEnclave(
     return await withTimeout(
       async () => {
         await writeMessage(conn, request);
-        return readMessage<EnclaveResponse>(conn);
+        return readMessage<EnclaveResponse>(conn, { deadlineMs });
       },
       timeoutMs,
       `Enclave request timed out after ${timeoutMs}ms (CID ${cid}, port ${port})`,
@@ -54,13 +57,14 @@ export async function pingEnclave(
   timeoutMs: number = 2_000,
 ): Promise<boolean> {
   try {
+    const deadlineMs = Date.now() + timeoutMs;
     const timeoutSecs = Math.max(1, Math.ceil(timeoutMs / 1000));
     const conn = await vsockConnectAsync(cid, port, timeoutSecs);
     try {
       const result = await withTimeout(
         async () => {
           await writeMessage(conn, { type: 'ping' });
-          const resp = await readMessage<{ type: string }>(conn);
+          const resp = await readMessage<{ type: string }>(conn, { deadlineMs });
           return resp.type === 'pong';
         },
         timeoutMs,

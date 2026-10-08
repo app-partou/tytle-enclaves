@@ -17,7 +17,8 @@
   "devDependencies": {
     "@types/express": "^4.17.21",
     "@types/node": "^20.11.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vitest": "4.0.18"
   },
   "license": "AGPL-3.0",
   "engines": {

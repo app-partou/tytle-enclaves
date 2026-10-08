@@ -12,6 +12,24 @@ const HEADER_SIZE = 4;
 const MAX_MESSAGE_SIZE = 16 * 1024 * 1024; // 16MB max
 
 /**
+ * The whole message did not arrive before its deadline. Each read is a blocking libc::read with a
+ * socket timeout (native/src/vsock.rs), which a peer can reset forever by sending one byte at a
+ * time; the deadline bounds the whole message, so such a peer cannot hold a connection open.
+ */
+export class ReadDeadlineError extends Error {
+  readonly code = 'READ_DEADLINE' as const;
+  constructor(readonly expectedBytes: number, readonly receivedBytes: number) {
+    super(`Read deadline passed: expected ${expectedBytes} bytes, got ${receivedBytes}`);
+    this.name = 'ReadDeadlineError';
+  }
+}
+
+export interface ReadOptions {
+  /** Epoch ms after which the read gives up (ReadDeadlineError). Checked before every read call. */
+  deadlineMs?: number;
+}
+
+/**
  * Minimal stream interface for the protocol layer.
  * VsockStream from the native addon implements this shape natively.
  */
@@ -43,8 +61,8 @@ export async function writeMessage(stream: MessageStream, data: unknown): Promis
 }
 
 /** Read a length-prefixed JSON message. Returns parsed object. */
-export async function readMessage<T = unknown>(stream: MessageStream): Promise<T> {
-  const header = await readExact(stream, HEADER_SIZE);
+export async function readMessage<T = unknown>(stream: MessageStream, options: ReadOptions = {}): Promise<T> {
+  const header = await readExact(stream, HEADER_SIZE, options.deadlineMs);
   const length = header.readUInt32BE(0);
 
   if (length === 0) {
@@ -54,18 +72,21 @@ export async function readMessage<T = unknown>(stream: MessageStream): Promise<T
     throw new Error(`Message too large: ${length} bytes (max ${MAX_MESSAGE_SIZE})`);
   }
 
-  const payload = await readExact(stream, length);
+  const payload = await readExact(stream, length, options.deadlineMs);
   const json = payload.toString('utf-8');
 
   return JSON.parse(json) as T;
 }
 
-/** Read exactly `size` bytes from the stream. */
-async function readExact(stream: MessageStream, size: number): Promise<Buffer> {
+/** Read exactly `size` bytes from the stream, giving up once `deadlineMs` has passed. */
+async function readExact(stream: MessageStream, size: number, deadlineMs?: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let remaining = size;
 
   while (remaining > 0) {
+    if (deadlineMs !== undefined && Date.now() > deadlineMs) {
+      throw new ReadDeadlineError(size, size - remaining);
+    }
     const readSize = Math.min(remaining, 65536);
     const chunk = stream.read(readSize);
 

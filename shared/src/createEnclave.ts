@@ -20,6 +20,13 @@ const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4', 10);
 const CONNECTION_TIMEOUT_MS = 60_000;
 
 /**
+ * The whole request (or ping) must arrive within this. The parent writes it in one go right after
+ * connecting; a peer that trickles bytes to keep the socket's per-read timeout from firing is cut off
+ * here (protocol.ts ReadDeadlineError) instead of holding the connection, and the event loop, open.
+ */
+const REQUEST_READ_DEADLINE_MS = 10_000;
+
+/**
  * Start the enclave accept loop.
  *
  * Uses acceptAsync() to accept connections on the libuv thread pool,
@@ -34,8 +41,9 @@ const CONNECTION_TIMEOUT_MS = 60_000;
  * readMessage/writeMessage use synchronous libc::read/write (the native
  * addon has no async read variant). They stay inside dispatched handlers
  * so they don't block the accept loop itself. Accepted connections have
- * SO_RCVTIMEO=60s set by the Rust addon, so a stuck read returns EAGAIN
- * instead of blocking indefinitely.
+ * SO_RCVTIMEO and SO_SNDTIMEO of 10 s set by the Rust addon, so a stuck read
+ * or write returns EAGAIN instead of blocking indefinitely, and the request
+ * read has a deadline over the whole message (REQUEST_READ_DEADLINE_MS).
  */
 export function startEnclave(config: EnclaveConfig): void {
   const processRequest = config.customHandler || createRequestHandler(config);
@@ -83,7 +91,7 @@ export function startEnclave(config: EnclaveConfig): void {
   ): Promise<void> {
     try {
       const message = await withTimeout(
-        () => readMessage<EnclaveRequest | { type: string }>(conn),
+        () => readMessage<EnclaveRequest | { type: string }>(conn, { deadlineMs: Date.now() + REQUEST_READ_DEADLINE_MS }),
         CONNECTION_TIMEOUT_MS,
         `Read timed out after ${CONNECTION_TIMEOUT_MS}ms`,
       );

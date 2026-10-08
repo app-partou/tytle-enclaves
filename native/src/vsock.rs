@@ -10,6 +10,73 @@ const VMADDR_CID_ANY: u32 = 0xFFFFFFFF;
 /// Sentinel value indicating the fd has been closed.
 const CLOSED_FD: i32 = -1;
 
+/// Read/write timeout of a socket from `VsockStream::connect` when the caller gives none.
+const DEFAULT_IO_TIMEOUT_SECS: u32 = 30;
+
+/// Read/write timeout of an accepted connection. The parent writes its whole request at once and
+/// reads the answer at once, so a peer that goes quiet for this long is gone or hostile. Every read
+/// and write is a blocking libc call on the Node.js event loop: while one waits, the enclave serves
+/// nothing else, so this bounds the longest freeze a peer can cause per call. The JS side adds a
+/// deadline over the whole message (shared/src/protocol.ts), which bounds a peer that trickles bytes.
+const ACCEPTED_IO_TIMEOUT_SECS: u32 = 10;
+
+/// Set SO_RCVTIMEO and SO_SNDTIMEO on `fd`, so a blocking read or write returns EAGAIN after `secs`
+/// instead of waiting forever (0 would mean "no timeout" to the kernel, so it is raised to 1).
+///
+/// # Safety
+/// `fd` must be an open socket owned by the caller.
+pub(crate) unsafe fn set_io_timeouts(fd: i32, secs: u32) -> std::io::Result<()> {
+    let tv = libc::timeval {
+        tv_sec: secs.max(1) as libc::time_t,
+        tv_usec: 0,
+    };
+    for opt in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+        let ret = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &tv as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Give a freshly accepted connection its timeouts; on failure the connection is closed and the
+/// error returned (an accepted socket without timeouts could freeze the event loop for good).
+///
+/// # Safety
+/// `client_fd` must be an open socket owned by the caller.
+pub(crate) unsafe fn configure_accepted(client_fd: i32) -> Result<()> {
+    if let Err(e) = set_io_timeouts(client_fd, ACCEPTED_IO_TIMEOUT_SECS) {
+        libc::close(client_fd);
+        return Err(Error::from_reason(format!(
+            "setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) on an accepted connection failed: {}",
+            e
+        )));
+    }
+    Ok(())
+}
+
+/// Give a freshly connected socket its timeouts (`timeout_secs`, else DEFAULT_IO_TIMEOUT_SECS);
+/// on failure the socket is closed and the error returned.
+///
+/// # Safety
+/// `fd` must be an open socket owned by the caller.
+pub(crate) unsafe fn configure_connected(fd: i32, timeout_secs: Option<u32>) -> Result<()> {
+    if let Err(e) = set_io_timeouts(fd, timeout_secs.unwrap_or(DEFAULT_IO_TIMEOUT_SECS)) {
+        libc::close(fd);
+        return Err(Error::from_reason(format!(
+            "setsockopt(SO_RCVTIMEO/SO_SNDTIMEO) failed: {}",
+            e
+        )));
+    }
+    Ok(())
+}
+
 /// sockaddr_vm layout (from linux/vm_sockets.h)
 #[repr(C)]
 struct SockaddrVm {
@@ -109,6 +176,7 @@ impl VsockListener {
                     std::io::Error::last_os_error()
                 )));
             }
+            configure_accepted(client_fd)?;
 
             Ok(VsockStream {
                 fd: AtomicI32::new(client_fd),
@@ -139,7 +207,7 @@ impl VsockListener {
     }
 }
 
-struct AcceptTask {
+pub struct AcceptTask {
     fd: i32,
 }
 
@@ -167,19 +235,11 @@ impl Task for AcceptTask {
                 )));
             }
 
-            // Set SO_RCVTIMEO on accepted connections so libc::read in
-            // readMessage returns EAGAIN instead of blocking indefinitely
-            // if the client connects but never sends data. Without this,
-            // a stuck read freezes the Node.js event loop permanently
-            // because withTimeout's setTimeout cannot fire while blocked.
-            let tv = libc::timeval { tv_sec: 60, tv_usec: 0 };
-            libc::setsockopt(
-                client_fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as u32,
-            );
+            // Timeouts on both directions, so libc::read / libc::write in readMessage / writeMessage
+            // return EAGAIN instead of blocking forever when the peer connects and goes quiet or
+            // stops reading. A stuck call freezes the Node.js event loop: withTimeout's setTimeout
+            // cannot fire while it blocks.
+            configure_accepted(client_fd)?;
 
             Ok((client_fd, addr.svm_cid, addr.svm_port))
         }
@@ -207,8 +267,10 @@ pub struct VsockStream {
 impl VsockStream {
     /// Connect to a vsock endpoint at the given CID and port.
     /// CID 3 = host (parent) from inside the enclave.
+    /// Every read and write on the stream gives up after `timeout_secs` (default 30): without it a
+    /// host proxy that accepts and goes silent would block libc::read on the event loop forever.
     #[napi(factory)]
-    pub fn connect(cid: u32, port: u32) -> Result<Self> {
+    pub fn connect(cid: u32, port: u32, timeout_secs: Option<u32>) -> Result<Self> {
         unsafe {
             let fd = libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0);
             if fd < 0 {
@@ -240,6 +302,7 @@ impl VsockStream {
                     std::io::Error::last_os_error()
                 )));
             }
+            configure_connected(fd, timeout_secs)?;
 
             Ok(VsockStream {
                 fd: AtomicI32::new(fd),
@@ -338,7 +401,7 @@ pub fn vsock_connect_async(cid: u32, port: u32, timeout_secs: Option<u32>) -> As
     })
 }
 
-struct ConnectTask {
+pub struct ConnectTask {
     cid: u32,
     port: u32,
     timeout_secs: u32,
@@ -472,34 +535,7 @@ impl Task for ConnectTask {
             }
 
             // Set I/O timeouts for subsequent read/write operations
-            let tv = libc::timeval {
-                tv_sec: self.timeout_secs as i64,
-                tv_usec: 0,
-            };
-            let tv_ret = libc::setsockopt(
-                fd, libc::SOL_SOCKET, libc::SO_RCVTIMEO,
-                &tv as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as u32,
-            );
-            if tv_ret < 0 {
-                libc::close(fd);
-                return Err(Error::from_reason(format!(
-                    "setsockopt(SO_RCVTIMEO) failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            let tv_ret = libc::setsockopt(
-                fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO,
-                &tv as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::timeval>() as u32,
-            );
-            if tv_ret < 0 {
-                libc::close(fd);
-                return Err(Error::from_reason(format!(
-                    "setsockopt(SO_SNDTIMEO) failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+            configure_connected(fd, Some(self.timeout_secs))?;
 
             Ok((fd, self.cid, self.port))
         }
@@ -694,6 +730,121 @@ mod tests {
 
             libc::close(fd);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // I/O timeouts (socketpair stands in for AF_VSOCK: SO_RCVTIMEO/SO_SNDTIMEO behave the same)
+    // -------------------------------------------------------------------------
+
+    fn socketpair() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "socketpair() failed: {}", std::io::Error::last_os_error());
+        (fds[0], fds[1])
+    }
+
+    fn timeout_secs_of(fd: i32, opt: i32) -> libc::time_t {
+        let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+        let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(fd, libc::SOL_SOCKET, opt, &mut tv as *mut _ as *mut libc::c_void, &mut len)
+        };
+        assert_eq!(ret, 0, "getsockopt() failed: {}", std::io::Error::last_os_error());
+        tv.tv_sec
+    }
+
+    #[test]
+    fn set_io_timeouts_sets_rcv_and_snd() {
+        let (a, b) = socketpair();
+        unsafe { set_io_timeouts(a, 3) }.expect("set_io_timeouts");
+        assert_eq!(timeout_secs_of(a, libc::SO_RCVTIMEO), 3);
+        assert_eq!(timeout_secs_of(a, libc::SO_SNDTIMEO), 3);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
+    fn set_io_timeouts_never_sets_zero_which_means_forever() {
+        let (a, b) = socketpair();
+        unsafe { set_io_timeouts(a, 0) }.expect("set_io_timeouts");
+        assert_eq!(timeout_secs_of(a, libc::SO_RCVTIMEO), 1);
+        assert_eq!(timeout_secs_of(a, libc::SO_SNDTIMEO), 1);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
+    fn read_on_idle_socket_returns_within_timeout() {
+        let (a, b) = socketpair();
+        unsafe { set_io_timeouts(a, 1) }.expect("set_io_timeouts");
+        let mut buf = [0u8; 16];
+        let start = std::time::Instant::now();
+        let n = unsafe { libc::read(a, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let err = std::io::Error::last_os_error();
+        let elapsed = start.elapsed();
+        assert_eq!(n, -1, "an idle read must fail, not return data");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock, "expected EAGAIN, got {}", err);
+        assert!(elapsed.as_millis() >= 900, "returned too early: {:?}", elapsed);
+        assert!(elapsed.as_millis() < 2500, "took too long: {:?}", elapsed);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
+    fn configure_connected_defaults_to_30_seconds() {
+        let (a, b) = socketpair();
+        unsafe { configure_connected(a, None) }.expect("configure_connected");
+        assert_eq!(timeout_secs_of(a, libc::SO_RCVTIMEO), DEFAULT_IO_TIMEOUT_SECS as libc::time_t);
+        assert_eq!(timeout_secs_of(a, libc::SO_SNDTIMEO), DEFAULT_IO_TIMEOUT_SECS as libc::time_t);
+        assert_eq!(DEFAULT_IO_TIMEOUT_SECS, 30);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
+    fn configure_connected_uses_the_callers_timeout() {
+        let (a, b) = socketpair();
+        unsafe { configure_connected(a, Some(7)) }.expect("configure_connected");
+        assert_eq!(timeout_secs_of(a, libc::SO_RCVTIMEO), 7);
+        assert_eq!(timeout_secs_of(a, libc::SO_SNDTIMEO), 7);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    #[test]
+    fn configure_accepted_sets_both_directions() {
+        let (a, b) = socketpair();
+        unsafe { configure_accepted(a) }.expect("configure_accepted");
+        assert_eq!(timeout_secs_of(a, libc::SO_RCVTIMEO), ACCEPTED_IO_TIMEOUT_SECS as libc::time_t);
+        assert_eq!(timeout_secs_of(a, libc::SO_SNDTIMEO), ACCEPTED_IO_TIMEOUT_SECS as libc::time_t);
+        assert_eq!(ACCEPTED_IO_TIMEOUT_SECS, 10);
+        unsafe { libc::close(a); libc::close(b); }
+    }
+
+    fn is_open(fd: i32) -> bool {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    fn pipe() -> (i32, i32) {
+        let mut fds = [0i32; 2];
+        let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(ret, 0, "pipe() failed: {}", std::io::Error::last_os_error());
+        (fds[0], fds[1])
+    }
+
+    #[test]
+    fn configure_accepted_closes_the_fd_when_it_cannot_set_timeouts() {
+        // A pipe is not a socket: setsockopt fails (ENOTSOCK), the error names the cause, the fd is closed.
+        let (r, w) = pipe();
+        let result = unsafe { configure_accepted(r) };
+        assert!(result.is_err());
+        assert!(result.unwrap_err().reason.contains("accepted connection"));
+        assert!(!is_open(r), "the fd must be closed");
+        unsafe { libc::close(w); }
+    }
+
+    #[test]
+    fn configure_connected_closes_the_fd_when_it_cannot_set_timeouts() {
+        let (r, w) = pipe();
+        let result = unsafe { configure_connected(r, Some(5)) };
+        assert!(result.is_err());
+        assert!(!is_open(r), "the fd must be closed");
+        unsafe { libc::close(w); }
     }
 
     // -------------------------------------------------------------------------

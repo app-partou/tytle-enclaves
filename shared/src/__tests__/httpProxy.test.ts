@@ -104,6 +104,40 @@ describe('proxyFetchPlain - replies it reads completely (locks)', () => {
   });
 });
 
+describe('the vsock socket of a fetch gets the fetch budget as its read/write timeout', () => {
+  it.each([
+    [5_000, 5],
+    [25_001, 26],
+    [300, 1],
+  ])('a %i ms budget gives a %i s socket timeout', async (budgetMs, secs) => {
+    scripted('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+    await proxyFetchPlain(8445, 'www.sicae.pt', 'GET', '/', {}, undefined, budgetMs);
+    expect(connect).toHaveBeenCalledWith(3, 8445, secs);
+  });
+
+  it('a zero budget still gives a 1 s socket timeout (0 would mean "never" to the kernel)', async () => {
+    scripted('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+    await proxyFetchPlain(8445, 'www.sicae.pt', 'GET', '/', {}, undefined, 0).catch(() => undefined);
+    expect(connect).toHaveBeenCalledWith(3, 8445, 1);
+  });
+
+  it('the TLS path passes the same timeout', async () => {
+    const sock = scripted();
+    tlsConnect.mockImplementation((_opts: unknown, onSecure: () => void) => {
+      const tlsSocket = Object.assign(new EventEmitter(), { write: vi.fn(), destroy: vi.fn() });
+      setImmediate(() => {
+        onSecure();
+        tlsSocket.emit('data', Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'));
+        tlsSocket.emit('end');
+      });
+      return tlsSocket;
+    });
+    await proxyFetch(8443, 'ec.europa.eu', 'POST', '/x', {}, 'b', 25_000);
+    expect(connect).toHaveBeenCalledWith(3, 8443, 25);
+    expect(sock.closed).toBe(false);
+  });
+});
+
 describe('proxyFetchPlain - a reply cut short or out of frame is an error, never a body', () => {
   it('a body shorter than its Content-Length is IncompleteBodyError', async () => {
     scripted('HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n', 'x'.repeat(60));

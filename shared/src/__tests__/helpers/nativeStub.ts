@@ -35,7 +35,7 @@ export class VsockListener {
 }
 
 export class VsockStream {
-  static connect(_cid: number, _port: number): VsockStream {
+  static connect(_cid: number, _port: number, _timeoutSecs?: number | null): VsockStream {
     return notInTests('VsockStream.connect');
   }
   read(_size: number): Buffer {

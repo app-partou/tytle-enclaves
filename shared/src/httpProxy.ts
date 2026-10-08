@@ -23,6 +23,11 @@ export type { HttpResponse } from './httpParse.js';
 /** CID 3 = host parent from inside the enclave */
 const HOST_CID = 3;
 
+/** The socket read/write timeout for a fetch budget: whole seconds, at least 1 (0 means "never" to the kernel). */
+function socketTimeoutSecs(timeoutMs: number): number {
+  return Math.max(1, Math.ceil(timeoutMs / 1000));
+}
+
 /**
  * Per-hostname TLS session cache for session resumption.
  * Avoids a full TLS handshake on subsequent requests to the same host.
@@ -61,8 +66,9 @@ export async function proxyFetch(
     }, timeoutMs);
 
     try {
-      // Step 1: Connect to host's vsock-proxy
-      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
+      // Step 1: Connect to host's vsock-proxy. Every read and write on the socket gives up within the
+      // fetch budget: a proxy that accepts and goes silent must not block libc::read forever.
+      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort, socketTimeoutSecs(timeoutMs));
       duplex = new VsockDuplex(vsockRaw);
 
       // Step 2: TLS handshake over vsock tunnel (with session resumption)
@@ -174,8 +180,8 @@ export async function proxyFetchPlain(
     }, timeoutMs);
 
     try {
-      // Connect to host's vsock-proxy (no TLS — write raw HTTP)
-      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
+      // Connect to host's vsock-proxy (no TLS — write raw HTTP); reads and writes give up within the budget
+      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort, socketTimeoutSecs(timeoutMs));
       duplex = new VsockDuplex(vsockRaw);
 
       // Build and send HTTP request directly over the vsock tunnel
