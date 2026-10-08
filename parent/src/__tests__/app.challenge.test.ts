@@ -65,22 +65,22 @@ describe('POST /attest/fetch and the caller challenge', () => {
   it('forwards the challenge to the enclave and passes its answer back', async () => {
     const conn = enclaveConnection(ANSWER);
     vsockConnectAsync.mockResolvedValue(conn);
-    const res = await post({ id: 'r1', url: 'https://ec.europa.eu/x', method: 'POST', body: '{}', challenge: 'c'.repeat(64) });
+    const res = await post({ id: '7d0f3b2a-1c4e-4f6a-8b9d-0e1f2a3b4c5d', url: 'https://ec.europa.eu/x', method: 'POST', body: '{}', challenge: 'c'.repeat(64) });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual(ANSWER);
-    expect(conn.request()).toEqual({ id: 'r1', url: 'https://ec.europa.eu/x', method: 'POST', headers: {}, body: '{}', challenge: 'c'.repeat(64) });
+    expect(conn.request()).toEqual({ id: '7d0f3b2a-1c4e-4f6a-8b9d-0e1f2a3b4c5d', url: 'https://ec.europa.eu/x', method: 'POST', headers: {}, body: '{}', challenge: 'c'.repeat(64) });
   });
 
   it('without a challenge the enclave request carries none (lock: a caller from before the release)', async () => {
     const conn = enclaveConnection({ success: true, status: 200, headers: {}, rawBody: '' });
     vsockConnectAsync.mockResolvedValue(conn);
-    const res = await post({ id: 'r2', url: 'https://ec.europa.eu/x', method: 'POST', body: '{}' });
+    const res = await post({ id: '8e1a4c3b-2d5f-4a7b-9c0e-1f2a3b4c5d6e', url: 'https://ec.europa.eu/x', method: 'POST', body: '{}' });
     expect(res.status).toBe(200);
-    expect(conn.request()).toEqual({ id: 'r2', url: 'https://ec.europa.eu/x', method: 'POST', headers: {}, body: '{}' });
+    expect(conn.request()).toEqual({ id: '8e1a4c3b-2d5f-4a7b-9c0e-1f2a3b4c5d6e', url: 'https://ec.europa.eu/x', method: 'POST', headers: {}, body: '{}' });
   });
 
   it('a challenge that is not a string is a 400 and the enclave is never called', async () => {
-    const res = await post({ id: 'r3', url: 'https://ec.europa.eu/x', method: 'POST', body: '{}', challenge: 42 });
+    const res = await post({ id: '9f2b5d4c-3e6a-4b8c-8d1f-2a3b4c5d6e7f', url: 'https://ec.europa.eu/x', method: 'POST', body: '{}', challenge: 42 });
     expect(res.status).toBe(400);
     expect(vsockConnectAsync).not.toHaveBeenCalled();
   });
