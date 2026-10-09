@@ -346,3 +346,20 @@ describe('refuses every answer that is not a sealed secret (red)', () => {
     expect(err.message).toMatch(/does not open with this enclave's private key/);
   });
 });
+
+describe('the KMS call and the request budget (D-P1-11)', () => {
+  it('🔴 takes what is left of the request\'s budget, at most 10 s', async () => {
+    kmsSealing(SECRET);
+    const now = Date.now();
+    expect(await unsealSecret(uniqueCiphertext(), 'stripe_payment', CREDENTIALS, ALLOWLIST, { deadlineMs: now + 4_000 })).toBe(SECRET);
+    expect(fakeIo.timeouts(KMS_PORT)).toEqual([4]);
+  });
+
+  it('🔴 a budget already spent: no KMS call', async () => {
+    kmsSealing(SECRET);
+    const err = await refusal(unsealSecret(uniqueCiphertext(), 'stripe_payment', CREDENTIALS, ALLOWLIST, { deadlineMs: Date.now() - 1 }));
+    expect(err.name).toBe('RequestDeadlineError');
+    expect(fakeIo.requests(KMS_PORT)).toEqual([]);
+    expect(fakeIo.nsmAsks).toEqual([]);
+  });
+});

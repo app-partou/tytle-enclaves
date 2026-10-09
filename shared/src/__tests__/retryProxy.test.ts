@@ -185,3 +185,31 @@ describe('proxyFetchWithRetry', () => {
     expect(mockProxyFetch).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('with the request budget (D-P1-11)', () => {
+  it('🔴 each try takes what is left of the budget', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    mockProxyFetch
+      .mockImplementationOnce(async () => { now += 20_000; return makeResponse(503); })
+      .mockResolvedValueOnce(makeResponse(200));
+
+    const res = await proxyFetchWithRetry(8443, 'api.stripe.com', 'GET', '/', {}, undefined, undefined, true, undefined, { deadlineMs: 1_030_000 });
+
+    expect(res.status).toBe(200);
+    expect(mockProxyFetch.mock.calls.map((call) => call[6])).toEqual([25_000, 10_000]);
+    vi.restoreAllMocks();
+  });
+
+  it('🔴 no pause and no try the budget cannot hold: the last answer stands', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    mockProxyFetch.mockImplementationOnce(async () => { now += 29_800; return makeResponse(503); });
+
+    const res = await proxyFetchWithRetry(8443, 'api.stripe.com', 'GET', '/', {}, undefined, undefined, true, undefined, { deadlineMs: 1_030_000 });
+
+    expect(res.status).toBe(503);
+    expect(mockProxyFetch).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
+  });
+});

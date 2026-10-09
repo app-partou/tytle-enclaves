@@ -100,11 +100,41 @@ describe('startEnclave', () => {
     const conn = new ScriptedConnection(frame(REQUEST), 65536);
     pending.push(conn);
     const answer: EnclaveResponse = { success: true, status: 200, headers: {}, rawBody: 'ok' };
-    const handler = vi.fn(async () => answer);
+    const handler = vi.fn(async (_request: EnclaveRequest, _budget?: unknown) => answer);
     startEnclave({ name: 'test-request', hosts: [], customHandler: handler });
     await conn.done;
-    expect(handler).toHaveBeenCalledWith(REQUEST);
+    expect(handler.mock.calls[0]?.[0]).toEqual(REQUEST);
     expect(conn.reply()).toEqual(answer);
+  });
+
+  it('🔴 the handler gets the request\'s budget: 30 s from the accept (D-P1-11)', async () => {
+    let now = 5_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const conn = new ScriptedConnection(frame(REQUEST), 65536, () => { now += 1_000; });
+    pending.push(conn);
+    const handler = vi.fn(async (_request: EnclaveRequest, _budget?: unknown): Promise<EnclaveResponse> => ({ success: true, status: 200, headers: {}, rawBody: '' }));
+    startEnclave({ name: 'test-budget', hosts: [], customHandler: handler });
+    await conn.done;
+    // Counted from the accept, before the request was read (the read moved the clock): the read is inside it.
+    expect(handler.mock.calls[0]?.[1]).toEqual({ deadlineMs: 5_000_000 + 30_000 });
+  });
+
+  it('🔴 a handler with no answer 2 s after its budget: the parent gets a 504 then, not after 60 s (D-P1-11)', async () => {
+    vi.useFakeTimers({ now: 6_000_000 });
+    try {
+      const conn = new ScriptedConnection(frame(REQUEST), 65536);
+      pending.push(conn);
+      const handler = vi.fn((): Promise<EnclaveResponse> => new Promise(() => {}));
+      startEnclave({ name: 'test-overrun', hosts: [], customHandler: handler });
+      await vi.advanceTimersByTimeAsync(31_900);
+      expect(conn.written).toEqual([]);
+      await vi.advanceTimersByTimeAsync(200);
+      await conn.done;
+      expect(conn.reply()).toMatchObject({ success: false, status: 504 });
+      expect((conn.reply() as EnclaveResponse).error).toMatch(/budget was spent before the answer/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a peer that trickles its request past 10 s is cut off: an error answer, the handler never called', async () => {

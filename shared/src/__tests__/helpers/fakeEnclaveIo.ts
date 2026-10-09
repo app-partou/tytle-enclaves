@@ -21,6 +21,8 @@ import { createFakeNsm } from './fakeNsm.js';
 interface Exchange {
   port: number;
   written: Buffer[];
+  /** The socket read/write timeout the enclave asked for at connect, in whole seconds (httpProxy.ts) */
+  timeoutSecs: number | undefined;
 }
 
 /** Raw HTTP/1.1 reply text, or a fake server: the reply as a function of the raw request written. */
@@ -77,10 +79,10 @@ export const nativeModule = {
     return raw;
   },
   VsockStream: {
-    connect(cid: number, port: number): FakeVsock {
+    connect(cid: number, port: number, timeoutSecs?: number): FakeVsock {
       if (cid !== 3) throw new Error(`unexpected CID ${cid}`);
       const raw = nextReply(port);
-      const exchange: Exchange = { port, written: [] };
+      const exchange: Exchange = { port, written: [], timeoutSecs };
       exchanges.push(exchange);
       const sock = new FakeVsock(exchange, raw, PLAIN_PORTS.has(port));
       if (!PLAIN_PORTS.has(port)) pendingTlsReply.set(sock, { exchange, raw });
@@ -137,6 +139,10 @@ export const fakeIo = {
   /** The raw requests written to `port`, in order. */
   requests(port: number): string[] {
     return exchanges.filter((e) => e.port === port).map((e) => Buffer.concat(e.written).toString('utf-8'));
+  },
+  /** The socket timeout (whole seconds) of each connect to `port`, in order: what each read was given. */
+  timeouts(port: number): Array<number | undefined> {
+    return exchanges.filter((e) => e.port === port).map((e) => e.timeoutSecs);
   },
   /** What the enclave asked the NSM to sign, in order. */
   get nsmAsks() {

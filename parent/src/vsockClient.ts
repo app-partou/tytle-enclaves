@@ -14,18 +14,26 @@ import { readMessage, writeMessage } from '@tytle-enclaves/shared';
 import type { EnclaveRequest, EnclaveResponse } from './types.js';
 
 /**
+ * How long the parent waits for an enclave's answer (enclave audit F6; D-P1-11 "A", LJ 2026-10-08): longer than the
+ * enclave's own budget for a request (30 s from accept, plus 2 s to hand over an answer on its way; shared
+ * requestBudget.ts), shorter than data-bridge's 45 s for a whole call. It was 30 s while the enclave allowed a handler
+ * 60 s, so the parent gave up on answers the enclave went on to produce.
+ */
+export const ENCLAVE_ANSWER_BUDGET_MS = 35_000;
+
+/**
  * Send a request to an enclave via vsock and return the response.
  *
  * @param cid - Enclave CID (e.g., 16 for VIES)
  * @param port - Enclave vsock port (e.g., 5000)
  * @param request - Request to forward
- * @param timeoutMs - Timeout in ms (default 30000)
+ * @param timeoutMs - Timeout in ms (default ENCLAVE_ANSWER_BUDGET_MS, 35 s)
  */
 export async function sendToEnclave(
   cid: number,
   port: number,
   request: EnclaveRequest,
-  timeoutMs: number = 30_000,
+  timeoutMs: number = ENCLAVE_ANSWER_BUDGET_MS,
 ): Promise<EnclaveResponse> {
   // Reads are blocking libc calls: withTimeout's timer cannot fire while one waits, and a peer that
   // sends one byte at a time resets the socket's per-read timeout. The deadline bounds the whole answer.

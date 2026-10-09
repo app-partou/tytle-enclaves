@@ -9,16 +9,19 @@
 
 import { proxyFetch, proxyFetchPlain } from './httpProxy.js';
 import { assertChallenge, attest } from './attestor.js';
+import { DEFAULT_FETCH_TIMEOUT_MS, RequestDeadlineError, requestBudget, timeFor, type RequestBudget } from './requestBudget.js';
 import type { EnclaveConfig, EnclaveRequest, EnclaveResponse } from './types.js';
 
 /**
  * Create a request handler bound to a specific enclave config.
- * The returned function validates URLs against the config's allowlist.
+ * The returned function validates URLs against the config's allowlist. The upstream read takes what is left of the
+ * request's `budget` (requestBudget.ts); spent before the read or before the attestation, the answer is 504 and no
+ * document is minted.
  */
 export function createRequestHandler(
   config: EnclaveConfig,
-): (request: EnclaveRequest) => Promise<EnclaveResponse> {
-  return async (request: EnclaveRequest): Promise<EnclaveResponse> => {
+): (request: EnclaveRequest, budget?: RequestBudget) => Promise<EnclaveResponse> {
+  return async (request: EnclaveRequest, budget: RequestBudget = requestBudget(Date.now())): Promise<EnclaveResponse> => {
     try {
       assertChallenge(request.challenge);
     } catch (err: unknown) {
@@ -51,8 +54,10 @@ export function createRequestHandler(
         path,
         request.headers,
         request.body,
+        timeFor(budget, `the read of ${hostname}`, DEFAULT_FETCH_TIMEOUT_MS),
       );
 
+      timeFor(budget, 'the attestation');
       const attestation = await attest(
         apiEndpoint,
         request.method,
@@ -74,7 +79,7 @@ export function createRequestHandler(
       console.error(`[enclave:${config.name}] Request error: ${msg}`);
       return {
         success: false,
-        status: 502,
+        status: err instanceof RequestDeadlineError ? 504 : 502,
         headers: {},
         rawBody: '',
         error: msg,

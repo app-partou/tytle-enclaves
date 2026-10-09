@@ -295,3 +295,53 @@ describe('manifest (lock)', () => {
     expect(HANDLER_MANIFEST.schema.outputBytes).toBe(SICAE_SCHEMA.length * 32);
   });
 });
+
+describe('the request budget (D-P1-11): every read takes what is left of 30 s from the accept', () => {
+  const searchPage = () => httpReply(200, SEARCH_PAGE, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Set-Cookie': `ASP.NET_SessionId=${SESSION}; path=/; HttpOnly`,
+  });
+  const ask = (budget: { deadlineMs: number }) =>
+    handler({ id: 'req-1', url: 'http://www.sicae.pt/Consulta.aspx', method: 'POST', headers: {}, body: JSON.stringify({ nif: '503504564' }) }, budget);
+
+  it('🔴 the form post after a 20 s search page gets the 10 s that are left, not 25 s', async () => {
+    let now = Date.now();
+    const start = now;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    fakeIo.reply(PORT, () => { now += 20_000; return searchPage(); });
+    fakeIo.reply(PORT, html(FOUND));
+
+    const res = await ask({ deadlineMs: start + 30_000 });
+
+    expect(res).toMatchObject({ success: true, status: 200 });
+    expect(fakeIo.timeouts(PORT)).toEqual([25, 10]);
+  });
+
+  it('🔴 a form post that ends after the budget: no document is minted, 504', async () => {
+    let now = Date.now();
+    const start = now;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    fakeIo.reply(PORT, () => { now += 20_000; return searchPage(); });
+    fakeIo.reply(PORT, () => { now += 10_001; return html(FOUND); });
+
+    const res = await ask({ deadlineMs: start + 30_000 });
+
+    expect(res).toMatchObject({ success: false, status: 504 });
+    expect(posts()).toHaveLength(1);
+    expect(fakeIo.nsmAsks).toEqual([]);
+  });
+
+  it('🔴 a search page that used the whole budget: no form post, no document, 504', async () => {
+    let now = Date.now();
+    const start = now;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    fakeIo.reply(PORT, () => { now += 30_000; return searchPage(); });
+    fakeIo.reply(PORT, html(FOUND));
+
+    const res = await ask({ deadlineMs: start + 30_000 });
+
+    expect(res).toMatchObject({ success: false, status: 504 });
+    expect(posts()).toEqual([]);
+    expect(fakeIo.nsmAsks).toEqual([]);
+  });
+});

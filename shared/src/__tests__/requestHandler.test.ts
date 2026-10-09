@@ -68,3 +68,44 @@ describe('createRequestHandler and the caller challenge', () => {
     expect(fake.current!.asks).toHaveLength(0);
   });
 });
+
+describe('createRequestHandler and the request budget (D-P1-11)', () => {
+  it('🔴 the read takes what is left of the budget', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(3_000_000);
+    upstreamReplies('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+    const res = await handler(REQUEST, { deadlineMs: 3_000_000 + 12_000 });
+    expect(res.success).toBe(true);
+    expect(connect.mock.calls[0]?.[2]).toBe(12);
+    vi.restoreAllMocks();
+  });
+
+  it('🔴 a read that ends after the budget: 504, no document', async () => {
+    let now = 3_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    let sent = false;
+    connect.mockReturnValue({
+      read: () => {
+        if (sent) return Buffer.alloc(0);
+        sent = true;
+        now += 12_001;
+        return Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok', 'utf-8');
+      },
+      write: (d: Buffer) => d.length,
+      close: () => {},
+    });
+    const res = await handler(REQUEST, { deadlineMs: 3_000_000 + 12_000 });
+    expect(res).toMatchObject({ success: false, status: 504 });
+    expect(fake.current!.asks).toEqual([]);
+    vi.restoreAllMocks();
+  });
+
+  it('🔴 a budget spent before the read: 504, no read, no document', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(3_000_000);
+    upstreamReplies('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+    const res = await handler(REQUEST, { deadlineMs: 3_000_000 });
+    expect(res).toMatchObject({ success: false, status: 504 });
+    expect(connect).not.toHaveBeenCalled();
+    expect(fake.current!.asks).toEqual([]);
+    vi.restoreAllMocks();
+  });
+});

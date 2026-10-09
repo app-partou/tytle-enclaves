@@ -17,6 +17,7 @@ import { Duplex } from 'node:stream';
 import { VsockStream } from '@tytle-enclaves/native';
 import { VsockDuplex } from './vsockStream.js';
 import { ResponseCollector, type HttpResponse } from './httpParse.js';
+import { DEFAULT_FETCH_TIMEOUT_MS } from './requestBudget.js';
 
 export type { HttpResponse } from './httpParse.js';
 
@@ -45,7 +46,7 @@ const tlsSessionCache = new Map<string, Buffer>();
  * @param path - Request path (e.g., /taxation_customs/vies/services/checkVatService)
  * @param headers - HTTP headers
  * @param body - Optional request body
- * @param timeoutMs - Timeout in ms (default 25000)
+ * @param timeoutMs - Timeout in ms (default DEFAULT_FETCH_TIMEOUT_MS, 25 s)
  */
 export async function proxyFetch(
   vsockPort: number,
@@ -54,7 +55,7 @@ export async function proxyFetch(
   path: string,
   headers: Record<string, string>,
   body?: string,
-  timeoutMs: number = 25_000,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
 ): Promise<HttpResponse> {
   return new Promise<HttpResponse>((resolve, reject) => {
     let duplex: VsockDuplex | null = null;
@@ -168,7 +169,7 @@ export async function proxyFetchPlain(
   path: string,
   headers: Record<string, string>,
   body?: string,
-  timeoutMs: number = 25_000,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
 ): Promise<HttpResponse> {
   return new Promise<HttpResponse>((resolve, reject) => {
     let duplex: VsockDuplex | null = null;

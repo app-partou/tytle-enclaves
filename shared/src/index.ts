@@ -39,6 +39,8 @@ export { proxyFetchWithRetry } from './retryProxy.js';
 export type { RetryConfig } from './retryProxy.js';
 export { shouldSkipAttestation, getAttestOverrides, getHeadersToStrip, redactError } from './policyEngine.js';
 export { createHandler } from './handlerFactory.js';
+export { REQUEST_BUDGET_MS, ANSWER_GRACE_MS, DEFAULT_FETCH_TIMEOUT_MS, RequestDeadlineError, requestBudget, timeFor } from './requestBudget.js';
+export type { RequestBudget } from './requestBudget.js';
 export type { HandlerDef, HandlerResult, HandlerContext } from './handlerFactory.js';
 export { readMessage, writeMessage, ReadDeadlineError } from './protocol.js';
 export type { MessageStream, ReadOptions } from './protocol.js';

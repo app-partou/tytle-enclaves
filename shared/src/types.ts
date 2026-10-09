@@ -1,4 +1,5 @@
 import type { AwsCredentials } from './sigv4.js';
+import type { RequestBudget } from './requestBudget.js';
 
 /** Allowlisted host entry with its vsock-proxy port. */
 export interface AllowedHost {
@@ -14,8 +15,11 @@ export interface EnclaveConfig {
   name: string;
   /** Hosts this enclave is allowed to call. Baked into the image → reflected in PCR0. */
   hosts: AllowedHost[];
-  /** Override the generic proxy handler with a custom request handler. */
-  customHandler?: (request: EnclaveRequest) => Promise<EnclaveResponse>;
+  /**
+   * Override the generic proxy handler with a custom request handler. `budget` is the request's (requestBudget.ts):
+   * startEnclave starts it when it accepts the connection.
+   */
+  customHandler?: (request: EnclaveRequest, budget: RequestBudget) => Promise<EnclaveResponse>;
 }
 
 /** Request from parent server to enclave via vsock. */

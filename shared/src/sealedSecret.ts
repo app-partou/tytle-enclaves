@@ -17,6 +17,7 @@ import crypto from 'node:crypto';
 import { recipientAttestation } from './attestor.js';
 import { openEnvelopedData } from './cms.js';
 import { proxyFetch } from './httpProxy.js';
+import { timeFor, type RequestBudget } from './requestBudget.js';
 import { signRequest, type AwsCredentials } from './sigv4.js';
 import type { AllowedHost } from './types.js';
 
@@ -128,10 +129,11 @@ function kmsHostOf(allowlist: readonly AllowedHost[]): AllowedHost {
 
 /**
  * The secret `ciphertext` (base64, as `aws kms encrypt` gives it) holds, sealed for the enclave named `context`.
- * `credentials` are the host role's, from the parent (EnclaveRequest.awsCredentials); `allowlist` is the enclave's own.
+ * `credentials` are the host role's, from the parent (EnclaveRequest.awsCredentials); `allowlist` is the enclave's own;
+ * `budget` is the request's (requestBudget.ts): the KMS call takes what is left of it.
  */
 export async function unsealSecret(
-  ciphertext: string, context: string, credentials: unknown, allowlist: readonly AllowedHost[],
+  ciphertext: string, context: string, credentials: unknown, allowlist: readonly AllowedHost[], budget?: RequestBudget,
 ): Promise<string> {
   if (!CONTEXT_PATTERN.test(context)) throw new SealedSecretError('INVALID_SEALED_SECRET', `"${context}" is not an enclave name`);
   if (!isSealedSecretText(ciphertext)) {
@@ -143,6 +145,9 @@ export async function unsealSecret(
   const kept = opened.get(cacheKey);
   if (kept && kept.expiresAt > Date.now()) return kept.secret;
 
+  // The KMS call takes what is left of the request's budget, at most KMS_TIMEOUT_MS (requestBudget.ts); with nothing
+  // left, neither the recipient document nor the call is made
+  const kmsTimeoutMs = budget ? timeFor(budget, 'the KMS call', KMS_TIMEOUT_MS) : KMS_TIMEOUT_MS;
   const signer = credentialsOf(credentials);
   const { publicKey, privateKey } = recipientKeyPair();
   const document = recipientAttestation(publicKey.export({ type: 'spki', format: 'der' }));
@@ -163,7 +168,7 @@ export async function unsealSecret(
   );
   // proxyFetch writes the Host header itself (the same value): sent twice, it would be a malformed request
   const headers = Object.fromEntries(Object.entries(signed).filter(([name]) => name !== 'host'));
-  const response = await proxyFetch(kms.vsockProxyPort, kms.hostname, 'POST', '/', headers, body, KMS_TIMEOUT_MS);
+  const response = await proxyFetch(kms.vsockProxyPort, kms.hostname, 'POST', '/', headers, body, kmsTimeoutMs);
   const secret = secretOf(response.status, response.body, privateKey);
 
   // An expired copy of this secret leaves first; then, at the limit, the oldest secret kept

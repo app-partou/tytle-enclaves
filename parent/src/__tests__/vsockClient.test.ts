@@ -54,8 +54,19 @@ describe('sendToEnclave', () => {
     const conn = enclaveAnswering(frame(answer), 65536);
     vsockConnectAsync.mockResolvedValue(conn);
     await expect(sendToEnclave(16, 5000, REQUEST)).resolves.toEqual(answer);
-    expect(vsockConnectAsync).toHaveBeenCalledWith(16, 5000, 30);
     expect(conn.closed).toBe(true);
+  });
+
+  it('🔴 waits 35 s by default (D-P1-11): longer than the enclave\'s 30 s budget and its 2 s to hand over an answer', async () => {
+    let now = 7_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const answer = { success: true, status: 200, headers: {}, rawBody: 'ok' };
+    // The enclave answers 32 s after the request (its first read returns at t+32 s).
+    let reads = 0;
+    const conn = enclaveAnswering(frame(answer), 65536, () => { if (reads++ === 0) now += 32_000; });
+    vsockConnectAsync.mockResolvedValue(conn);
+    await expect(sendToEnclave(16, 5000, REQUEST)).resolves.toEqual(answer);
+    expect(vsockConnectAsync).toHaveBeenCalledWith(16, 5000, 35);
   });
 
   it('an answer trickled past the budget is an error, not a late answer', async () => {
