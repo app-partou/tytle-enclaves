@@ -818,8 +818,17 @@ mod tests {
         unsafe { libc::close(a); libc::close(b); }
     }
 
-    fn is_open(fd: i32) -> bool {
-        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    /// The pipe whose write end is `w` still has a reader: once every read end is closed, a write fails with EPIPE (the
+    /// test harness ignores SIGPIPE, as every Rust program does). A check on the read end's fd NUMBER failed in CI: a
+    /// test on another thread opened a file that took the freed number.
+    fn has_reader(w: i32) -> bool {
+        let n = unsafe { libc::write(w, b"x".as_ptr() as *const libc::c_void, 1) };
+        if n == 1 {
+            return true;
+        }
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::EPIPE), "write to the pipe: {}", err);
+        false
     }
 
     fn pipe() -> (i32, i32) {
@@ -836,7 +845,7 @@ mod tests {
         let result = unsafe { configure_accepted(r) };
         assert!(result.is_err());
         assert!(result.unwrap_err().reason.contains("accepted connection"));
-        assert!(!is_open(r), "the fd must be closed");
+        assert!(!has_reader(w), "the fd must be closed");
         unsafe { libc::close(w); }
     }
 
@@ -845,7 +854,7 @@ mod tests {
         let (r, w) = pipe();
         let result = unsafe { configure_connected(r, Some(5)) };
         assert!(result.is_err());
-        assert!(!is_open(r), "the fd must be closed");
+        assert!(!has_reader(w), "the fd must be closed");
         unsafe { libc::close(w); }
     }
 
