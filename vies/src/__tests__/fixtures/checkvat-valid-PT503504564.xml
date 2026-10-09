@@ -1,0 +1,3 @@
+<env:Envelope xmlns:env="http://schemas.xmlsoap.org/soap/envelope/"><env:Header/><env:Body><ns2:checkVatResponse xmlns:ns2="urn:ec.europa.eu:taxud:vies:services:checkVat:types"><ns2:countryCode>PT</ns2:countryCode><ns2:vatNumber>503504564</ns2:vatNumber><ns2:requestDate>2026-10-08+02:00</ns2:requestDate><ns2:valid>true</ns2:valid><ns2:name>EDP COMERCIAL - COMERCIALIZAÇÃO DE ENERGIA S A</ns2:name><ns2:address>AV 24 DE JULHO N 12
+LISBOA
+1249-300 LISBOA</ns2:address></ns2:checkVatResponse></env:Body></env:Envelope>

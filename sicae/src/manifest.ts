@@ -43,7 +43,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
 
   schema: {
     name: 'SICAE_SCHEMA',
-    outputBytes: 192,
+    outputBytes: 256,
     fields: [
       { name: 'nif',       encoding: 'shortString', source: { from: 'request', param: 'nif' } },
       { name: 'name',      encoding: 'sha256',      source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'officialName' } },
@@ -51,6 +51,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       { name: 'cae1Desc',  encoding: 'sha256',      source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'primaryCAE.description' } },
       { name: 'cae2Code',  encoding: 'shortString', source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'secondaryCAE[0].code' } },
       { name: 'cae2Desc',  encoding: 'sha256',      source: { from: 'parsed', query: 'sicae_post', parser: 'html_grid', field: 'secondaryCAE[0].description' } },
+      { name: 'dataHash',  encoding: 'sha256',      source: { from: 'derived', inputs: ['sicae_post:rawBody'], join: '', transform: 'sha256' } },
+      { name: 'transport', encoding: 'shortString', source: { from: 'host', host: 'www.sicae.pt', property: 'tls' } },
     ],
   },
 
@@ -72,30 +74,40 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'form_variant_fallback',
-      check: { type: 'behavioral', description: 'Tries multiple ASP.NET form field names until one returns results' },
+      check: { type: 'behavioral', description: 'Tries the next ASP.NET form variant only while SICAE processed none (no results grid, no error label, or a non-200)' },
       reason: 'SICAE has changed form field names over time; handler supports both variants',
     },
     {
       id: 'not_found',
       check: { type: 'status_attest', code: 404, overrides: {} },
-      reason: 'NIF not found or no CAE data is a valid, attestable answer (success: true, status: 404)',
+      reason: 'SICAE\'s own "no data" row or its "NIPC not valid" refusal is a definitive answer, attested (success: true, status: 404; nif set, every other field null)',
+    },
+    {
+      id: 'no_data_row',
+      check: { type: 'field_matches', path: 'responseBody', pattern: 'Não existem dados para o critério de pesquisa indicado\\.' },
+      reason: 'The results grid\'s only row, with this exact text as its only text, is SICAE saying it holds nothing for the number (not_found)',
     },
     {
       id: 'html_error_detection',
-      check: { type: 'field_matches', path: 'responseBody', pattern: 'ClassErro' },
-      reason: 'HTML responses containing ClassErro indicate validation errors (treated as not found)',
+      check: { type: 'field_matches', path: 'responseBody', pattern: "O campo 'NIPC' não é válido" },
+      reason: 'Only this exact text in SICAE\'s error label (class ClassErro), with no results grid, is not_found; any other error text throws 502',
+    },
+    {
+      id: 'parse_miss_is_error',
+      check: { type: 'behavioral', description: 'A results grid or error label the handler cannot read, a results row for another NIPC, or no form variant processed throws 502 - never not_found' },
+      reason: 'A page that is not one of SICAE\'s known answers is no answer (audit 2026-10 P1.4)',
     },
     {
       id: 'http_transport',
-      check: { type: 'behavioral', description: 'Uses HTTP (no TLS) — www.sicae.pt does not support HTTPS' },
-      reason: 'Data is public and cross-referenced; host cannot forge NSM attestation',
+      check: { type: 'behavioral', description: 'Uses HTTP (no TLS) - www.sicae.pt does not support HTTPS; the signed vector says so (transport = \'http\')' },
+      reason: 'The host relays plaintext and could change the page before the enclave reads it: the answer records which code read which page (dataHash), never that the page is genuine (audit P1.5, D-P1-1)',
     },
   ],
 
   repeatability: {
-    hashAlgorithm: null,
-    dataHashInput: null,
-    outputFormat: 'BN254 big-endian, 6 × 32 bytes, base64',
+    hashAlgorithm: 'sha256',
+    dataHashInput: 'sicae_post:rawBody - the page the answer was read from, UTF-8',
+    outputFormat: 'BN254 big-endian, 8 × 32 bytes, base64',
     deterministic: true,
   },
 };

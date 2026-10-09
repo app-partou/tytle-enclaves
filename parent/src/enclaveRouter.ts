@@ -46,16 +46,27 @@ const ROUTES: EnclaveRoute[] = [
   },
 ];
 
-// monerium-payment enclave is opt-in: the deploy workflow does not currently
-// build or launch it on staging/prod, so it must not be in the default route
-// list. When the infra is ready, set MONERIUM_PAYMENT_CID in the systemd
-// unit env (alongside VIES_CID, SICAE_CID, STRIPE_PAYMENT_CID) to enable it.
+// monerium-payment (CID 19) is routed only when the host's parent unit names
+// MONERIUM_PAYMENT_CID. The main repo's service registry
+// (infra/lib/enclaveServices.ts) sets it on exactly the hosts that launch the
+// enclave, so /health never waits for an enclave the host does not run.
 if (process.env.MONERIUM_PAYMENT_CID) {
   ROUTES.push({
     cid: parseInt(process.env.MONERIUM_PAYMENT_CID, 10),
     port: 5000,
     hosts: ['api.monerium.app'],
   });
+}
+
+/**
+ * The enclaves that open secrets sealed to them with KMS (enclave audit P1.7): only these get the host role's AWS
+ * credentials with a request, to sign their KMS Decrypt. Every other enclave never sees them. Stripe's allowlist names
+ * KMS for this; an enclave added here must name it too.
+ */
+const SEALED_SECRET_CIDS: ReadonlySet<number> = new Set([STRIPE_PAYMENT_CID]);
+
+export function opensSealedSecrets(route: EnclaveRoute): boolean {
+  return SEALED_SECRET_CIDS.has(route.cid);
 }
 
 /**

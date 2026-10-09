@@ -7,11 +7,14 @@ Each service directory contains a thin config that defines which API hosts the e
 ## Architecture
 
 ```
-Fargate (ai-agent-server)
-    |  POST /attest/fetch {url, method, headers, body}
+Fargate (data-bridge)
+    |  POST /attest/fetch {id, url, method, headers, body, challenge}   (JSON, at most 64 KB)
+    |  GET /health -> {healthy, enclaves, proxies}                     (503 when an enclave does not answer)
+    |  Authorization: Bearer <ENCLAVE_PARENT_AUTH_TOKEN>                (when the parent has one; not on /health)
     v
 Parent Server (EC2 host, port 5001)     <- generic router
     |  vsock (CID 16, port 5000)
+    |  + the host role's AWS credentials (IMDSv2), only to an enclave that opens sealed secrets (Stripe)
     v
 Nitro Enclave                            <- this repo
     |  1. Validate URL against allowlist
@@ -52,7 +55,7 @@ startEnclave({
 });
 ```
 
-Copy `vies/Dockerfile` as a starting point, update paths from `vies/` to your service name.
+Copy `vies/Dockerfile` as a starting point, update paths from `vies/` to your service name. Then add the service to every per-service list - the verify CLI's `VALID_SERVICES`, `scripts/rotate-pcr0.sh` and `scripts/test-determinism.sh`; `verify/src/__tests__/services.drift.test.ts` fails until each names it.
 
 ### HTTP-Only Hosts
 
@@ -64,43 +67,30 @@ Set `tls: false` on an `AllowedHost` to skip TLS and send plain HTTP over the vs
 |----------|------|-------|----------------|------------------|
 | CID | 16 | 17 | 18 | 19 |
 | ECR tag | `vies` | `sicae` | `stripe-payment` | `monerium-payment` |
-| PCR0 SSM | `/tytle/{env}/enclave/vies/pcr0` | `/tytle/{env}/enclave/sicae/pcr0` | `/tytle/{env}/enclave/stripe/pcr0` | `/tytle/{env}/enclave/monerium/pcr0` |
-| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `www.sicae.pt` | `api.stripe.com` | `api.monerium.app`, `rpc.gnosischain.com` |
+| PCR0 SSM | `/tytle/{env}/enclave/vies/pcr0` | `/tytle/{env}/enclave/sicae/pcr0` | `/tytle/{env}/enclave/stripe_payment/pcr0` | `/tytle/{env}/enclave/monerium_payment/pcr0` |
+| URL allowlist | `ec.europa.eu`, `api.service.hmrc.gov.uk` | `www.sicae.pt` | `api.stripe.com`, `kms.eu-central-1.amazonaws.com` (to open a sealed key: SECURITY.md, Sealed Secrets) | `api.monerium.app`, `rpc.gnosischain.com` |
 | Transport | HTTPS (TLS) | HTTP (plain) | HTTPS (TLS) | HTTPS (TLS) |
-| vsock-proxy ports | 8443, 8444 | 8445 | 8446 | 8447, 8448 |
+| vsock-proxy ports | 8443, 8444 | 8445 | 8446, 8000 | 8447, 8448 |
 
 Each enclave image contains ONLY shared core + its service config. PCR0 proves exactly which code ran. A VIES attestation's PCR0 can only match the VIES enclave image.
 
 ## Building
 
-### VIES Enclave
+Every image is built by ONE recipe, `scripts/lib/recipe.sh`, with the values of `scripts/build-recipe.json`: linux/amd64; a fixed `SOURCE_DATE_EPOCH=1767225600` (2026-01-01T00:00:00Z), so an image - and its PCR0 - changes only when what goes into it changes; and BuildKit `moby/buildkit:v0.27.1@sha256:1e110c71d389d6d24f67b9438e2f7b8da749a6ff407b22a1631e025c95599368`, run as its own docker-container builder. The image goes to a docker tarball (`type=docker,dest=...,rewrite-timestamp=true`) and is then loaded into Docker.
 
 ```bash
-cd vies
-./build.sh [tag] [ecr-uri]
-
-# Or manually:
-SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct) \
-docker buildx build \
-  --output type=docker,rewrite-timestamp=true \
-  --platform linux/amd64 \
-  -t tytle-enclave-vies:latest \
-  -f Dockerfile ..
+cd vies && ./build.sh [tag] [ecr-uri]                    # each service: vies, sicae, stripe-payment, monerium-payment, parent
+./scripts/test-determinism.sh [service]                  # build twice, compare, check scripts/expected-digests.json
+./scripts/test-determinism.sh --update [service]         # record a meant change, then commit the file
+./scripts/rotate-pcr0.sh <service|all>                   # the PCR0 of a build and the published one
+./scripts/build-eif.sh <enclave> <out-dir>               # its EIF + measurements, written only if it is the record
+EIF_SIGNING_KEY=key.pem EIF_SIGNING_CERT=cert.pem \
+  ./scripts/build-eif.sh <enclave> <out-dir>             # the same EIF, signed: it adds PCR8
 ```
 
-### SICAE Enclave
+The scripts need Docker with buildx, and Node.js (the recipe reads its values with it). The verify CLI rebuilds with the same values (`verify/src/lib/buildRecipe.ts`).
 
-```bash
-cd sicae
-./build.sh [tag] [ecr-uri]
-```
-
-### Parent Server
-
-```bash
-cd parent
-docker build -t tytle-enclave-parent:latest .
-```
+A signed EIF carries PCR8, its signing certificate's, and every other PCR of the unsigned build (SECURITY.md, Operator Binding). The certificate must be EC P-384, the key's own, and valid for 60 more days at least: an EIF whose certificate has expired does not start. CI signs each enclave's EIF with a throwaway certificate on every pull request (`scripts/ci/test-signing.sh`).
 
 ## Handler Manifests
 
@@ -108,7 +98,7 @@ See [MANIFESTS.md](MANIFESTS.md) for the manifest framework — canonical query 
 
 ## Verification
 
-See [VERIFICATION.md](VERIFICATION.md) for how to reproduce PCR0 and verify attestations.
+See [VERIFICATION.md](VERIFICATION.md) for how to reproduce PCR0 and verify attestations: who gets which attestation document, and which checks each allows. The `verify/` CLI runs every check end to end; it is not on npm yet, so build it from `verify/` (`npm ci && npm run build`, then `node dist/cli.js`).
 
 ## Security
 

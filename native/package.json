@@ -12,8 +12,8 @@
     }
   },
   "scripts": {
-    "build": "napi build --platform --release",
-    "build:debug": "napi build --platform"
+    "build": "cargo fetch --locked && napi build --platform --release --cargo-flags=--locked",
+    "build:debug": "cargo fetch --locked && napi build --platform --cargo-flags=--locked"
   },
   "devDependencies": {
     "@napi-rs/cli": "2.18.4"

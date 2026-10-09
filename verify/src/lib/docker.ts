@@ -1,6 +1,6 @@
 /**
- * Docker build orchestration for reproducible enclave builds.
- * Mirrors the pattern from vies/build.sh, sicae/build.sh, stripe-payment/build.sh.
+ * Docker build orchestration for reproducible enclave builds: the build recipe of scripts/lib/recipe.sh (every
+ * service's build.sh, the determinism gate, CI), with the values of ./buildRecipe.ts.
  *
  * SECURITY: All shell commands use execFileSync with argument arrays (not string interpolation)
  * to prevent command injection from user-provided or API-provided inputs.
@@ -11,11 +11,8 @@ import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ServiceName } from './types.js';
-import {
-  validateCommitHash,
-  validateRepoUrl,
-  validateSourceDateEpoch,
-} from './validation.js';
+import { validateCommitHash, validateRepoUrl } from './validation.js';
+import { BUILD_RECIPE, BUILDER_NAME, assertCommitRecipe, configDigestOf } from './buildRecipe.js';
 import * as report from './report.js';
 
 /**
@@ -31,7 +28,7 @@ export function checkDocker(): boolean {
 }
 
 /**
- * Check that Docker buildx is available (needed for --output rewrite-timestamp).
+ * Check that Docker buildx is available (the recipe builds on its own docker-container builder).
  */
 export function checkBuildx(): boolean {
   try {
@@ -44,9 +41,30 @@ export function checkBuildx(): boolean {
 
 export interface BuildResult {
   imageTag: string;
+  /** The image's config digest (sha256:...), read from the tarball: the same on every Docker image store. */
   imageDigest: string;
   repoDir: string;
   tempDir?: string;
+}
+
+/**
+ * The pinned BuildKit's builder, made on first use. It is never made the default builder: the user's own builds
+ * stay on theirs.
+ */
+export function ensureBuilder(): void {
+  try {
+    execFileSync('docker', ['buildx', 'inspect', BUILDER_NAME], { stdio: 'pipe' });
+    return;
+  } catch {
+    // Not made yet
+  }
+  report.info(`Creating the builder ${BUILDER_NAME} (${BUILD_RECIPE.buildkitImage})...`);
+  execFileSync('docker', [
+    'buildx', 'create',
+    '--name', BUILDER_NAME,
+    '--driver', 'docker-container',
+    '--driver-opt', `image=${BUILD_RECIPE.buildkitImage}`,
+  ], { stdio: 'pipe' });
 }
 
 /**
@@ -112,39 +130,50 @@ export function reproduceBuild(
     );
   }
 
-  // Get SOURCE_DATE_EPOCH from the commit
-  const sourceDate = validateSourceDateEpoch(
-    execFileSync('git', ['log', '-1', '--pretty=%ct'], {
-      cwd: repoDir,
-      encoding: 'utf-8',
-    }).trim(),
-  );
+  // Only the recipe this CLI holds: a commit built another way is refused before anything is built.
+  assertCommitRecipe(repoDir, safeCommit);
+  ensureBuilder();
 
   const imageTag = `verify-${service}:${safeCommit.slice(0, 7)}`;
+  const imageDir = mkdtempSync(path.join(tmpdir(), 'tytle-verify-image-'));
+  const tarPath = path.join(imageDir, 'image.tar');
 
-  report.info(
-    `Building ${service} image (SOURCE_DATE_EPOCH=${sourceDate})...`,
-  );
-  report.info('This may take several minutes on first build.');
+  try {
+    if (tarPath.includes(',')) {
+      throw new Error(`The temporary directory has a comma, which --output cannot take: ${tarPath}`);
+    }
+    report.info(
+      `Building ${service} image (${BUILD_RECIPE.platform}, SOURCE_DATE_EPOCH=${BUILD_RECIPE.sourceDateEpoch}, ` +
+      `${BUILD_RECIPE.buildkitImage})...`,
+    );
+    report.info('This may take several minutes on first build.');
 
-  execFileSync('docker', [
-    'buildx', 'build',
-    '--output', 'type=docker,rewrite-timestamp=true',
-    '--platform', 'linux/amd64',
-    '-t', imageTag,
-    '-f', `${service}/Dockerfile`,
-    '.',
-  ], {
-    cwd: repoDir,
-    stdio: 'inherit',
-    env: { ...process.env, SOURCE_DATE_EPOCH: sourceDate },
-  });
+    // A docker tarball, not a direct load: Docker's containerd image store (Docker Desktop's default) refuses
+    // rewrite-timestamp on a load ("rewrite-timestamp conflicts with unpack").
+    execFileSync('docker', [
+      'buildx', 'build',
+      '--builder', BUILDER_NAME,
+      '--platform', BUILD_RECIPE.platform,
+      '--provenance=false', '--sbom=false',
+      '--output', `type=docker,dest=${tarPath},rewrite-timestamp=true,name=${imageTag}`,
+      '-f', `${service}/Dockerfile`,
+      '.',
+    ], {
+      cwd: repoDir,
+      stdio: 'inherit',
+      env: { ...process.env, SOURCE_DATE_EPOCH: String(BUILD_RECIPE.sourceDateEpoch) },
+    });
 
-  const imageDigest = execFileSync('docker', [
-    'inspect', '--format={{.Id}}', imageTag,
-  ], { encoding: 'utf-8' }).trim();
+    const imageDigest = configDigestOf(
+      execFileSync('tar', ['-xOf', tarPath, 'manifest.json'], { encoding: 'utf-8' }),
+    );
+    // nitro-cli reads the image from Docker
+    execFileSync('docker', ['load', '-i', tarPath], { stdio: 'pipe' });
 
-  return { imageTag, imageDigest, repoDir, tempDir };
+    return { imageTag, imageDigest, repoDir, tempDir };
+  } finally {
+    rmSync(imageDir, { recursive: true, force: true });
+  }
 }
 
 /**

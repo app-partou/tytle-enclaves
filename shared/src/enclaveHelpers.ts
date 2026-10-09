@@ -56,6 +56,8 @@ export async function encodeBn254AndAttest(
     method: string;
     url: string;
     requestHeaders: Record<string, string>;
+    /** The caller's challenge, if any (nonce version 2). */
+    challenge?: string;
   },
 ): Promise<Bn254AttestResult> {
   const encodedBytes = encodeFieldElements(schema, values);
@@ -68,7 +70,7 @@ export async function encodeBn254AndAttest(
     rawBody,
     attestArgs.url,
     attestArgs.requestHeaders,
-    bn254Hash,
+    { userDataHex: bn254Hash, challenge: attestArgs.challenge },
   );
 
   return {

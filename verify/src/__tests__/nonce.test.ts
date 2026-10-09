@@ -90,3 +90,46 @@ describe('verifyNonce', () => {
     expect(result.valid).toBe(false);
   });
 });
+
+// Version 2 (enclave audit P1.3): the caller's challenge is appended, so the document is bound to ONE request.
+describe('nonce version 2', () => {
+  const challenge = 'c0'.repeat(32);
+  const base = { responseHash: 'abc123', apiEndpoint: 'example.com/api', timestamp: 1700000000 };
+  const v2 = crypto.createHash('sha256').update(`abc123|example.com/api|1700000000|${challenge}`).digest('hex');
+
+  it('appends |challenge to the version-1 preimage (red)', () => {
+    expect(computeNonce(base.responseHash, base.apiEndpoint, base.timestamp, challenge)).toBe(v2);
+    expect(v2).not.toBe(computeNonce(base.responseHash, base.apiEndpoint, base.timestamp));
+  });
+
+  it('a version-2 document verifies with the challenge it echoes (red)', () => {
+    const result = verifyNonce({ ...base, nonce: v2, nonceVersion: 2, challenge } as AttestationDocument);
+    expect(result).toEqual({ valid: true, expected: v2, actual: v2 });
+  });
+
+  it('a version-2 document without its challenge is invalid, and says why (red)', () => {
+    const result = verifyNonce({ ...base, nonce: v2, nonceVersion: 2 } as AttestationDocument);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe('nonce version 2 needs a challenge of 64 lowercase hex');
+  });
+
+  it('a challenge that is not 64 lowercase hex is invalid, even when the nonce was made with it (red)', () => {
+    for (const bad of ['C0'.repeat(32), 'c0'.repeat(31), 'zz'.repeat(32)]) {
+      const nonce = crypto.createHash('sha256').update(`abc123|example.com/api|1700000000|${bad}`).digest('hex');
+      const result = verifyNonce({ ...base, nonce, nonceVersion: 2, challenge: bad } as AttestationDocument);
+      expect(result.valid).toBe(false);
+      expect(result.error).toBe('nonce version 2 needs a challenge of 64 lowercase hex');
+    }
+  });
+
+  it('a version-1 document that carries a challenge is invalid (red)', () => {
+    const result = verifyNonce({ ...base, nonce: v2, challenge } as AttestationDocument);
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe('a challenge was given but the nonce is version 1');
+  });
+
+  it('a version-1 nonce does not verify as version 2 (red)', () => {
+    const v1 = computeNonce(base.responseHash, base.apiEndpoint, base.timestamp);
+    expect(verifyNonce({ ...base, nonce: v1, nonceVersion: 2, challenge } as AttestationDocument).valid).toBe(false);
+  });
+});

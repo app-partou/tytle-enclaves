@@ -7,7 +7,8 @@
  * SECURITY:
  * - Algorithm in protected headers is validated (prevents algorithm confusion)
  * - Buffer types are validated (prevents CBOR injection)
- * - Nonce from COSE payload is extracted for binding verification
+ * - Nonce and user_data from the COSE payload are extracted for binding verification
+ * - The certificate chain is judged at the payload's signed time (the NSM timestamp), never at "now"
  */
 
 import crypto from 'node:crypto';
@@ -21,11 +22,26 @@ const COSE_ALG_ES384 = -35;
 export interface CoseVerificationResult {
   signatureValid: boolean;
   certChainValid: boolean;
-  pcrs: { pcr0: string; pcr1: string; pcr2: string };
+  /** From the signed payload: the EIF's PCR0-2, and PCR8 - who signed the EIF ('' or zeroes: unsigned). */
+  pcrs: { pcr0: string; pcr1: string; pcr2: string; pcr8: string };
   /** Nonce from the hardware-signed COSE payload (hex). Compare to application nonce. */
   payloadNonce: string | null;
+  /** user_data from the hardware-signed COSE payload (hex): the SHA-256 of the BN254 vector. */
+  payloadUserData: string | null;
+  /** The payload's timestamp (ms since the epoch), stamped by the Nitro hypervisor: THE signing time. */
+  payloadTimestampMs: number | null;
+  /** Issuer / subject mismatches in the chain where the signatures hold: reported, never fatal. */
+  chainWarnings: string[];
   error?: string;
 }
+
+/** The payload's signed time in ms: a positive whole number (a uint64; a bignum is read too), else null. */
+function signedTimestampMs(raw: unknown): number | null {
+  const ms = typeof raw === 'bigint' ? Number(raw) : raw;
+  return typeof ms === 'number' && Number.isSafeInteger(ms) && ms > 0 ? ms : null;
+}
+
+const hexOrNull = (value: Buffer | null | undefined): string | null => (value ? Buffer.from(value).toString('hex') : null);
 
 /**
  * Verify a COSE_Sign1 NSM attestation document:
@@ -47,8 +63,11 @@ export function verifyCoseSignature(
     return {
       signatureValid: false,
       certChainValid: false,
-      pcrs: { pcr0: '', pcr1: '', pcr2: '' },
+      pcrs: { pcr0: '', pcr1: '', pcr2: '', pcr8: '' },
       payloadNonce: null,
+      payloadUserData: null,
+      payloadTimestampMs: null,
+      chainWarnings: [],
       error: `Invalid COSE algorithm: ${alg}. Expected ${COSE_ALG_ES384} (ES384). ` +
         'This may indicate an algorithm confusion attack.',
     };
@@ -78,25 +97,29 @@ export function verifyCoseSignature(
     decoded.signature,
   );
 
-  // 4. Verify certificate chain
+  // 4. Verify the certificate chain at the signed time
+  const payloadTimestampMs = signedTimestampMs(decoded.payload.timestamp);
   const chainResult = verifyCertificateChain(
     decoded.payload.certificate,
     decoded.payload.cabundle,
+    new Date(payloadTimestampMs ?? Number.NaN),
   );
 
-  // 5. Extract PCRs and payload nonce
+  // 5. Extract PCRs and the payload's nonce and user_data
   const pcrs = extractPcrs(decoded);
-
-  const payloadNonce = decoded.payload.nonce
-    ? Buffer.from(decoded.payload.nonce).toString('hex')
-    : null;
+  const signed = {
+    pcrs,
+    payloadNonce: hexOrNull(decoded.payload.nonce),
+    payloadUserData: hexOrNull(decoded.payload.user_data),
+    payloadTimestampMs,
+    chainWarnings: chainResult.warnings,
+  };
 
   if (!signatureValid) {
     return {
       signatureValid: false,
       certChainValid: chainResult.valid,
-      pcrs,
-      payloadNonce,
+      ...signed,
       error: 'COSE_Sign1 signature verification failed (ES384/P-384)',
     };
   }
@@ -105,8 +128,7 @@ export function verifyCoseSignature(
     return {
       signatureValid: true,
       certChainValid: false,
-      pcrs,
-      payloadNonce,
+      ...signed,
       error: chainResult.error,
     };
   }
@@ -114,7 +136,6 @@ export function verifyCoseSignature(
   return {
     signatureValid: true,
     certChainValid: true,
-    pcrs,
-    payloadNonce,
+    ...signed,
   };
 }

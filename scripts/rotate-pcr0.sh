@@ -2,27 +2,27 @@
 #
 # PCR0 Rotation Helper
 #
-# Builds an enclave Docker image, extracts its PCR0 by converting to EIF
-# via a pinned nitro-cli Docker image, and optionally updates the SSM parameter.
+# Builds an enclave image with the one recipe of this repository (scripts/lib/recipe.sh), measures its EIF with the
+# nitro-cli helper built from verify/Dockerfile.nitro-cli (the helper the verify CLI measures with), and optionally
+# updates the SSM parameter. scripts/expected-digests.json holds the same PCR0 for the committed build.
 #
 # Usage:
 #   ./scripts/rotate-pcr0.sh <enclave>           # Print old vs new PCR0
 #   ./scripts/rotate-pcr0.sh <enclave> --apply    # Also update SSM parameter
 #   ./scripts/rotate-pcr0.sh all                  # Print PCR0 for all enclaves
 #
-# Enclaves: vies, sicae, stripe-payment
+# Enclaves: vies, sicae, stripe-payment, monerium-payment
 #
 # Prerequisites:
-#   - Docker with BuildKit
+#   - Docker with buildx, and Node.js (the recipe reads its values with it)
 #   - AWS CLI configured (for --apply and SSM lookup)
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENCLAVES=("vies" "sicae" "stripe-payment")
-
-# Pinned nitro-cli image for reproducible PCR0 extraction (no Nitro instance needed)
-NITRO_CLI_IMAGE="docker.io/tytle/nitro-cli:1.4.4"
+# shellcheck source-path=SCRIPTDIR source=lib/recipe.sh
+source "$REPO_DIR/scripts/lib/recipe.sh"
+ENCLAVES=("vies" "sicae" "stripe-payment" "monerium-payment")
 
 # SSM parameter path convention (matches CDK stack: /tytle/{env}/enclave/{key}/pcr0)
 ssm_param_name() {
@@ -33,40 +33,22 @@ ssm_param_name() {
     vies) key="vies" ;;
     sicae) key="sicae" ;;
     stripe-payment) key="stripe_payment" ;;
+    monerium-payment) key="monerium_payment" ;;
     *) echo "Unknown enclave: $enclave" >&2; exit 1 ;;
   esac
   echo "/tytle/${env}/enclave/${key}/pcr0"
 }
 
 build_and_extract_pcr0() {
-  local enclave="$1"
-  local image_tag="tytle-enclave-${enclave}:pcr0-check"
+  local enclave="$1" work pcr0
+  work="$(mktemp -d)"
 
-  echo "Building ${enclave}..." >&2
-  local source_epoch
-  source_epoch=$(git -C "$REPO_DIR" log -1 --pretty=%ct)
+  echo "Building ${enclave} (the recipe: $(recipe_summary))..." >&2
+  recipe_build "$enclave" "$work/image.tar" "tytle-enclave-${enclave}:pcr0-check" >&2
 
-  SOURCE_DATE_EPOCH="$source_epoch" docker buildx build \
-    --output type=docker,rewrite-timestamp=true \
-    --platform linux/amd64 \
-    -t "$image_tag" \
-    -f "${REPO_DIR}/${enclave}/Dockerfile" \
-    "$REPO_DIR" >&2
-
-  echo "Extracting PCR0 from EIF..." >&2
-  # Convert Docker image to EIF and extract PCR0 using pinned nitro-cli
-  local pcr0
-  pcr0=$(docker run --rm \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    "$NITRO_CLI_IMAGE" \
-    build-enclave --docker-uri "$image_tag" --output-file /dev/null 2>&1 \
-    | grep -oP '"PCR0":\s*"\K[0-9a-f]+')
-
-  if [ -z "$pcr0" ]; then
-    echo "ERROR: Failed to extract PCR0 for ${enclave}" >&2
-    return 1
-  fi
-
+  echo "Measuring its EIF..." >&2
+  pcr0="$(recipe_measure "$work/image.tar" | node "$RECIPE_LIB/recipe.mjs" pcr0)"
+  rm -rf "$work"
   echo "$pcr0"
 }
 

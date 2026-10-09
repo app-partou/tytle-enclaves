@@ -142,13 +142,15 @@ export function decodeCoseSign1(coseBytes: Buffer): DecodedAttestation {
 }
 
 /**
- * Extract PCR hex strings from a decoded attestation.
+ * Extract PCR hex strings from a decoded attestation: PCR0-2 (the EIF) and PCR8 (who signed it: lib/signing.ts),
+ * each '' when absent.
  * Throws if PCR0 is missing or empty (not a valid attestation without it).
  */
 export function extractPcrs(decoded: DecodedAttestation): {
   pcr0: string;
   pcr1: string;
   pcr2: string;
+  pcr8: string;
 } {
   const { pcrs } = decoded.payload;
 
@@ -170,5 +172,6 @@ export function extractPcrs(decoded: DecodedAttestation): {
     pcr0,
     pcr1: getPcr(1),
     pcr2: getPcr(2),
+    pcr8: getPcr(8),
   };
 }

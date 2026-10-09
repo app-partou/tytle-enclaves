@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "platform": "linux/amd64",
+  "sourceDateEpoch": 1767225600,
+  "buildkitImage": "moby/buildkit:v0.27.1@sha256:1e110c71d389d6d24f67b9438e2f7b8da749a6ff407b22a1631e025c95599368"
+}

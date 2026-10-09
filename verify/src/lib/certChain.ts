@@ -1,192 +1,90 @@
 /**
- * X.509 certificate chain validation for AWS Nitro Enclaves.
+ * X.509 certificate chain validation for AWS Nitro Enclaves (enclave audit P2.1).
  *
- * The AWS Nitro root CA is embedded directly in this file for security:
- * - No TOFU (trust-on-first-use) problem
- * - No network dependency during verification
- * - Auditable in source code
- * - Fingerprint verified at runtime
+ * AWS ("Verifying the root of trust") orders the NSM payload's cabundle root first: [ROOT, INTERM_1, ..., INTERM_N].
+ * The path is leaf -> INTERM_N -> ... -> INTERM_1 -> ROOT, and ROOT must BE the trust anchor: equal to it by
+ * fingerprint, not merely signed by its key. Every certificate is judged at the document's signed time (the NSM
+ * payload's timestamp): AWS's leaf lives about three hours, so judging at "now" refuses every stored document. The
+ * anchor itself must also be valid now.
  *
- * To verify this root CA independently:
- *   curl -O https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
- *   unzip AWS_NitroEnclaves_Root-G1.zip
- *   openssl x509 -in root.pem -noout -fingerprint -sha256
- *   # Expected: 64:1A:03:21:A3:E2:44:EF:E4:56:46:31:95:D6:06:31:7E:D7:CD:CC:3C:17:56:E0:98:93:F3:C6:8F:79:BB:5B
+ * The same rules as the main repo's verifier (packages/attestation-core nsmVerification.ts verifyCertChain).
+ * Until 2026-10 this file walked [leaf, ROOT, INTERM_1, ...] and judged at "now", so every real document failed.
  */
 
 import crypto from 'node:crypto';
+import { getAwsNitroRootCa } from './trustAnchor.js';
 
-// AWS Nitro Enclaves Root CA (G1)
-// Subject: CN=aws.nitro-enclaves, OU=AWS, O=Amazon, C=US
-// Valid: 2019-10-28 to 2049-10-28
-// Algorithm: ECDSA P-384 with SHA-384
-// Source: https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip
-const AWS_NITRO_ROOT_CA_PEM = `-----BEGIN CERTIFICATE-----
-MIICETCCAZagAwIBAgIRAPkxdWgbkK/hHUbMtOTn+FYwCgYIKoZIzj0EAwMwSTEL
-MAkGA1UEBhMCVVMxDzANBgNVBAoMBkFtYXpvbjEMMAoGA1UECwwDQVdTMRswGQYD
-VQQDDBJhd3Mubml0cm8tZW5jbGF2ZXMwHhcNMTkxMDI4MTMyODA1WhcNNDkxMDI4
-MTQyODA1WjBJMQswCQYDVQQGEwJVUzEPMA0GA1UECgwGQW1hem9uMQwwCgYDVQQL
-DANBV1MxGzAZBgNVBAMMEmF3cy5uaXRyby1lbmNsYXZlczB2MBAGByqGSM49AgEG
-BSuBBAAiA2IABPwCVOumCMHzaHDimtqQvkY4MpJzbolL//Zy2YlES1BR5TSksfbb
-48C8WBoyt7F2Bw7eEtaaP+ohG2bnUs990d0JX28TcPQXCEPZ3BABIeTPYwEoCWZE
-h8l5YoQwTcU/9KNCMEAwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUkCW1DdkF
-R+eWw5b6cp3PmanfS5YwDgYDVR0PAQH/BAQDAgGGMAoGCCqGSM49BAMDA2kAMGYC
-MQCjfy+Rocm9Xue4YnwWmNJVA44fA0P5W2OpYow9OYCVRaEevL8uO1XYru5xtMPW
-rfMCMQCi85sWBbJwKKXdS6BptQFuZbT73o/gBh1qUxl/nNr12UO8Yfwr6wPLb+6N
-IwLz3/Y=
------END CERTIFICATE-----`;
+export { getAwsNitroRootCa };
 
-const EXPECTED_ROOT_FINGERPRINT = '641A0321A3E244EFE456463195D606317ED7CDCC3C1756E09893F3C68F79BB5B';
+export interface ChainResult {
+  valid: boolean;
+  error?: string;
+  /** Issuer / subject name mismatches where the signature holds: reported, never fatal (as in the core). */
+  warnings: string[];
+}
 
-let rootCaCert: crypto.X509Certificate | null = null;
-
-function getRootCa(): crypto.X509Certificate {
-  if (!rootCaCert) {
-    rootCaCert = new crypto.X509Certificate(AWS_NITRO_ROOT_CA_PEM);
-
-    // Runtime fingerprint check — defense against supply-chain tampering of the embedded PEM
-    const actualFingerprint = rootCaCert.fingerprint256.replace(/:/g, '');
-    if (actualFingerprint !== EXPECTED_ROOT_FINGERPRINT) {
-      throw new Error(
-        `AWS Nitro root CA fingerprint mismatch! ` +
-        `Expected: ${EXPECTED_ROOT_FINGERPRINT}, ` +
-        `Got: ${actualFingerprint}. ` +
-        `The embedded certificate may have been tampered with.`,
-      );
-    }
-  }
-  return rootCaCert;
+function validAt(cert: crypto.X509Certificate, at: Date): boolean {
+  return new Date(cert.validFrom) <= at && new Date(cert.validTo) >= at;
 }
 
 /**
- * Verify the certificate chain from a Nitro attestation document.
- *
- * Validates:
- * 1. Each cert was issued by the next (issuer + signature)
- * 2. The last cert roots to the embedded AWS Nitro root CA
- * 3. All certs are within their validity period (notBefore ≤ now ≤ notAfter)
- * 4. Intermediate certs have CA:TRUE basic constraint
- * 5. Leaf cert has digitalSignature key usage (if keyUsage is present)
+ * Verify the certificate chain of a Nitro attestation document:
+ * 1. cabundle[0] is the trust anchor (by SHA-256 fingerprint)
+ * 2. every cabundle member is a CA (basicConstraints CA:TRUE), and each is signed by the one before it
+ * 3. the leaf is signed by the last cabundle member, is not a CA, and may sign (keyUsage digitalSignature, if present)
+ * 4. every certificate is valid at `signedAt`; the anchor is also valid now
  *
  * @param leafCertDer - DER-encoded leaf certificate (from payload.certificate)
- * @param cabundle - Array of DER-encoded intermediate certificates (from payload.cabundle)
+ * @param cabundle - DER-encoded CA certificates (from payload.cabundle), root first
+ * @param signedAt - the document's signed time (the NSM payload's timestamp)
+ * @param anchor - the trust anchor (the embedded AWS Nitro root)
  */
 export function verifyCertificateChain(
   leafCertDer: Buffer,
   cabundle: Buffer[],
-): { valid: boolean; error?: string } {
+  signedAt: Date,
+  anchor: crypto.X509Certificate = getAwsNitroRootCa(),
+): ChainResult {
+  const warnings: string[] = [];
+  const fail = (error: string): ChainResult => ({ valid: false, error, warnings });
   try {
-    const rootCa = getRootCa();
-    const now = new Date();
+    if (Number.isNaN(signedAt.getTime())) return fail('The document has no valid signed time');
+    if (cabundle.length === 0) return fail('cabundle is empty: a Nitro document always carries the root first');
 
-    // Build full chain: leaf + cabundle intermediates
-    const certs = [
-      new crypto.X509Certificate(leafCertDer),
-      ...cabundle.map((der) => new crypto.X509Certificate(der)),
-    ];
+    const bundle = cabundle.map((der) => new crypto.X509Certificate(der));
+    const leaf = new crypto.X509Certificate(leafCertDer);
 
-    // Check validity dates for all certs in the chain
-    for (let i = 0; i < certs.length; i++) {
-      const cert = certs[i];
-      const label = i === 0 ? 'Leaf certificate' : `Intermediate certificate ${i}`;
-
-      // Node's X509Certificate exposes validFrom/validTo as strings, and
-      // validFromDate/validToDate as Date objects (Node 20.13+)
-      const validFrom = new Date(cert.validFrom);
-      const validTo = new Date(cert.validTo);
-
-      if (validFrom > now) {
-        return {
-          valid: false,
-          error: `${label} is not yet valid (validFrom: ${cert.validFrom})`,
-        };
-      }
-
-      if (validTo < now) {
-        return {
-          valid: false,
-          error: `${label} has expired (validTo: ${cert.validTo})`,
-        };
-      }
+    if (bundle[0].fingerprint256 !== anchor.fingerprint256) {
+      return fail(`cabundle[0] (${bundle[0].fingerprint256}) is not the AWS Nitro root (${anchor.fingerprint256})`);
     }
-
-    // Check root CA validity too
-    const rootValidTo = new Date(rootCa.validTo);
-    if (rootValidTo < now) {
-      return {
-        valid: false,
-        error: `AWS Nitro root CA has expired (validTo: ${rootCa.validTo})`,
-      };
+    for (let i = 0; i < bundle.length; i++) {
+      if (!bundle[i].ca) return fail(`cabundle[${i}] is not a CA certificate (basicConstraints CA:TRUE missing)`);
     }
-
-    // Leaf cert: check digitalSignature key usage (if present)
-    const leafKeyUsage = certs[0].keyUsage;
+    for (let i = 0; i < bundle.length - 1; i++) {
+      if (!bundle[i + 1].verify(bundle[i].publicKey)) return fail(`cabundle[${i + 1}] is not signed by cabundle[${i}]`);
+      if (!bundle[i + 1].checkIssued(bundle[i])) warnings.push(`cabundle[${i + 1}] issuer does not match cabundle[${i}] subject`);
+    }
+    const issuer = bundle[bundle.length - 1];
+    if (!leaf.verify(issuer.publicKey)) return fail(`Leaf certificate is not signed by cabundle[${bundle.length - 1}]`);
+    if (!leaf.checkIssued(issuer)) warnings.push(`Leaf certificate issuer does not match cabundle[${bundle.length - 1}] subject`);
+    if (leaf.ca) return fail('Leaf certificate is a CA certificate (basicConstraints CA:TRUE)');
+    const leafKeyUsage = leaf.keyUsage;
     if (leafKeyUsage && !leafKeyUsage.includes('digitalSignature')) {
-      return {
-        valid: false,
-        error: `Leaf certificate keyUsage does not include digitalSignature: [${leafKeyUsage.join(', ')}]`,
-      };
+      return fail(`Leaf certificate keyUsage does not include digitalSignature: [${leafKeyUsage.join(', ')}]`);
     }
 
-    // Intermediate certs: check CA basic constraint
-    for (let i = 1; i < certs.length; i++) {
-      if (!certs[i].ca) {
-        return {
-          valid: false,
-          error: `Intermediate certificate ${i} does not have CA:TRUE basic constraint`,
-        };
+    if (!validAt(anchor, new Date())) return fail(`The AWS Nitro root is not valid now (valid ${anchor.validFrom} - ${anchor.validTo})`);
+    for (let i = 0; i < bundle.length; i++) {
+      if (!validAt(bundle[i], signedAt)) {
+        return fail(`cabundle[${i}] is not valid at the signed time ${signedAt.toISOString()} (valid ${bundle[i].validFrom} - ${bundle[i].validTo})`);
       }
     }
-
-    // Verify each adjacent pair: cert[i] was issued by cert[i+1]
-    for (let i = 0; i < certs.length - 1; i++) {
-      const child = certs[i];
-      const parent = certs[i + 1];
-
-      if (!child.checkIssued(parent)) {
-        return {
-          valid: false,
-          error: `Certificate ${i} was not issued by certificate ${i + 1} (${child.subject} → ${parent.subject})`,
-        };
-      }
-
-      if (!child.verify(parent.publicKey)) {
-        return {
-          valid: false,
-          error: `Certificate ${i} signature verification failed against certificate ${i + 1}`,
-        };
-      }
+    if (!validAt(leaf, signedAt)) {
+      return fail(`Leaf certificate is not valid at the signed time ${signedAt.toISOString()} (valid ${leaf.validFrom} - ${leaf.validTo})`);
     }
 
-    // Verify the last cert in chain was issued by the root CA
-    const lastCert = certs[certs.length - 1];
-
-    if (!lastCert.checkIssued(rootCa)) {
-      return {
-        valid: false,
-        error: `Last certificate in chain was not issued by AWS Nitro root CA (${lastCert.subject})`,
-      };
-    }
-
-    if (!lastCert.verify(rootCa.publicKey)) {
-      return {
-        valid: false,
-        error: 'Last certificate signature verification failed against AWS Nitro root CA',
-      };
-    }
-
-    return { valid: true };
-  } catch (err: any) {
-    return {
-      valid: false,
-      error: `Certificate chain verification error: ${err.message}`,
-    };
+    return { valid: true, warnings };
+  } catch (err: unknown) {
+    return fail(`Certificate chain verification error: ${err instanceof Error ? err.message : String(err)}`);
   }
-}
-
-/**
- * Get the AWS Nitro root CA as an X509Certificate for external use.
- */
-export function getAwsNitroRootCa(): crypto.X509Certificate {
-  return getRootCa();
 }

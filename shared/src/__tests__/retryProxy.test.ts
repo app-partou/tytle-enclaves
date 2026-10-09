@@ -9,6 +9,7 @@ vi.mock('../httpProxy.js', () => ({
 }));
 
 import { proxyFetchWithRetry } from '../retryProxy.js';
+import { IncompleteBodyError, ResponseTooLargeError } from '../httpErrors.js';
 
 function makeResponse(status: number, body = '') {
   return { status, headers: {}, body };
@@ -123,6 +124,33 @@ describe('proxyFetchWithRetry', () => {
     expect(mockProxyFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('never retries a reply that was too large: the same request would pull the same bytes again', async () => {
+    mockProxyFetch.mockRejectedValueOnce(new ResponseTooLargeError('example.com', 4_194_305, 4_194_304));
+
+    await expect(
+      proxyFetchWithRetry(
+        8443, 'example.com', 'GET', '/', {},
+        undefined, undefined, true,
+        { maxRetries: 2, baseDelayMs: 1 },
+      ),
+    ).rejects.toBeInstanceOf(ResponseTooLargeError);
+    expect(mockProxyFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries a reply cut short (IncompleteBodyError) and returns the complete one', async () => {
+    mockProxyFetch
+      .mockRejectedValueOnce(new IncompleteBodyError('Content-Length 100, received 60'))
+      .mockResolvedValueOnce(makeResponse(200, 'complete'));
+
+    const result = await proxyFetchWithRetry(
+      8443, 'example.com', 'GET', '/', {},
+      undefined, undefined, true,
+      { maxRetries: 1, baseDelayMs: 1 },
+    );
+    expect(result.body).toBe('complete');
+    expect(mockProxyFetch).toHaveBeenCalledTimes(2);
+  });
+
   it('uses proxyFetchPlain when tls=false', async () => {
     mockProxyFetchPlain.mockResolvedValueOnce(makeResponse(200));
 
@@ -155,5 +183,33 @@ describe('proxyFetchWithRetry', () => {
     );
     expect(result.status).toBe(500);
     expect(mockProxyFetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('with the request budget (D-P1-11)', () => {
+  it('🔴 each try takes what is left of the budget', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    mockProxyFetch
+      .mockImplementationOnce(async () => { now += 20_000; return makeResponse(503); })
+      .mockResolvedValueOnce(makeResponse(200));
+
+    const res = await proxyFetchWithRetry(8443, 'api.stripe.com', 'GET', '/', {}, undefined, undefined, true, undefined, { deadlineMs: 1_030_000 });
+
+    expect(res.status).toBe(200);
+    expect(mockProxyFetch.mock.calls.map((call) => call[6])).toEqual([25_000, 10_000]);
+    vi.restoreAllMocks();
+  });
+
+  it('🔴 no pause and no try the budget cannot hold: the last answer stands', async () => {
+    let now = 1_000_000;
+    vi.spyOn(Date, 'now').mockImplementation(() => now);
+    mockProxyFetch.mockImplementationOnce(async () => { now += 29_800; return makeResponse(503); });
+
+    const res = await proxyFetchWithRetry(8443, 'api.stripe.com', 'GET', '/', {}, undefined, undefined, true, undefined, { deadlineMs: 1_030_000 });
+
+    expect(res.status).toBe(503);
+    expect(mockProxyFetch).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
   });
 });

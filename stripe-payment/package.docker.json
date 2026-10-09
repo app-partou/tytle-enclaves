@@ -13,11 +13,11 @@
     "cbor": "9.0.2"
   },
   "devDependencies": {
-    "@types/node": "20.19.33",
+    "@types/node": "22.20.5",
     "typescript": "5.9.3",
     "vitest": "4.0.18"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

@@ -16,9 +16,18 @@ import * as tls from 'node:tls';
 import { Duplex } from 'node:stream';
 import { VsockStream } from '@tytle-enclaves/native';
 import { VsockDuplex } from './vsockStream.js';
+import { ResponseCollector, type HttpResponse } from './httpParse.js';
+import { DEFAULT_FETCH_TIMEOUT_MS } from './requestBudget.js';
+
+export type { HttpResponse } from './httpParse.js';
 
 /** CID 3 = host parent from inside the enclave */
 const HOST_CID = 3;
+
+/** The socket read/write timeout for a fetch budget: whole seconds, at least 1 (0 means "never" to the kernel). */
+function socketTimeoutSecs(timeoutMs: number): number {
+  return Math.max(1, Math.ceil(timeoutMs / 1000));
+}
 
 /**
  * Per-hostname TLS session cache for session resumption.
@@ -27,12 +36,6 @@ const HOST_CID = 3;
  * Node.js TLS falls back to a full handshake if a cached ticket is rejected.
  */
 const tlsSessionCache = new Map<string, Buffer>();
-
-export interface HttpResponse {
-  status: number;
-  headers: Record<string, string>;
-  body: string;
-}
 
 /**
  * Make an HTTPS request through a vsock-proxy tunnel.
@@ -43,7 +46,7 @@ export interface HttpResponse {
  * @param path - Request path (e.g., /taxation_customs/vies/services/checkVatService)
  * @param headers - HTTP headers
  * @param body - Optional request body
- * @param timeoutMs - Timeout in ms (default 25000)
+ * @param timeoutMs - Timeout in ms (default DEFAULT_FETCH_TIMEOUT_MS, 25 s)
  */
 export async function proxyFetch(
   vsockPort: number,
@@ -52,7 +55,7 @@ export async function proxyFetch(
   path: string,
   headers: Record<string, string>,
   body?: string,
-  timeoutMs: number = 25_000,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
 ): Promise<HttpResponse> {
   return new Promise<HttpResponse>((resolve, reject) => {
     let duplex: VsockDuplex | null = null;
@@ -64,8 +67,9 @@ export async function proxyFetch(
     }, timeoutMs);
 
     try {
-      // Step 1: Connect to host's vsock-proxy
-      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
+      // Step 1: Connect to host's vsock-proxy. Every read and write on the socket gives up within the
+      // fetch budget: a proxy that accepts and goes silent must not block libc::read forever.
+      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort, socketTimeoutSecs(timeoutMs));
       duplex = new VsockDuplex(vsockRaw);
 
       // Step 2: TLS handshake over vsock tunnel (with session resumption)
@@ -110,18 +114,23 @@ export async function proxyFetch(
         tlsSessionCache.set(hostname, session);
       });
 
-      // Step 3: Collect response (as bytes - decode to string after de-chunking)
-      const chunks: Buffer[] = [];
+      // Step 3: Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules
+      const collector = new ResponseCollector(hostname);
       tlsSocket.on('data', (chunk: Buffer) => {
-        chunks.push(chunk);
+        try {
+          collector.push(chunk);
+        } catch (err) {
+          clearTimeout(timer);
+          tlsSocket.destroy();
+          duplex?.destroy();
+          reject(err);
+        }
       });
 
       tlsSocket.on('end', () => {
         clearTimeout(timer);
         try {
-          const raw = Buffer.concat(chunks);
-          const response = parseHttpResponse(raw);
-          resolve(response);
+          resolve(collector.finish());
         } catch (err) {
           reject(err);
         }
@@ -160,7 +169,7 @@ export async function proxyFetchPlain(
   path: string,
   headers: Record<string, string>,
   body?: string,
-  timeoutMs: number = 25_000,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
 ): Promise<HttpResponse> {
   return new Promise<HttpResponse>((resolve, reject) => {
     let duplex: VsockDuplex | null = null;
@@ -172,8 +181,8 @@ export async function proxyFetchPlain(
     }, timeoutMs);
 
     try {
-      // Connect to host's vsock-proxy (no TLS — write raw HTTP)
-      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort);
+      // Connect to host's vsock-proxy (no TLS — write raw HTTP); reads and writes give up within the budget
+      const vsockRaw = VsockStream.connect(HOST_CID, vsockPort, socketTimeoutSecs(timeoutMs));
       duplex = new VsockDuplex(vsockRaw);
 
       // Build and send HTTP request directly over the vsock tunnel
@@ -201,26 +210,31 @@ export async function proxyFetchPlain(
 
       duplex.write(httpReq);
 
-      // Collect response
-      const chunks: Buffer[] = [];
-      duplex.on('data', (chunk: Buffer) => {
-        chunks.push(chunk);
+      // Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules
+      const collector = new ResponseCollector(hostname);
+      const plain = duplex;
+      plain.on('data', (chunk: Buffer) => {
+        try {
+          collector.push(chunk);
+        } catch (err) {
+          clearTimeout(timer);
+          plain.destroy();
+          reject(err);
+        }
       });
 
-      duplex.on('end', () => {
+      plain.on('end', () => {
         clearTimeout(timer);
         try {
-          const raw = Buffer.concat(chunks);
-          const response = parseHttpResponse(raw);
-          resolve(response);
+          resolve(collector.finish());
         } catch (err) {
           reject(err);
         }
       });
 
-      duplex.on('error', (err: Error) => {
+      plain.on('error', (err: Error) => {
         clearTimeout(timer);
-        duplex?.destroy();
+        plain.destroy();
         reject(new Error(`Plain HTTP error to ${hostname}: ${err.message}`));
       });
     } catch (err) {
@@ -229,85 +243,4 @@ export async function proxyFetchPlain(
       reject(err);
     }
   });
-}
-
-/**
- * Parse raw HTTP/1.1 response into structured object.
- * Operates on Buffer to correctly handle chunked encoding with multi-byte characters.
- * Headers are ASCII, so safe to split as string. Body is decoded after de-chunking.
- */
-function parseHttpResponse(raw: Buffer): HttpResponse {
-  // Find header/body separator (\r\n\r\n) at byte level
-  const separator = Buffer.from('\r\n\r\n');
-  const headerEnd = raw.indexOf(separator);
-  if (headerEnd === -1) {
-    throw new Error('Malformed HTTP response: no header/body separator');
-  }
-
-  // Headers are ASCII — safe to decode as string
-  const headerSection = raw.subarray(0, headerEnd).toString('ascii');
-  const bodyBuf = raw.subarray(headerEnd + 4);
-
-  const lines = headerSection.split('\r\n');
-  const statusLine = lines[0];
-
-  // Parse status line: "HTTP/1.1 200 OK"
-  const statusMatch = statusLine.match(/^HTTP\/\d\.\d\s+(\d+)/);
-  if (!statusMatch) {
-    throw new Error(`Malformed status line: ${statusLine}`);
-  }
-  const status = parseInt(statusMatch[1], 10);
-
-  // Parse headers
-  const headers: Record<string, string> = {};
-  for (let i = 1; i < lines.length; i++) {
-    const colonIdx = lines[i].indexOf(':');
-    if (colonIdx > 0) {
-      const key = lines[i].substring(0, colonIdx).trim().toLowerCase();
-      const value = lines[i].substring(colonIdx + 1).trim();
-      headers[key] = value;
-    }
-  }
-
-  // Handle chunked transfer encoding at byte level, then decode to string
-  let responseBody: string;
-  if (headers['transfer-encoding']?.includes('chunked')) {
-    responseBody = decodeChunked(bodyBuf).toString('utf-8');
-  } else {
-    responseBody = bodyBuf.toString('utf-8');
-  }
-
-  return { status, headers, body: responseBody };
-}
-
-/**
- * Decode chunked transfer encoding.
- * Operates on Buffer so chunk sizes (byte counts) correctly index the data,
- * even when the body contains multi-byte UTF-8 characters.
- */
-function decodeChunked(raw: Buffer): Buffer {
-  const parts: Buffer[] = [];
-  let offset = 0;
-  const crlf = Buffer.from('\r\n');
-
-  while (offset < raw.length) {
-    const lineEnd = raw.indexOf(crlf, offset);
-    if (lineEnd === -1) break;
-
-    const chunkSizeHex = raw.subarray(offset, lineEnd).toString('ascii').trim();
-    const chunkSize = parseInt(chunkSizeHex, 16);
-
-    if (chunkSize === 0) break; // Terminal chunk
-    if (!Number.isFinite(chunkSize) || chunkSize < 0) {
-      throw new Error(`Invalid chunk size: "${chunkSizeHex}"`);
-    }
-
-    const chunkStart = lineEnd + 2;
-    const chunkEnd = chunkStart + chunkSize;
-    parts.push(raw.subarray(chunkStart, chunkEnd));
-
-    offset = chunkEnd + 2; // Skip \r\n after chunk data
-  }
-
-  return Buffer.concat(parts);
 }

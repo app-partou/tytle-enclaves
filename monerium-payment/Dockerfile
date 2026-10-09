@@ -33,7 +33,10 @@ COPY native/src/ ./src/
 RUN npm run build
 
 # Stage 2: Build shared library
-FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c AS shared-builder
+# Node.js 22 LTS (Node 20 is end-of-life since 2026-04-30), pinned by digest: node:22-alpine = Node 22.23.3 on
+# Alpine 3.24.2, resolved 2026-10-08. The same digest in every stage below and in every enclave Dockerfile.
+# Update via: docker buildx imagetools inspect node:22-alpine (the index digest)
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS shared-builder
 
 WORKDIR /shared
 
@@ -50,9 +53,10 @@ COPY shared/src/ ./src/
 RUN npx tsc
 
 # Stage 3: Build monerium-payment enclave
-# node:20-alpine already includes libcrypto3, libssl3, and ca-certificates-bundle,
-# which is everything Node.js needs for HTTPS/TLS. No extra apk installs required.
-FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c AS node-builder
+# No extra apk installs: Node.js needs nothing more for HTTPS. TLS trusts Node's BUNDLED Mozilla root store
+# (tls.rootCertificates, compiled into the node binary: 119 roots in Node 22.23.3), never the Alpine
+# ca-certificates bundle, so a bump of this digest is a bump of the CA store: re-check every upstream host.
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS node-builder
 
 WORKDIR /app
 
@@ -74,17 +78,25 @@ COPY monerium-payment/tsconfig.json ./
 COPY monerium-payment/src/ ./src/
 RUN npx tsc
 
-# Remove devDependencies directly (npm prune fights with local packages).
+# Remove every package the lockfile marks dev-only - the build tools AND their whole trees (vitest brings vite,
+# rollup and esbuild with native binaries) - and the .bin links to them, so the image ships only the runtime
+# closure plus the two injected local packages. npm prune fights with the injected packages, which the lockfile
+# does not list, so they stay. Removing only the top-level devDependencies left 32 dev packages (21.7 MB, two
+# native binaries) in every enclave image until 2026-10.
 RUN node -e " \
   const fs = require('fs'); \
-  const pkg = JSON.parse(fs.readFileSync('package.json','utf8')); \
-  for (const d of Object.keys(pkg.devDependencies || {})) { \
-    fs.rmSync('node_modules/' + d, { recursive: true, force: true }); \
+  const lock = JSON.parse(fs.readFileSync('package-lock.json','utf8')); \
+  for (const [path, entry] of Object.entries(lock.packages)) { \
+    if (path && entry.dev) fs.rmSync(path, { recursive: true, force: true }); \
+  } \
+  fs.rmSync('node_modules/.bin', { recursive: true, force: true }); \
+  for (const scope of fs.readdirSync('node_modules').filter((d) => d.startsWith('@'))) { \
+    if (fs.readdirSync('node_modules/' + scope).length === 0) fs.rmdirSync('node_modules/' + scope); \
   }"
 
 # Stage 4: Minimal runtime
-# node:20-alpine already has ca-certificates-bundle; no extra apk installs needed.
-FROM node:20-alpine@sha256:f598378b5240225e6beab68fa9f356db1fb8efe55173e6d4d8153113bb8f333c
+# The same Node.js 22 image as the build stages; no extra apk installs.
+FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402
 
 WORKDIR /app
 COPY --from=node-builder /app/dist ./dist
@@ -99,7 +111,7 @@ EXPOSE 5000
 
 # Nitro Enclaves init execs the Docker image's CMD directly via execvpe
 # without resolving PATH, and without running the base image's ENTRYPOINT
-# (docker-entrypoint.sh from node:20-alpine). Clear ENTRYPOINT and use
+# (docker-entrypoint.sh from node:22-alpine). Clear ENTRYPOINT and use
 # absolute paths so the enclave init can locate the binary.
 ENTRYPOINT []
 CMD ["/usr/local/bin/node", "/app/dist/enclave.js"]

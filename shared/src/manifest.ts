@@ -67,7 +67,11 @@ export interface ParsedSource {
   field: string;
 }
 
-/** Value derived by combining raw bodies from multiple queries. */
+/**
+ * Value derived by combining raw bodies from multiple queries. An input whose query did not run (a routed
+ * alternative, e.g. VIES or HMRC) contributes nothing; a query that ran more than once (form variants) contributes
+ * the body the answer was read from.
+ */
 export interface DerivedSource {
   from: 'derived';
   /** Input references: 'queryId:rawBody'. */
@@ -78,13 +82,26 @@ export interface DerivedSource {
   transform: FieldTransform;
 }
 
+/**
+ * Value taken from the enclave's own allowlist entry for a host. `tls`: 'https' unless the entry says `tls: false`,
+ * then 'http' - how the bytes reached the enclave, so a plaintext answer is never mistaken for a TLS one.
+ */
+export interface HostSource {
+  from: 'host';
+  /** Hostname in the enclave's allowlist. */
+  host: string;
+  /** The allowlist property read. */
+  property: 'tls';
+}
+
 /** Where a BN254 field's value comes from. Discriminated by `from`. */
 export type FieldSource =
   | ResponseFieldSource
   | RequestParamSource
   | RequestHeaderSource
   | ParsedSource
-  | DerivedSource;
+  | DerivedSource
+  | HostSource;
 
 /** Maps a BN254 schema field to its data origin and transformation. */
 export interface FieldProvenance {

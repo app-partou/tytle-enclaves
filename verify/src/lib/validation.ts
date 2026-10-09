@@ -3,6 +3,8 @@
  * Every value that touches a shell command or comparison MUST be validated here first.
  */
 
+import { X509Certificate } from 'node:crypto';
+import { existsSync, readFileSync } from 'node:fs';
 import type { ServiceName } from './types.js';
 import { VALID_SERVICES } from './types.js';
 
@@ -84,14 +86,18 @@ export function validateApiUrl(url: string): string {
   return url;
 }
 
-/** Validate SOURCE_DATE_EPOCH is a numeric unix timestamp. */
-export function validateSourceDateEpoch(value: string): string {
-  if (!/^\d+$/.test(value)) {
-    throw new Error(
-      `Invalid SOURCE_DATE_EPOCH: "${value}". Must be a numeric Unix timestamp.`,
-    );
+/** Validate --signing-cert: a file holding an X.509 certificate in PEM. Returns the PEM. */
+export function validateSigningCertFile(file: string): string {
+  if (!existsSync(file)) {
+    throw new Error(`--signing-cert file not found: ${file}`);
   }
-  return value;
+  const pem = readFileSync(file, 'utf-8');
+  try {
+    new X509Certificate(pem);
+  } catch {
+    throw new Error(`--signing-cert is not an X.509 certificate in PEM: ${file}`);
+  }
+  return pem;
 }
 
 /** Validate a directory path exists and is a git repo. */

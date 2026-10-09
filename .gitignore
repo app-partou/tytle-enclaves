@@ -3,3 +3,7 @@ dist/
 *.tsbuildinfo
 docs/
 .claude/
+native/index.js
+native/index.d.ts
+native/*.node
+native/target/

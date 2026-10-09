@@ -7,11 +7,14 @@
  */
 
 import { encodeBn254AndAttest } from './enclaveHelpers.js';
+import { assertChallenge } from './attestor.js';
 import { errorResponse } from './enclaveHelpers.js';
 import { toErrorMessage } from './errorUtils.js';
 import { proxyFetch, proxyFetchPlain, type HttpResponse } from './httpProxy.js';
 import { proxyFetchWithRetry, type RetryConfig } from './retryProxy.js';
+import { DEFAULT_FETCH_TIMEOUT_MS, RequestDeadlineError, requestBudget, timeFor, type RequestBudget } from './requestBudget.js';
 import { getHeadersToStrip, redactError } from './policyEngine.js';
+import { unsealSecret } from './sealedSecret.js';
 import { stripSensitiveHeaders } from './sanitize.js';
 import type { FieldDef } from './bn254Codec.js';
 import type { PolicyDef } from './manifest.js';
@@ -33,13 +36,28 @@ export interface HandlerResult {
   status?: number;
   skipAttestation?: boolean;
   rawPassthrough?: { status: number; headers: Record<string, string>; rawBody: string };
+  /**
+   * The upstream body the signed `dataHash` commits to, for a handler whose data IS that body (Stripe's JSON): sent
+   * beside the signed answer, never signed itself. A reader uses it only when its SHA-256 is the vector's dataHash.
+   */
+  upstreamBody?: string;
 }
 
+/**
+ * What a handler may do for one request. Every upstream read, retry and KMS call takes what is left of the request's
+ * budget (requestBudget.ts): a `timeoutMs` the handler names can only be shortened, never lengthened.
+ */
 export interface HandlerContext {
   hosts: AllowedHost[];
   log: Logger;
   fetch(host: AllowedHost, method: string, path: string, headers: Record<string, string>, body?: string, timeoutMs?: number): Promise<HttpResponse>;
   fetchWithRetry(host: AllowedHost, method: string, path: string, headers: Record<string, string>, body?: string, timeoutMs?: number, retryConfig?: RetryConfig): Promise<HttpResponse>;
+  /**
+   * The secret a ciphertext sealed for the enclave named `context` holds (sealedSecret.ts, enclave audit P1.7),
+   * opened through KMS - which the enclave's allowlist must name - with the AWS credentials the parent sent with THIS
+   * request.
+   */
+  unsealSecret(ciphertext: string, context: string): Promise<string>;
 }
 
 export interface HandlerDef<TParams> {
@@ -62,11 +80,15 @@ export interface HandlerDef<TParams> {
  * Validates required hosts at construction time (fail-fast on misconfiguration).
  * At request time, handles all boilerplate: JSON parsing, policy enforcement,
  * BN254 encoding + attestation, and response construction.
+ *
+ * `budget` is the request's (requestBudget.ts; startEnclave starts it at accept): when it is spent before a read or
+ * before the attestation, the answer is 504 and no document is minted. A caller that names none (a test) gets a fresh
+ * one.
  */
 export function createHandler<TParams>(
   def: HandlerDef<TParams>,
   hosts: AllowedHost[],
-): (request: EnclaveRequest) => Promise<EnclaveResponse> {
+): (request: EnclaveRequest, budget?: RequestBudget) => Promise<EnclaveResponse> {
   for (const required of def.requiredHosts) {
     if (!hosts.find((h) => h.hostname === required)) {
       throw new Error(`Handler "${def.name}" requires host "${required}" but it is not in the allowlist`);
@@ -76,25 +98,30 @@ export function createHandler<TParams>(
   const headersToStrip = getHeadersToStrip(def.policies);
   const log = createLogger(def.name);
 
-  const ctx: HandlerContext = {
+  /** The context of one request: its reads, retries and KMS call take what is left of its budget. */
+  const contextFor = (request: EnclaveRequest, budget: RequestBudget): HandlerContext => ({
     hosts,
     log,
-    fetch(host, method, path, headers, body, timeoutMs) {
+    async fetch(host, method, path, headers, body, timeoutMs) {
       const fetchFn = host.tls !== false ? proxyFetch : proxyFetchPlain;
-      return fetchFn(host.vsockProxyPort, host.hostname, method, path, headers, body, timeoutMs);
+      const readMs = timeFor(budget, `the read of ${host.hostname}`, timeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS);
+      return fetchFn(host.vsockProxyPort, host.hostname, method, path, headers, body, readMs);
     },
     fetchWithRetry(host, method, path, headers, body, timeoutMs, retryConfig) {
       return proxyFetchWithRetry(
         host.vsockProxyPort, host.hostname, method, path, headers, body,
-        timeoutMs, host.tls !== false, retryConfig,
+        timeoutMs, host.tls !== false, retryConfig, budget,
       );
     },
-  };
+    unsealSecret: (ciphertext, context) => unsealSecret(ciphertext, context, request.awsCredentials, hosts, budget),
+  });
 
-  return async (request: EnclaveRequest): Promise<EnclaveResponse> => {
+  return async (request: EnclaveRequest, budget: RequestBudget = requestBudget(Date.now())): Promise<EnclaveResponse> => {
     try {
       let params: TParams;
       try {
+        // A malformed challenge is refused before any upstream call (and attest() refuses it again).
+        assertChallenge(request.challenge);
         const body = JSON.parse(request.body || '{}');
         params = def.parseParams(body);
       } catch (err: unknown) {
@@ -102,7 +129,7 @@ export function createHandler<TParams>(
       }
 
       const startMs = Date.now();
-      const result = await def.execute(params, ctx);
+      const result = await def.execute(params, contextFor(request, budget));
       const executeMs = Date.now() - startMs;
 
       if (result.rawPassthrough) {
@@ -130,6 +157,8 @@ export function createHandler<TParams>(
         ? stripSensitiveHeaders(result.requestHeaders, headersToStrip)
         : result.requestHeaders;
 
+      // No document is minted once the budget is spent: the parent has given up on this answer, or is about to
+      timeFor(budget, 'the attestation');
       const attestStartMs = Date.now();
       const attestResult = await encodeBn254AndAttest(
         def.schema,
@@ -139,6 +168,7 @@ export function createHandler<TParams>(
           method: result.method,
           url: result.url,
           requestHeaders: { ...attestHeaders, 'x-manifest-hash': def.manifestHash },
+          challenge: request.challenge,
         },
       );
 
@@ -163,11 +193,12 @@ export function createHandler<TParams>(
         attestation: attestResult.attestation,
         bn254: attestResult.rawBody,
         bn254Headers: result.bn254Headers,
+        ...(result.upstreamBody !== undefined ? { upstreamBody: result.upstreamBody } : {}),
       };
     } catch (err: unknown) {
       const safeMessage = redactError(def.policies, toErrorMessage(err));
       log.error('Handler error', { error: safeMessage });
-      return errorResponse(502, safeMessage);
+      return errorResponse(err instanceof RequestDeadlineError ? 504 : 502, safeMessage);
     }
   };
 }

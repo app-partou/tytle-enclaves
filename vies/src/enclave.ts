@@ -8,15 +8,10 @@
  */
 
 import { startEnclave, createHandler } from '@tytle-enclaves/shared';
-import { viesHandlerDef } from './viesHandler.js';
-
-const hosts = [
-  { hostname: 'ec.europa.eu', vsockProxyPort: 8443 },
-  { hostname: 'api.service.hmrc.gov.uk', vsockProxyPort: 8444 },
-];
+import { viesHandlerDef, VIES_HOSTS } from './viesHandler.js';
 
 startEnclave({
   name: 'vies',
-  hosts,
-  customHandler: createHandler(viesHandlerDef, hosts),
+  hosts: VIES_HOSTS,
+  customHandler: createHandler(viesHandlerDef, VIES_HOSTS),
 });

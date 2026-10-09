@@ -192,12 +192,17 @@ describe('bigintToBytes32', () => {
 // =============================================================================
 
 describe('schemaByteLength', () => {
-  it('VIES_SCHEMA = 5 * 32 = 160', () => {
-    expect(schemaByteLength(VIES_SCHEMA)).toBe(160);
+  it('VIES_SCHEMA = 6 * 32 = 192 (version 2: dataHash appended)', () => {
+    expect(schemaByteLength(VIES_SCHEMA)).toBe(192);
+    expect(VIES_SCHEMA.at(-1)).toEqual({ name: 'dataHash', encoding: 'sha256', jsType: 'string' });
   });
 
-  it('SICAE_SCHEMA = 6 * 32 = 192', () => {
-    expect(schemaByteLength(SICAE_SCHEMA)).toBe(192);
+  it('SICAE_SCHEMA = 8 * 32 = 256 (version 2: dataHash and transport appended)', () => {
+    expect(schemaByteLength(SICAE_SCHEMA)).toBe(256);
+    expect(SICAE_SCHEMA.slice(-2)).toEqual([
+      { name: 'dataHash', encoding: 'sha256', jsType: 'string' },
+      { name: 'transport', encoding: 'shortString', jsType: 'string' },
+    ]);
   });
 
   it('STRIPE_PAYMENT_SCHEMA = 6 * 32 = 192', () => {
@@ -668,7 +673,7 @@ describe('VIES_SCHEMA encode/decode roundtrip', () => {
     };
 
     const encoded = encodeFieldElements(VIES_SCHEMA, values);
-    expect(encoded.length).toBe(160);
+    expect(encoded.length).toBe(192);
 
     const decoded = decodeFieldElements(VIES_SCHEMA, encoded);
 
@@ -689,7 +694,7 @@ describe('VIES_SCHEMA encode/decode roundtrip', () => {
     };
 
     const encoded = encodeFieldElements(VIES_SCHEMA, values);
-    expect(encoded.length).toBe(160);
+    expect(encoded.length).toBe(192);
 
     const decoded = decodeFieldElements(VIES_SCHEMA, encoded);
 
@@ -745,7 +750,7 @@ describe('SICAE_SCHEMA encode/decode roundtrip', () => {
     };
 
     const encoded = encodeFieldElements(SICAE_SCHEMA, values);
-    expect(encoded.length).toBe(192);
+    expect(encoded.length).toBe(256);
 
     const decoded = decodeFieldElements(SICAE_SCHEMA, encoded);
 
@@ -1090,11 +1095,11 @@ describe('decodeToTyped', () => {
 
 describe('decode error handling', () => {
   it('throws on wrong buffer length', () => {
-    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(100))).toThrow('Expected 160 bytes');
+    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(100))).toThrow('Expected 192 bytes');
   });
 
   it('throws on empty buffer with non-empty schema', () => {
-    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(0))).toThrow('Expected 160 bytes');
+    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(0))).toThrow('Expected 192 bytes');
   });
 
   it('decodes empty schema from empty buffer', () => {
@@ -1103,15 +1108,15 @@ describe('decode error handling', () => {
   });
 
   it('throws when buffer is too large', () => {
-    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(200))).toThrow('Expected 160 bytes');
+    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(200))).toThrow('Expected 192 bytes');
   });
 
   it('throws when buffer is one byte short', () => {
-    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(159))).toThrow('Expected 160 bytes');
+    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(191))).toThrow('Expected 192 bytes');
   });
 
   it('throws when buffer is one byte too long', () => {
-    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(161))).toThrow('Expected 160 bytes');
+    expect(() => decodeFieldElements(VIES_SCHEMA, Buffer.alloc(193))).toThrow('Expected 192 bytes');
   });
 });
 
@@ -1217,8 +1222,9 @@ describe('cross-repo consistency: known test vectors', () => {
       address: null,
     }).toString('base64')).toBe(b64);
 
-    // Verify structure: 5 fields × 32 bytes
-    expect(encoded.length).toBe(160);
+    // Verify structure: 6 fields × 32 bytes (the last, dataHash, is null here)
+    expect(encoded.length).toBe(192);
+    expect(isZero(encoded.subarray(160, 192))).toBe(true);
 
     // First 32 bytes = "PT" as shortString
     const ptField = encoded.subarray(0, 32);
@@ -1241,7 +1247,7 @@ describe('cross-repo consistency: known test vectors', () => {
     expect(isZero(addrField)).toBe(true);
   });
 
-  it('SICAE: 507172230 with CAE 62010 produces 192 bytes', () => {
+  it('SICAE: 507172230 with CAE 62010 produces 256 bytes', () => {
     const encoded = encodeFieldElements(SICAE_SCHEMA, {
       nif: '507172230',
       name: 'TYTLE LDA',
@@ -1249,9 +1255,11 @@ describe('cross-repo consistency: known test vectors', () => {
       cae1Desc: 'Computer programming activities',
       cae2Code: null,
       cae2Desc: null,
+      dataHash: null,
+      transport: 'http',
     });
 
-    expect(encoded.length).toBe(192);
+    expect(encoded.length).toBe(256);
 
     // Verify nif field
     const nifField = encoded.subarray(0, 32);
@@ -1269,6 +1277,8 @@ describe('cross-repo consistency: known test vectors', () => {
     // Verify secondary CAE fields are null
     expect(isZero(encoded.subarray(128, 160))).toBe(true); // cae2Code
     expect(isZero(encoded.subarray(160, 192))).toBe(true); // cae2Desc
+    expect(isZero(encoded.subarray(192, 224))).toBe(true); // dataHash (null here)
+    expect(recoverShortString(encoded.subarray(224, 256))).toBe('http'); // transport
   });
 
   it('STRIPE_PAYMENT: list_charges vector for cross-repo decoder', () => {
@@ -1335,8 +1345,8 @@ describe('cross-repo consistency: known test vectors', () => {
     });
 
     // All must be deterministic
-    expect(viesEncoded.length).toBe(160);
-    expect(sicaeEncoded.length).toBe(192);
+    expect(viesEncoded.length).toBe(192);
+    expect(sicaeEncoded.length).toBe(256);
     expect(stripeEncoded.length).toBe(192);
 
     // Re-encode and verify

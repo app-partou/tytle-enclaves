@@ -24,14 +24,10 @@
  */
 
 import { startEnclave, createHandler } from '@tytle-enclaves/shared';
-import { sicaeHandlerDef } from './sicaeHandler.js';
-
-const hosts = [
-  { hostname: 'www.sicae.pt', vsockProxyPort: 8445, tls: false as const },
-];
+import { sicaeHandlerDef, SICAE_HOSTS } from './sicaeHandler.js';
 
 startEnclave({
   name: 'sicae',
-  hosts,
-  customHandler: createHandler(sicaeHandlerDef, hosts),
+  hosts: SICAE_HOSTS,
+  customHandler: createHandler(sicaeHandlerDef, SICAE_HOSTS),
 });
