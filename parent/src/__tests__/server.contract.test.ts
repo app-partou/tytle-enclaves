@@ -5,9 +5,11 @@
  * listing of the systemd unit directory.
  */
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
-import type { AddressInfo } from 'node:net';
-import type { Server } from 'node:http';
+import net, { type AddressInfo } from 'node:net';
+import http, { type Server } from 'node:http';
+import { once } from 'node:events';
 import { readMessage, writeMessage, type MessageStream } from '@tytle-enclaves/shared';
+import { blockFor } from '../../../shared/src/__tests__/helpers/blockingVsock.js';
 
 const io = vi.hoisted(() => ({
   vsockConnectAsync: vi.fn(),
@@ -26,7 +28,7 @@ vi.mock('node:fs/promises', async (importOriginal) => ({
   readdir: io.readdir,
 }));
 
-import { createApp } from '../app.js';
+import { createApp, listenParent } from '../app.js';
 import { getAllRoutes } from '../enclaveRouter.js';
 import { startFakeImds, imdsCredentials } from './helpers/fakeImds.js';
 
@@ -87,7 +89,8 @@ let logs: string[];
 let errors: string[];
 
 beforeAll(async () => {
-  server = createApp().listen(0, '127.0.0.1');
+  // Each /health here reads the host anew: the shared check's cache is off (its own tests start apps of their own)
+  server = createApp({ healthCacheMs: 0 }).listen(0, '127.0.0.1');
   await new Promise<void>((r) => server.once('listening', () => r()));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 });
@@ -365,7 +368,11 @@ describe('GET /health', () => {
     });
     if (unitFiles instanceof Error) io.readdir.mockRejectedValue(unitFiles);
     else io.readdir.mockResolvedValue(unitFiles);
-    io.execFile.mockImplementation((_cmd: string, args: string[], _opts: unknown, callback: (err: Error | null) => void) => {
+    io.execFile.mockImplementation((cmd: string, args: string[], _opts: unknown, callback: (err: Error | null, stdout?: string) => void) => {
+      if (cmd === 'nitro-cli') {
+        callback(null, JSON.stringify(running));
+        return;
+      }
       callback(active.includes(args[2]) ? null : Object.assign(new Error('inactive'), { code: 3 }));
     });
   }
@@ -426,12 +433,17 @@ describe('GET /health', () => {
     expect(Object.keys(body.proxies as object)).toEqual(['hmrc', 'sicae', 'stripe', 'vies']);
   });
 
-  it('systemd is asked without a shell, once per proxy unit, and nothing else (red)', async () => {
+  it('nitro-cli and systemd are asked without a shell: nitro-cli once, systemd once per proxy unit, and nothing else (red)', async () => {
+    // nitro-cli ran through a shell before (execSync with a command line), and held the event loop while it ran
     await host();
     await health();
-    expect(io.execFile.mock.calls.map((call) => [call[0], call[1]])).toEqual(
-      ['hmrc', 'sicae', 'stripe', 'vies'].map((name) => ['systemctl', ['is-active', '--quiet', `vsock-proxy-${name}`]]),
-    );
+    expect(io.execFile.mock.calls.map((call) => [call[0], call[1]])).toEqual([
+      ['nitro-cli', ['describe-enclaves']],
+      ...['hmrc', 'sicae', 'stripe', 'vies'].map((name) => ['systemctl', ['is-active', '--quiet', `vsock-proxy-${name}`]]),
+    ]);
+    // Each with its time limit, nitro-cli's as before (5 s)
+    expect(io.execFile.mock.calls.map((call) => (call[2] as { timeout?: number }).timeout)).toEqual([5_000, 2_000, 2_000, 2_000, 2_000]);
+    expect(io.execSync).not.toHaveBeenCalled();
   });
 
   it('a down proxy does not make the parent unhealthy: the watchdog reads 503 as a down enclave (lock)', async () => {
@@ -453,7 +465,101 @@ describe('GET /health', () => {
     expect((await health()).body.proxies).toEqual({});
     await host({ unitFiles: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) });
     expect((await health()).body.proxies).toEqual({});
-    expect(io.execFile).not.toHaveBeenCalled();
+    expect(io.execFile.mock.calls.filter(([cmd]) => cmd === 'systemctl')).toEqual([]);
+  });
+
+  it('nitro-cli that fails, or prints no JSON, lists no enclave, whatever it printed: 503, and the parent answers (lock)', async () => {
+    await host();
+    // The release before ran it with execSync, which throws for a failed run
+    io.execSync.mockImplementation(() => { throw Object.assign(new Error('Command failed: nitro-cli describe-enclaves'), { status: 1 }); });
+    io.execFile.mockImplementation((cmd: string, args: string[], _opts: unknown, callback: (err: Error | null, stdout?: string) => void) => {
+      if (cmd === 'nitro-cli') callback(Object.assign(new Error('Command failed: nitro-cli describe-enclaves'), { code: 1 }), JSON.stringify(ALL_RUNNING));
+      else callback(null);
+    });
+    const failed = await health();
+    expect(failed.status).toBe(503);
+    expect((failed.body.enclaves as Array<{ state: string }>).map((e) => e.state)).toEqual(['NOT_FOUND', 'NOT_FOUND', 'NOT_FOUND']);
+
+    io.execSync.mockReturnValue('nitro-cli: not JSON');
+    io.execFile.mockImplementation((cmd: string, args: string[], _opts: unknown, callback: (err: Error | null, stdout?: string) => void) => {
+      callback(null, cmd === 'nitro-cli' ? 'nitro-cli: not JSON' : undefined);
+    });
+    const garbled = await health();
+    expect(garbled.status).toBe(503);
+    expect((garbled.body.enclaves as Array<{ state: string }>).map((e) => e.state)).toEqual(['NOT_FOUND', 'NOT_FOUND', 'NOT_FOUND']);
+  });
+
+  /** How often nitro-cli was asked, through a shell (the release before) or not. */
+  const nitroCliAsks = (): number => io.execSync.mock.calls.length + io.execFile.mock.calls.filter(([cmd]) => cmd === 'nitro-cli').length;
+
+  /**
+   * nitro-cli takes `ms` to answer. The release before ran it with execSync, which holds the thread that long (the fake
+   * blocks it, as the real wait does); this one runs it with execFile, which calls back after it.
+   */
+  function slowNitroCli(ms: number): void {
+    io.execSync.mockImplementation(() => {
+      blockFor(ms);
+      return JSON.stringify(ALL_RUNNING);
+    });
+    const answerAtOnce = io.execFile.getMockImplementation();
+    io.execFile.mockImplementation((cmd: string, args: string[], opts: unknown, callback: (err: Error | null, stdout?: string) => void) => {
+      if (cmd === 'nitro-cli') setTimeout(() => callback(null, JSON.stringify(ALL_RUNNING)), ms);
+      else answerAtOnce?.(cmd, args, opts, callback);
+    });
+  }
+
+  it('the parent serves its other routes while nitro-cli runs (enclave review 2026-10-09, E2b F-1, F-2) (red)', async () => {
+    // /routes is asked 100 ms after /health: a timer, which needs the event loop. Before, nitro-cli held the event loop
+    // while it ran (execSync), and /routes waited for it.
+    await host();
+    slowNitroCli(1_500);
+    const own = await listen(createApp());
+    try {
+      const start = Date.now();
+      const probe = fetch(`${own.url}/health`);
+      const routesAt = await new Promise<number>((resolve) => {
+        setTimeout(() => { void fetch(`${own.url}/routes`).then(() => resolve(Date.now() - start)); }, 100);
+      });
+      expect(routesAt).toBeLessThan(100 + 400);
+      expect((await probe).status).toBe(200);
+    } finally {
+      await own.close();
+    }
+  });
+
+  it('probes that come while a check runs share it: nitro-cli is asked once (E2b F-2) (red)', async () => {
+    await host();
+    slowNitroCli(300);
+    const own = await listen(createApp());
+    try {
+      const answers = await Promise.all([1, 2, 3].map(() => fetch(`${own.url}/health`)));
+      expect(answers.map((answer) => answer.status)).toEqual([200, 200, 200]);
+      expect(nitroCliAsks()).toBe(1);
+    } finally {
+      await own.close();
+    }
+  });
+
+  it('a check answers every probe for 2 s after it, and a probe after that checks again (E2b F-2) (red)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const own = await listen(createApp());
+    try {
+      const t0 = 1_760_000_000_000;
+      vi.setSystemTime(t0);
+      await host();
+      expect((await fetch(`${own.url}/health`)).status).toBe(200);
+      // An enclave stops. Within the 2 s, a probe gets the last check's answer.
+      await host({ running: ALL_RUNNING.slice(0, 2) });
+      vi.setSystemTime(t0 + 1_999);
+      expect((await fetch(`${own.url}/health`)).status).toBe(200);
+      expect(nitroCliAsks()).toBe(1);
+      vi.setSystemTime(t0 + 2_000);
+      expect((await fetch(`${own.url}/health`)).status).toBe(503);
+      expect(nitroCliAsks()).toBe(2);
+    } finally {
+      vi.useRealTimers();
+      await own.close();
+    }
   });
 });
 
@@ -523,6 +629,7 @@ describe('the parent token: ENCLAVE_PARENT_AUTH_TOKEN (enclave audit P1.7, the i
     expect((await send('/metrics', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
     expect((await send('/routes', { headers: { Authorization: `Bearer ${TOKEN}` } })).status).toBe(200);
     io.execSync.mockReturnValue('[]');
+    io.execFile.mockImplementation((_cmd: string, _args: string[], _opts: unknown, callback: (err: Error | null, stdout?: string) => void) => callback(null, '[]'));
     io.readdir.mockResolvedValue([]);
     const health = await send('/health');
     expect(health.status).toBe(503); // answered without the token: no enclave runs in this test
@@ -618,4 +725,107 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
     expect(framed).toEqual(request({ url: STRIPE }));
     expect(errors).toEqual(['[parent] IMDSv2: no host role credentials: "IMDS answered 500 to PUT /latest/api/token"']);
   });
+});
+
+/** The number of connections `server` holds now. */
+function connectionsOf(server: Server): Promise<number> {
+  return new Promise((resolve, reject) => server.getConnections((err, count) => (err ? reject(err) : resolve(count))));
+}
+
+describe('a caller that has gone (enclave review 2026-10-09, E2b F-1, item 2)', () => {
+  it('a request whose caller closed its connection before the parent sent it on never reaches the enclave (red)', async () => {
+    // A Stripe request waits for the host role's credentials; its caller gives up meanwhile, as data-bridge does at its
+    // own deadline. Before, the parent sent it on anyway: the enclave fetched upstream and minted a document nobody got.
+    let asked!: () => void;
+    const imdsAsked = new Promise<void>((resolve) => { asked = resolve; });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const imds = await startFakeImds({
+      answer: async (read) => {
+        asked();
+        await held;
+        return imdsCredentials(read, Date.now() + 6 * 3600_000);
+      },
+    });
+    const { createHostCredentials } = await import('../hostCredentials.js');
+    const parent = createApp({ hostCredentials: createHostCredentials({ endpoint: imds.url }) }).listen(0, '127.0.0.1');
+    await once(parent, 'listening');
+    try {
+      const caller = http.request({
+        host: '127.0.0.1',
+        port: (parent.address() as AddressInfo).port,
+        method: 'POST',
+        path: '/attest/fetch',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      caller.on('error', () => { /* destroyed below, on purpose */ });
+      caller.end(JSON.stringify(request({ url: 'https://api.stripe.com/v1/charges' })));
+      await imdsAsked;
+      caller.destroy();
+      await vi.waitFor(async () => expect(await connectionsOf(parent)).toBe(0));
+      release();
+      await vi.waitFor(() => expect(logs).toContain(`[parent] ${ID}: the caller has gone; not sent to the enclave`));
+      expect(io.vsockConnectAsync).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await new Promise<void>((resolve) => parent.close(() => resolve()));
+      await imds.close();
+    }
+  });
+});
+
+/** The status of the next response on `socket`: its head, then its Content-Length body. */
+function nextResponse(socket: net.Socket): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let bytes = Buffer.alloc(0);
+    const stop = (): void => {
+      socket.off('data', onData);
+      socket.off('close', onClose);
+    };
+    const onClose = (): void => {
+      stop();
+      reject(new Error('the parent closed the connection'));
+    };
+    const onData = (chunk: Buffer): void => {
+      bytes = Buffer.concat([bytes, chunk]);
+      const headEnd = bytes.indexOf('\r\n\r\n');
+      if (headEnd === -1) return;
+      const head = bytes.subarray(0, headEnd).toString('latin1');
+      const length = Number(/\r\ncontent-length: *(\d+)/i.exec(head)?.[1] ?? 0);
+      if (bytes.length < headEnd + 4 + length) return;
+      stop();
+      resolve(Number(head.slice('HTTP/1.1 '.length, 'HTTP/1.1 '.length + 3)));
+    };
+    socket.on('data', onData);
+    socket.on('close', onClose);
+  });
+}
+
+describe('an idle connection is kept for the caller\'s next request (enclave review 2026-10-09, E2b F-1, item 4)', () => {
+  it('a connection idle 7 s, past Node\'s 5 s, still serves the next request (red)', async () => {
+    // The parent listens as server.ts starts it (listenParent). The release before had none: it listened with Node's
+    // defaults, whose 5 s timer closed an idle connection (Node 24 and later wait 1 s more: 7 s is past both).
+    const start = typeof listenParent === 'function'
+      ? listenParent
+      : (app: ReturnType<typeof createApp>, port: number, host: string): Server => app.listen(port, host);
+    const parent = start(createApp(), 0, '127.0.0.1');
+    await once(parent, 'listening');
+    const socket = net.connect((parent.address() as AddressInfo).port, '127.0.0.1');
+    let closedByParent = false;
+    socket.on('end', () => { closedByParent = true; });
+    try {
+      await once(socket, 'connect');
+      const ask = 'GET /routes HTTP/1.1\r\nHost: parent\r\n\r\n';
+      socket.write(ask);
+      expect(await nextResponse(socket)).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 7_000));
+      expect(closedByParent).toBe(false);
+      const second = nextResponse(socket);
+      socket.write(ask);
+      expect(await second).toBe(200);
+    } finally {
+      socket.destroy();
+      await new Promise<void>((resolve) => parent.close(() => resolve()));
+    }
+  }, 15_000);
 });

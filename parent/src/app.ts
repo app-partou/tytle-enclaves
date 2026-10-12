@@ -11,9 +11,10 @@
 
 import express from 'express';
 import crypto from 'node:crypto';
+import type { Server } from 'node:http';
 import { findRoute, getAllRoutes, opensSealedSecrets } from './enclaveRouter.js';
 import { sendToEnclave } from './vsockClient.js';
-import { checkHealth } from './healthCheck.js';
+import { checkHealth, type HealthStatus } from './healthCheck.js';
 import { MAX_REQUEST_BODY, parseFetchRequest } from './requestSchema.js';
 import type { HostCredentials } from './hostCredentials.js';
 import type { EnclaveRequest } from './types.js';
@@ -68,6 +69,53 @@ function carriesToken(header: string | undefined, token: string): boolean {
   return crypto.timingSafeEqual(sha256(header.slice('Bearer '.length)), sha256(token));
 }
 
+/**
+ * How long one /health check answers every probe after it, in ms. A probe used to start a check of its own (nitro-cli,
+ * a ping per enclave, systemctl per proxy), so a loop of probes, which needs no token, made the host do that work
+ * without end (enclave review 2026-10-09, E2b F-2). The host's watchdog reads /health every 30 s and the reload's ready
+ * check every 5 s: an answer 2 s old misleads neither.
+ */
+export const HEALTH_CACHE_MS = 2_000;
+
+/**
+ * How long an idle connection is kept for its caller's next request, in ms (Node's default: 5 s). data-bridge's fetch
+ * keeps one for the time the parent's Keep-Alive header gives, less a margin, so the parent always closes last; a longer
+ * life means fewer connections, and fewer reuses close to the edge. Before, the parent's event loop could stall past
+ * that margin, and its timer closed a connection with a request on it, unread (E2b F-1, item 4).
+ */
+export const PARENT_KEEP_ALIVE_MS = 65_000;
+
+/**
+ * Start `app` on `port` as the parent serves: with PARENT_KEEP_ALIVE_MS. server.ts starts the parent with it; the tests
+ * start it the same way.
+ */
+export function listenParent(app: express.Express, port: number, host: string, onListening?: () => void): Server {
+  const server = app.listen(port, host, onListening);
+  server.keepAliveTimeout = PARENT_KEEP_ALIVE_MS;
+  return server;
+}
+
+/**
+ * The health check behind /health: probes that come while a check runs share it, and its answer serves every probe for
+ * `cacheMs` after it ended.
+ */
+function sharedHealthCheck(cacheMs: number): () => Promise<HealthStatus> {
+  let last: { status: HealthStatus; endedAt: number } | null = null;
+  let running: Promise<HealthStatus> | null = null;
+  return () => {
+    if (last !== null && Date.now() - last.endedAt < cacheMs) return Promise.resolve(last.status);
+    running ??= checkHealth()
+      .then((status) => {
+        last = { status, endedAt: Date.now() };
+        return status;
+      })
+      .finally(() => {
+        running = null;
+      });
+    return running;
+  };
+}
+
 export interface ParentOptions {
   /**
    * The shared secret data-bridge sends as `Authorization: Bearer <token>` (ENCLAVE_PARENT_AUTH_TOKEN, enclave audit
@@ -78,6 +126,11 @@ export interface ParentOptions {
   authToken?: string;
   /** The host role's credentials, for an enclave that opens sealed secrets (hostCredentials.ts). Unset: none sent. */
   hostCredentials?: HostCredentials;
+  /**
+   * How long one /health check answers every probe after it (HEALTH_CACHE_MS when unset). At 0 each probe checks anew,
+   * though probes that come while a check runs still share it.
+   */
+  healthCacheMs?: number;
 }
 
 /** The routes the parent token guards. */
@@ -91,6 +144,7 @@ export function createApp(options: ParentOptions = {}): express.Express {
   const metrics = new Map<number, EnclaveMetrics>();
   const app = express();
   const { authToken, hostCredentials } = options;
+  const health = sharedHealthCheck(options.healthCacheMs ?? HEALTH_CACHE_MS);
 
   // Before the body is read: a request without the token costs no parsing
   if (authToken) {
@@ -114,6 +168,13 @@ export function createApp(options: ParentOptions = {}): express.Express {
    * method by then.
    */
   app.post('/attest/fetch', async (req, res) => {
+    // A caller that has gone (data-bridge gave up and closed the connection) gets nothing: its request is not sent to
+    // the enclave, which would fetch upstream and mint a document nobody receives (enclave review 2026-10-09, E2b F-1,
+    // item 2). The response closes before this handler answers only when the caller's connection does.
+    let callerGone = false;
+    res.on('close', () => {
+      callerGone = true;
+    });
     const parsed = parseFetchRequest(req.body);
     if (!parsed.ok) {
       res.status(400).json({ success: false, error: parsed.error });
@@ -134,6 +195,10 @@ export function createApp(options: ParentOptions = {}): express.Express {
       // The host role's credentials go only to an enclave that opens sealed secrets; without them the request still
       // goes, and only a sealed secret fails, in the enclave (NO_CREDENTIALS)
       const awsCredentials = hostCredentials && opensSealedSecrets(route) ? await hostCredentials.get() : null;
+      if (callerGone) {
+        console.log(`[parent] ${requestId}: the caller has gone; not sent to the enclave`);
+        return;
+      }
       const enclaveRequest: EnclaveRequest = { ...parsed.request, id: requestId, ...(awsCredentials ? { awsCredentials } : {}) };
 
       const response = await sendToEnclave(route.cid, route.port, enclaveRequest);
@@ -154,9 +219,9 @@ export function createApp(options: ParentOptions = {}): express.Express {
     }
   });
 
-  /** GET /health - health check for Cloud Map / load balancer. */
+  /** GET /health - health check for Cloud Map / load balancer. A probe gets the shared check's answer (HEALTH_CACHE_MS). */
   app.get('/health', async (_req, res) => {
-    const status = await checkHealth();
+    const status = await health();
     res.status(status.healthy ? 200 : 503).json(status);
   });
 

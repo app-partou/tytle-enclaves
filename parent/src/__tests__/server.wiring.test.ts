@@ -6,17 +6,24 @@
  *
  * Labels: "red" = fails on the release before this one.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, type Mock } from 'vitest';
 
 const seen = vi.hoisted(() => ({
   appOptions: [] as unknown[],
   credentialOptions: [] as unknown[],
-  listen: null as unknown as ReturnType<typeof vi.fn>,
+  /** The apps server.ts started through listenParent */
+  started: [] as unknown[],
+  listen: null as unknown as Mock<(port: number, host: string, onListening: () => void) => unknown>,
 }));
 vi.mock('../app.js', () => ({
   createApp: (options: unknown) => {
     seen.appOptions.push(options);
-    return { listen: seen.listen };
+    // Its own listen too: the release before called it, with Node's defaults
+    return { app: 'the parent', listen: (...args: [number, string, () => void]) => seen.listen(...args) };
+  },
+  listenParent: (app: unknown, port: number, host: string, onListening: () => void) => {
+    seen.started.push(app);
+    return seen.listen(port, host, onListening);
   },
 }));
 vi.mock('../hostCredentials.js', () => ({
@@ -31,6 +38,7 @@ let logs: string[];
 beforeEach(() => {
   seen.appOptions.length = 0;
   seen.credentialOptions.length = 0;
+  seen.started.length = 0;
   seen.listen = vi.fn();
   logs = [];
   vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { logs.push(args.map(String).join(' ')); });
@@ -66,5 +74,11 @@ describe('server.ts (red)', () => {
     await start();
     expect(seen.appOptions).toEqual([{ authToken: undefined, hostCredentials: expect.objectContaining({ reader: 'imds' }) }]);
     expect(logs).toContain('[parent] ENCLAVE_PARENT_AUTH_TOKEN is not set: /attest/fetch, /metrics and /routes answer every caller that reaches this port');
+  });
+
+  it('starts the app through listenParent, which keeps an idle connection PARENT_KEEP_ALIVE_MS (enclave review 2026-10-09, E2b F-1, item 4)', async () => {
+    await start();
+    expect(seen.started).toHaveLength(1);
+    expect(seen.started[0]).toMatchObject({ app: 'the parent' });
   });
 });

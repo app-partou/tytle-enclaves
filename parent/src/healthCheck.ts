@@ -10,9 +10,13 @@
  * It also reports each vsock proxy on the host (P0.5 step 3): the enclaves reach their upstreams only through them,
  * and from June to October 2026 every proxy crash-looped while this check said healthy
  * (docs/ENCLAVE_ATTESTATION_AUDIT_2026_10.md §0 in the main repo).
+ *
+ * Nothing here holds the event loop: nitro-cli and systemctl run as child processes the parent does not wait on, and the
+ * pings read in slices (shared vsockWait.ts), all at once. A check took up to 11 s before, and the parent served
+ * nothing else meanwhile (enclave review 2026-10-09, E2b F-1, F-2).
  */
 
-import { execFile, execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { readdir } from 'node:fs/promises';
 import { getAllRoutes } from './enclaveRouter.js';
 import { pingEnclave } from './vsockClient.js';
@@ -54,45 +58,45 @@ const UNIT_DIR = '/etc/systemd/system';
 /** vsock-proxy-<name>.service: the names the infra gives the units (infra/lib/enclaveServices.ts VSOCK_PROXIES). */
 const PROXY_UNIT_RE = /^vsock-proxy-([a-z0-9][a-z0-9-]*)\.service$/;
 const SYSTEMCTL_TIMEOUT_MS = 2_000;
+const NITRO_CLI_TIMEOUT_MS = 5_000;
 
 /** Check the health of all configured enclaves, and report each proxy. */
 export async function checkHealth(): Promise<HealthStatus> {
-  const routes = getAllRoutes();
-  const enclaveStates = getEnclaveStates();
-
-  const [enclaves, proxies] = await Promise.all([
-    Promise.all(
-      routes.map(async (route): Promise<EnclaveStatus> => {
-        const state = enclaveStates.find((e) => e.EnclaveCID === route.cid);
-        const isRunning = state?.State === 'RUNNING';
-
-        let connectivity: EnclaveStatus['connectivity'] = 'untested';
-        let clockDriftMs: number | null = null;
-        if (isRunning) {
-          const ping = await pingEnclave(route.cid, route.port);
-          connectivity = ping.responsive ? 'responsive' : 'unresponsive';
-          clockDriftMs = ping.clockDriftMs;
-        }
-
-        return {
-          cid: route.cid,
-          hosts: route.hosts,
-          state: state?.State || 'NOT_FOUND',
-          connectivity,
-          clockDriftMs,
-          healthy: isRunning && connectivity === 'responsive',
-        };
-      }),
-    ),
-    probeProxies(),
-  ]);
-
+  const [enclaves, proxies] = await Promise.all([enclaveStatuses(), probeProxies()]);
   return {
     healthy: enclaves.every((e) => e.healthy),
     enclaves,
     proxies,
     timestamp: Date.now(),
   };
+}
+
+/** Each configured enclave: its state as nitro-cli lists it, then, for a running one, its ping. */
+async function enclaveStatuses(): Promise<EnclaveStatus[]> {
+  const enclaveStates = await getEnclaveStates();
+  return Promise.all(
+    getAllRoutes().map(async (route): Promise<EnclaveStatus> => {
+      const state = enclaveStates.find((e) => e.EnclaveCID === route.cid);
+      const isRunning = state?.State === 'RUNNING';
+
+      let connectivity: EnclaveStatus['connectivity'] = 'untested';
+      let clockDriftMs: number | null = null;
+      if (isRunning) {
+        const ping = await pingEnclave(route.cid, route.port);
+        connectivity = ping.responsive ? 'responsive' : 'unresponsive';
+        clockDriftMs = ping.clockDriftMs;
+      }
+
+      return {
+        cid: route.cid,
+        hosts: route.hosts,
+        state: state?.State || 'NOT_FOUND',
+        connectivity,
+        clockDriftMs,
+        healthy: isRunning && connectivity === 'responsive',
+      };
+    }),
+  );
 }
 
 /** Each installed vsock-proxy unit and whether systemd says it is active, sorted by name. */
@@ -127,16 +131,23 @@ interface NitroEnclaveInfo {
   EnclaveID: string;
 }
 
-/** Query nitro-cli for running enclave states. */
-function getEnclaveStates(): NitroEnclaveInfo[] {
-  try {
-    const output = execSync('nitro-cli describe-enclaves', {
-      timeout: 5000,
-      encoding: 'utf-8',
+/**
+ * The enclaves nitro-cli lists, from `nitro-cli describe-enclaves`: no shell, and the parent serves on while it runs (it
+ * was execSync, which held the event loop up to its 5 s timeout). A failure, a timeout or an output that is not JSON is
+ * none.
+ */
+function getEnclaveStates(): Promise<NitroEnclaveInfo[]> {
+  return new Promise((resolve) => {
+    execFile('nitro-cli', ['describe-enclaves'], { timeout: NITRO_CLI_TIMEOUT_MS, encoding: 'utf-8' }, (err, stdout) => {
+      if (err) {
+        resolve([]);
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout) as NitroEnclaveInfo[]);
+      } catch {
+        resolve([]);
+      }
     });
-
-    return JSON.parse(output) as NitroEnclaveInfo[];
-  } catch {
-    return [];
-  }
+  });
 }
