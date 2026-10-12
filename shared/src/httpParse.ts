@@ -14,7 +14,12 @@
  *     (RFC 9112 §6.3: a smuggling signal);
  *   - neither header: the body runs to the end of the connection (every request sends
  *     `Connection: close`). Truncation is undetectable there; the handlers' rule that a parse miss
- *     is an error is the backstop.
+ *     is an error is the backstop;
+ *   - a 1xx reply other than 101 is an interim one (RFC 9110 §15.2): it is skipped, its headers
+ *     with it, and the reply after it is the answer (enclave review 2026-10-09, E1 F-2);
+ *   - a reply whose Content-Length or chunked body is complete is read then, not at the end of the
+ *     connection, which a server may keep open (E1 F-3). Bytes after it in a later read are never
+ *     read: data after a complete reply may be discarded, and is never a reply (RFC 9112 §6.3).
  */
 
 import { IncompleteBodyError, MalformedResponseError, ResponseTooLargeError } from './httpErrors.js';
@@ -35,27 +40,143 @@ const HEAD_END = Buffer.from('\r\n\r\n');
 const CHUNK_SIZE_PATTERN = /^[0-9a-fA-F]{1,8}$/;
 const CONTENT_LENGTH_PATTERN = /^\d{1,10}$/;
 
+/** The collector's first buffer; it doubles as it fills, up to the limit. */
+const FIRST_BUFFER_BYTES = 16 * 1024;
+
+/**
+ * How far ResponseCollector.complete() has read a reply's framing, so the next call goes on from there: each byte is
+ * looked at a bounded number of times, whatever sizes the bytes come in. `from` is where a search for a line end goes
+ * on.
+ */
+type FramingRead =
+  /** A reply head starts at `start`; its end is not in yet */
+  | { at: 'head'; start: number; from: number }
+  /** The body ends at `end` (Content-Length) */
+  | { at: 'length'; end: number }
+  /** A chunk-size line starts at `start` */
+  | { at: 'size-line'; start: number; from: number }
+  /** A chunk's data ends at `dataEnd`, where its CRLF is due */
+  | { at: 'chunk-end'; dataEnd: number }
+  /** A trailer line, or the empty line that ends the chunked body, starts at `start` */
+  | { at: 'trailer'; start: number; from: number }
+  /** The body runs to the end of the connection: never complete before it */
+  | { at: 'end-of-connection' }
+  /** Complete, or broken beyond what any later byte could mend: finish() reads it now */
+  | { at: 'done' };
+
 /**
  * Collects the bytes of one reply and refuses to hold more than `limitBytes`.
  * `push` throws ResponseTooLargeError as soon as the limit is passed; the caller destroys the socket.
  */
 export class ResponseCollector {
-  private readonly chunks: Buffer[] = [];
+  /** The bytes so far: the first `received` bytes of `buffer` */
+  private buffer = Buffer.alloc(FIRST_BUFFER_BYTES);
   private received = 0;
+  private framing: FramingRead = { at: 'head', start: 0, from: 0 };
 
   constructor(private readonly hostname: string, private readonly limitBytes: number = MAX_RESPONSE_BYTES) {}
 
   push(chunk: Buffer): void {
-    this.received += chunk.length;
-    if (this.received > this.limitBytes) {
-      throw new ResponseTooLargeError(this.hostname, this.received, this.limitBytes);
+    const total = this.received + chunk.length;
+    if (total > this.limitBytes) {
+      throw new ResponseTooLargeError(this.hostname, total, this.limitBytes);
     }
-    this.chunks.push(chunk);
+    if (total > this.buffer.length) {
+      const grown = Buffer.alloc(Math.min(this.limitBytes, Math.max(total, this.buffer.length * 2)));
+      this.buffer.copy(grown, 0, 0, this.received);
+      this.buffer = grown;
+    }
+    chunk.copy(this.buffer, this.received);
+    this.received = total;
   }
 
   /** The reply, read under the rules above. */
   finish(): HttpResponse {
-    return parseHttpResponse(Buffer.concat(this.chunks));
+    return parseHttpResponse(this.buffer.subarray(0, this.received));
+  }
+
+  /**
+   * Whether the bytes so far are a whole reply by its own framing - its Content-Length body, or its chunked body to the
+   * final CRLF - or are broken beyond what a later byte could mend: either way finish() reads it now, before the
+   * connection ends (E1 F-3). Never for a body that runs to the end of the connection. The same reading as finish()'s
+   * parse, step by step: it goes on from where the last call stopped.
+   */
+  complete(): boolean {
+    const raw = this.buffer.subarray(0, this.received);
+    for (;;) {
+      const read = this.framing;
+      switch (read.at) {
+        case 'done':
+          return true;
+        case 'end-of-connection':
+          return false;
+        case 'length':
+          return raw.length >= read.end;
+        case 'head': {
+          const headEnd = raw.indexOf(HEAD_END, read.from);
+          if (headEnd === -1) {
+            read.from = Math.max(read.start, raw.length - (HEAD_END.length - 1));
+            return false;
+          }
+          this.framing = framingAfterHead(raw, read.start, headEnd);
+          break;
+        }
+        case 'size-line': {
+          const lineEnd = raw.indexOf(CRLF, read.from);
+          if (lineEnd === -1) {
+            read.from = Math.max(read.start, raw.length - (CRLF.length - 1));
+            return false;
+          }
+          const size = chunkSizeOf(raw, read.start, lineEnd);
+          const dataStart = lineEnd + CRLF.length;
+          this.framing = size === null ? { at: 'done' }
+            : size === 0 ? { at: 'trailer', start: dataStart, from: dataStart }
+              : { at: 'chunk-end', dataEnd: dataStart + size };
+          break;
+        }
+        case 'chunk-end': {
+          if (raw.length < read.dataEnd + CRLF.length) return false;
+          const next = read.dataEnd + CRLF.length;
+          this.framing = isCrlfAt(raw, read.dataEnd) ? { at: 'size-line', start: next, from: next } : { at: 'done' };
+          break;
+        }
+        case 'trailer': {
+          const lineEnd = raw.indexOf(CRLF, read.from);
+          if (lineEnd === -1) {
+            read.from = Math.max(read.start, raw.length - (CRLF.length - 1));
+            return false;
+          }
+          const next = lineEnd + CRLF.length;
+          this.framing = lineEnd === read.start ? { at: 'done' } : { at: 'trailer', start: next, from: next };
+          break;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Where the framing read goes after the head from `start` to `headEnd`: the next head after an interim reply, else the
+ * answer's body. A head that cannot be read is done: finish() throws its error.
+ */
+function framingAfterHead(raw: Buffer, start: number, headEnd: number): FramingRead {
+  const bodyStart = headEnd + HEAD_END.length;
+  let framing: BodyFraming;
+  try {
+    const head = readHead(raw, start, headEnd);
+    if (isInterim(head.status)) return { at: 'head', start: bodyStart, from: bodyStart };
+    framing = bodyFramingOf(head);
+  } catch (err) {
+    if (err instanceof MalformedResponseError) return { at: 'done' };
+    throw err;
+  }
+  switch (framing.by) {
+    case 'chunked':
+      return { at: 'size-line', start: bodyStart, from: bodyStart };
+    case 'length':
+      return { at: 'length', end: bodyStart + framing.length };
+    case 'end-of-connection':
+      return { at: 'end-of-connection' };
   }
 }
 
@@ -69,14 +190,41 @@ export class ResponseCollector {
  * (enclave review 2026-10-09, E1 F-1).
  */
 export function parseHttpResponse(raw: Buffer): HttpResponse {
-  const headEnd = raw.indexOf(HEAD_END);
-  if (headEnd === -1) {
-    throw new MalformedResponseError('head', 'no header/body separator');
+  let start = 0;
+  for (;;) {
+    const headEnd = raw.indexOf(HEAD_END, start);
+    if (headEnd === -1) {
+      throw new MalformedResponseError('head', 'no header/body separator');
+    }
+    const head = readHead(raw, start, headEnd);
+    // An interim reply has no body: the next head starts right after it
+    if (isInterim(head.status)) {
+      start = headEnd + HEAD_END.length;
+      continue;
+    }
+    const bodyBytes = raw.subarray(headEnd + HEAD_END.length);
+    return { status: head.status, headers: head.headers, body: utf8Of(frameBody(bodyBytes, bodyFramingOf(head))) };
   }
+}
 
+/** 1xx but 101: an interim reply, read and skipped (RFC 9110 §15.2). A 101 ends HTTP on the connection: it is final. */
+function isInterim(status: number): boolean {
+  return status >= 100 && status < 200 && status !== 101;
+}
+
+/** A reply head: its status, its headers, and the values that frame its body. */
+interface Head {
+  status: number;
+  headers: Record<string, string>;
+  contentLengths: string[];
+  transferCodings: string[];
+}
+
+/** The head from `start` to `headEnd` (its CRLFCRLF). A status line that is not one is MalformedResponseError. */
+function readHead(raw: Buffer, start: number, headEnd: number): Head {
   // Byte for byte (latin1): read as 7-bit ASCII, the bytes 0x8D 0x8A became CR LF and split a header line in two
   // (enclave review 2026-10-09, E1 F-13).
-  const lines = raw.subarray(0, headEnd).toString('latin1').split('\r\n');
+  const lines = raw.subarray(start, headEnd).toString('latin1').split('\r\n');
   const statusMatch = lines[0].match(/^HTTP\/\d\.\d\s+(\d{3})(?:\s|$)/);
   if (!statusMatch) {
     throw new MalformedResponseError('status-line', JSON.stringify(lines[0].slice(0, 64)));
@@ -97,9 +245,7 @@ export function parseHttpResponse(raw: Buffer): HttpResponse {
       transferCodings.push(...value.split(',').map((c) => c.trim().toLowerCase()).filter((c) => c !== ''));
     }
   }
-
-  const bodyBytes = raw.subarray(headEnd + HEAD_END.length);
-  return { status, headers, body: utf8Of(frameBody(bodyBytes, contentLengths, transferCodings)) };
+  return { status, headers, contentLengths, transferCodings };
 }
 
 /** Bodies are UTF-8, decoded strictly and with a byte-order mark kept: the text is exactly the bytes sent. */
@@ -118,7 +264,11 @@ function utf8Of(body: Buffer): string {
   }
 }
 
-function frameBody(body: Buffer, contentLengths: string[], transferCodings: string[]): Buffer {
+/** How the body after a final head is framed. */
+type BodyFraming = { by: 'chunked' } | { by: 'length'; length: number } | { by: 'end-of-connection' };
+
+/** The framing a final head gives its body, under the rules at the top; MalformedResponseError when it cannot be read. */
+function bodyFramingOf({ contentLengths, transferCodings }: Head): BodyFraming {
   if (transferCodings.length > 0) {
     if (contentLengths.length > 0) {
       throw new MalformedResponseError('framing', 'both Transfer-Encoding and Content-Length');
@@ -126,7 +276,7 @@ function frameBody(body: Buffer, contentLengths: string[], transferCodings: stri
     if (transferCodings.length !== 1 || transferCodings[0] !== 'chunked') {
       throw new MalformedResponseError('transfer-encoding', `unsupported transfer coding "${transferCodings.join(', ')}"`);
     }
-    return decodeChunked(body);
+    return { by: 'chunked' };
   }
 
   if (contentLengths.length > 0) {
@@ -137,17 +287,27 @@ function frameBody(body: Buffer, contentLengths: string[], transferCodings: stri
     if (!CONTENT_LENGTH_PATTERN.test(declared)) {
       throw new MalformedResponseError('content-length', `not a decimal length: "${declared.slice(0, 32)}"`);
     }
-    const expected = Number(declared);
-    if (body.length < expected) {
-      throw new IncompleteBodyError(`Content-Length ${expected}, received ${body.length}`);
-    }
-    if (body.length > expected) {
-      throw new MalformedResponseError('content-length', `Content-Length ${expected}, received ${body.length}`);
-    }
-    return body;
+    return { by: 'length', length: Number(declared) };
   }
 
-  return body;
+  return { by: 'end-of-connection' };
+}
+
+function frameBody(body: Buffer, framing: BodyFraming): Buffer {
+  switch (framing.by) {
+    case 'chunked':
+      return decodeChunked(body);
+    case 'length':
+      if (body.length < framing.length) {
+        throw new IncompleteBodyError(`Content-Length ${framing.length}, received ${body.length}`);
+      }
+      if (body.length > framing.length) {
+        throw new MalformedResponseError('content-length', `Content-Length ${framing.length}, received ${body.length}`);
+      }
+      return body;
+    case 'end-of-connection':
+      return body;
+  }
 }
 
 /**
@@ -163,11 +323,11 @@ export function decodeChunked(raw: Buffer): Buffer {
     if (sizeLineEnd === -1) {
       throw new IncompleteBodyError('the chunked body ends inside a chunk-size line');
     }
-    const sizeToken = raw.subarray(offset, sizeLineEnd).toString('ascii').split(';', 1)[0].trim();
-    if (!CHUNK_SIZE_PATTERN.test(sizeToken)) {
+    const size = chunkSizeOf(raw, offset, sizeLineEnd);
+    if (size === null) {
+      const sizeToken = chunkSizeToken(raw, offset, sizeLineEnd);
       throw new MalformedResponseError('chunk-size', `"${sizeToken.slice(0, 32)}" is not a hexadecimal chunk size`);
     }
-    const size = parseInt(sizeToken, 16);
     const dataStart = sizeLineEnd + CRLF.length;
 
     if (size === 0) {
@@ -178,12 +338,27 @@ export function decodeChunked(raw: Buffer): Buffer {
     if (dataEnd + CRLF.length > raw.length) {
       throw new IncompleteBodyError(`a chunk of ${size} bytes is cut short`);
     }
-    if (raw[dataEnd] !== CRLF[0] || raw[dataEnd + 1] !== CRLF[1]) {
+    if (!isCrlfAt(raw, dataEnd)) {
       throw new MalformedResponseError('chunk', `the ${size}-byte chunk is not followed by CRLF`);
     }
     parts.push(raw.subarray(dataStart, dataEnd));
     offset = dataEnd + CRLF.length;
   }
+}
+
+/** The size field of the chunk-size line from `start` to its CRLF at `lineEnd` (extensions after `;` cut off). */
+function chunkSizeToken(raw: Buffer, start: number, lineEnd: number): string {
+  return raw.subarray(start, lineEnd).toString('ascii').split(';', 1)[0].trim();
+}
+
+/** The size the chunk-size line from `start` to `lineEnd` gives, or null when it is not hexadecimal. */
+function chunkSizeOf(raw: Buffer, start: number, lineEnd: number): number | null {
+  const token = chunkSizeToken(raw, start, lineEnd);
+  return CHUNK_SIZE_PATTERN.test(token) ? parseInt(token, 16) : null;
+}
+
+function isCrlfAt(raw: Buffer, at: number): boolean {
+  return raw[at] === CRLF[0] && raw[at + 1] === CRLF[1];
 }
 
 /** After the terminal chunk: trailer field lines, then an empty line that must be the last bytes. */

@@ -362,4 +362,22 @@ describe('the KMS call and the request budget (D-P1-11)', () => {
     expect(fakeIo.requests(KMS_PORT)).toEqual([]);
     expect(fakeIo.nsmAsks).toEqual([]);
   });
+
+  it('🔴 the KMS call gets what is left when it starts: the time of the NSM call before it is not given again (E1 F-8)', async () => {
+    // 4 s left at the start; the NSM takes 1.5 s of it. Before, the KMS call still got 4 s (a 4 s socket timeout).
+    kmsSealing(SECRET);
+    fakeIo.nsmTakes(1_500);
+    expect(await unsealSecret(uniqueCiphertext(), 'stripe_payment', CREDENTIALS, ALLOWLIST, { deadlineMs: Date.now() + 4_000 })).toBe(SECRET);
+    const [secs] = fakeIo.timeouts(KMS_PORT);
+    expect(fakeIo.timeouts(KMS_PORT)).toHaveLength(1);
+    expect(secs).toBeLessThanOrEqual(3);
+  });
+
+  it('🔴 a budget spent during the NSM call: no KMS call (E1 F-8)', async () => {
+    kmsSealing(SECRET);
+    fakeIo.nsmTakes(700);
+    const err = await refusal(unsealSecret(uniqueCiphertext(), 'stripe_payment', CREDENTIALS, ALLOWLIST, { deadlineMs: Date.now() + 500 }));
+    expect(err.name).toBe('RequestDeadlineError');
+    expect(fakeIo.requests(KMS_PORT)).toEqual([]);
+  });
 });

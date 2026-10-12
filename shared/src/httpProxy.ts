@@ -40,6 +40,31 @@ function socketTimeoutSecs(timeoutMs: number): number {
  */
 const tlsSessionCache = new Map<string, Buffer>();
 
+/** The request headers the enclave writes itself, in lower case. */
+const ENCLAVE_HEADERS = new Set(['host', 'connection', 'content-length', 'transfer-encoding']);
+
+/**
+ * The request as it goes on the wire: Host first (RFC 9110 §7.2), the caller's headers, `Connection: close`, and the
+ * body's Content-Length. A caller header the enclave writes itself is dropped, whatever its case or the spaces around
+ * it: the enclave's own was set after a spread of the caller's, and object keys are case-sensitive, so a caller `host`
+ * or `content-length` went out beside it (enclave review 2026-10-09, E1 F-5). CR and LF are stripped from every name
+ * and value (no header injection), and spaces from around a name (a line that starts with a space continues the line
+ * before it).
+ */
+function requestText(method: string, path: string, hostname: string, headers: Record<string, string>, body?: string): string {
+  let text = `${method} ${path} HTTP/1.1\r\nHost: ${hostname.replace(/[\r\n]/g, '')}\r\n`;
+  for (const [key, value] of Object.entries(headers)) {
+    const name = key.replace(/[\r\n]/g, '').trim();
+    if (ENCLAVE_HEADERS.has(name.toLowerCase())) continue;
+    text += `${name}: ${value.replace(/[\r\n]/g, '')}\r\n`;
+  }
+  text += 'Connection: close\r\n';
+  if (body) {
+    text += `Content-Length: ${Buffer.byteLength(body, 'utf-8')}\r\n`;
+  }
+  return `${text}\r\n${body ?? ''}`;
+}
+
 /**
  * Make an HTTPS request through a vsock-proxy tunnel.
  *
@@ -85,30 +110,7 @@ export async function proxyFetch(
         },
         () => {
           // TLS handshake complete - send HTTP request
-          // Host and Connection are set AFTER spread to prevent caller override
-          const reqHeaders = {
-            ...headers,
-            Host: hostname,
-            Connection: 'close',
-          };
-
-          let httpReq = `${method} ${path} HTTP/1.1\r\n`;
-          for (const [key, value] of Object.entries(reqHeaders)) {
-            // Sanitize header keys and values to prevent CRLF injection
-            const safeKey = key.replace(/[\r\n]/g, '');
-            httpReq += `${safeKey}: ${value.replace(/[\r\n]/g, '')}\r\n`;
-          }
-
-          if (body) {
-            httpReq += `Content-Length: ${Buffer.byteLength(body, 'utf-8')}\r\n`;
-          }
-          httpReq += '\r\n';
-
-          if (body) {
-            httpReq += body;
-          }
-
-          tlsSocket.write(httpReq);
+          tlsSocket.write(requestText(method, path, hostname, headers, body));
         },
       );
 
@@ -117,11 +119,18 @@ export async function proxyFetch(
         tlsSessionCache.set(hostname, session);
       });
 
-      // Step 3: Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules
+      // Step 3: Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules: when
+      // the connection ends, or as soon as the reply is complete by its own framing (the server may keep it open)
       const collector = new ResponseCollector(hostname);
       tlsSocket.on('data', (chunk: Buffer) => {
         try {
           collector.push(chunk);
+          if (collector.complete()) {
+            clearTimeout(timer);
+            tlsSocket.destroy();
+            duplex?.destroy();
+            resolve(collector.finish());
+          }
         } catch (err) {
           clearTimeout(timer);
           tlsSocket.destroy();
@@ -189,36 +198,20 @@ export async function proxyFetchPlain(
       duplex = new VsockDuplex(vsockRaw);
 
       // Build and send HTTP request directly over the vsock tunnel
-      const reqHeaders = {
-        ...headers,
-        Host: hostname,
-        Connection: 'close',
-      };
+      duplex.write(requestText(method, path, hostname, headers, body));
 
-      let httpReq = `${method} ${path} HTTP/1.1\r\n`;
-      for (const [key, value] of Object.entries(reqHeaders)) {
-        // Sanitize header keys and values to prevent CRLF injection
-        const safeKey = key.replace(/[\r\n]/g, '');
-        httpReq += `${safeKey}: ${value.replace(/[\r\n]/g, '')}\r\n`;
-      }
-
-      if (body) {
-        httpReq += `Content-Length: ${Buffer.byteLength(body, 'utf-8')}\r\n`;
-      }
-      httpReq += '\r\n';
-
-      if (body) {
-        httpReq += body;
-      }
-
-      duplex.write(httpReq);
-
-      // Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules
+      // Collect the response (bytes, at most MAX_RESPONSE_BYTES) and read it under httpParse.ts's rules: when the
+      // connection ends, or as soon as the reply is complete by its own framing (the server may keep it open)
       const collector = new ResponseCollector(hostname);
       const plain = duplex;
       plain.on('data', (chunk: Buffer) => {
         try {
           collector.push(chunk);
+          if (collector.complete()) {
+            clearTimeout(timer);
+            plain.destroy();
+            resolve(collector.finish());
+          }
         } catch (err) {
           clearTimeout(timer);
           plain.destroy();

@@ -17,6 +17,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { createFakeNsm } from './fakeNsm.js';
+import { blockFor } from './blockingVsock.js';
 
 interface Exchange {
   port: number;
@@ -33,6 +34,8 @@ const exchanges: Exchange[] = [];
 let nsm = createFakeNsm();
 /** Raw CBOR the NSM answers with ONCE instead of a document (an NSM error, say). */
 let nsmNext: Buffer | null = null;
+/** How long each NSM answer takes, the thread blocked meanwhile as the ioctl blocks it: 0 = at once. */
+let nsmTakesMs = 0;
 
 function nextReply(port: number): ScriptedReply {
   const queue = queues.get(port);
@@ -73,6 +76,7 @@ const pendingTlsReply = new WeakMap<object, { exchange: Exchange; raw: ScriptedR
 
 export const nativeModule = {
   nsmRequest: (request: Buffer): Buffer => {
+    blockFor(nsmTakesMs);
     if (nsmNext === null) return nsm.nsmRequest(request);
     const raw = nsmNext;
     nsmNext = null;
@@ -152,6 +156,10 @@ export const fakeIo = {
   nsmAnswersNext(raw: Buffer): void {
     nsmNext = raw;
   },
+  /** Each NSM answer from now on takes `ms`, the thread blocked meanwhile (the ioctl is synchronous). */
+  nsmTakes(ms: number): void {
+    nsmTakesMs = ms;
+  },
   /** Ports still holding scripted replies nobody fetched. */
   unusedReplies(): number[] {
     return [...queues.entries()].filter(([, q]) => q.length > 0).map(([p]) => p);
@@ -161,6 +169,7 @@ export const fakeIo = {
     exchanges.length = 0;
     nsm = createFakeNsm();
     nsmNext = null;
+    nsmTakesMs = 0;
   },
 };
 

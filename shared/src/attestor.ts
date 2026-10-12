@@ -77,9 +77,18 @@ export interface AttestationDocument {
  */
 let hypervisorGapMs = 0;
 
+/**
+ * The hypervisor's time as this enclave knows it, in epoch ms: its clock plus its last measured gap. Whatever this
+ * enclave signs with a time takes it from here: an attestation, and the KMS request (sealedSecret.ts), which KMS refuses
+ * more than 5 minutes off its own time (enclave review 2026-10-09, E1 F-9).
+ */
+export function hypervisorNowMs(): number {
+  return Date.now() + hypervisorGapMs;
+}
+
 /** The time an attestation signs, in Unix seconds: the enclave's clock plus its last measured gap to the hypervisor. */
 function attestationTimeSec(): number {
-  return Math.floor((Date.now() + hypervisorGapMs) / 1000);
+  return Math.floor(hypervisorNowMs() / 1000);
 }
 
 /**

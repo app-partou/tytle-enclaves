@@ -53,6 +53,9 @@ export function startEnclave(config: EnclaveConfig): void {
   const processRequest = config.customHandler || createRequestHandler(config);
 
   let activeHandlers = 0;
+  const freeSlot = (): void => {
+    activeHandlers--;
+  };
 
   const main = async (): Promise<void> => {
     console.log(`[enclave:${config.name}] Starting on vsock port ${VSOCK_PORT} (max concurrent: ${MAX_CONCURRENT})`);
@@ -121,12 +124,13 @@ export function startEnclave(config: EnclaveConfig): void {
         return;
       }
 
+      // The slot is held until the handler itself stops, not until its answer was written: a 504 ends the answer, not
+      // the handler, which may still hold its upstream socket (enclave review 2026-10-09, E1 F-7). A handler that
+      // throws at once rejects its run, as one that throws later does, so its slot is freed too.
       activeHandlers++;
-      try {
-        await executeRequest(conn, name, handler, request, budget, writeBy);
-      } finally {
-        activeHandlers--;
-      }
+      const handling = (async () => handler(request, budget))();
+      void handling.then(freeSlot, freeSlot);
+      await executeRequest(conn, name, request, handling, budget, writeBy);
     } catch (err: unknown) {
       const msg = toErrorMessage(err);
       console.error(`[enclave:${name}] Connection error: ${msg}`);
@@ -146,15 +150,15 @@ export function startEnclave(config: EnclaveConfig): void {
   async function executeRequest(
     conn: VsockStream,
     name: string,
-    handler: (req: EnclaveRequest, budget: RequestBudget) => Promise<EnclaveResponse>,
     request: EnclaveRequest,
+    handling: Promise<EnclaveResponse>,
     budget: RequestBudget,
     writeBy: { deadlineMs: number },
   ): Promise<void> {
     console.log(`[enclave:${name}] Request ${request.id}: ${request.method} ${request.url}`);
 
     const response = await withTimeout(
-      () => handler(request, budget),
+      handling,
       budget.deadlineMs + ANSWER_GRACE_MS - Date.now(),
       () => new RequestDeadlineError('the answer'),
     );
@@ -171,14 +175,15 @@ export function startEnclave(config: EnclaveConfig): void {
   });
 }
 
+/** What `promise` gives, or `onTimeout()` when `timeoutMs` passes first. The promise's own work goes on: it is not stopped. */
 async function withTimeout<T>(
-  fn: () => Promise<T>,
+  promise: Promise<T>,
   timeoutMs: number,
   onTimeout: () => Error,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(onTimeout()), timeoutMs);
-    fn().then(
+    promise.then(
       (result) => { clearTimeout(timer); resolve(result); },
       (err) => { clearTimeout(timer); reject(err); },
     );
