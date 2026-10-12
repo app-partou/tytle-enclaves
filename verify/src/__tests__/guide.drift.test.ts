@@ -5,11 +5,14 @@
 
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { BUILDER_NAME } from '../lib/buildRecipe.js';
 import { getAwsNitroRootCa } from '../lib/certChain.js';
 
 const read = (relative: string) => readFileSync(new URL(relative, import.meta.url), 'utf-8');
 const GUIDE = read('../../../VERIFICATION.md');
 const README = read('../../../README.md');
+const SECURITY = read('../../../SECURITY.md');
+const MANIFESTS = read('../../../MANIFESTS.md');
 const CLI = read('../cli.ts');
 const PCR0_API = read('../lib/pcr0Api.ts');
 
@@ -35,5 +38,30 @@ describe('the verification guide', () => {
     const route = /`\$\{apiBaseUrl\}(\/api\/enclave\/pcr0)`/.exec(PCR0_API)?.[1];
     expect(route).toBe('/api/enclave/pcr0');
     expect(GUIDE).toContain(`GET https://api.tytle.io${route}`);
+  });
+
+  // Enclave review 2026-10-09, E2b F-10: the manual build made a builder named plain "tytle-repro", so a verifier who
+  // made it under an earlier BuildKit pin kept building on that BuildKit. The CLI names its builder after the pin.
+  it('the manual build makes and uses the builder the CLI makes: named after the BuildKit pin (red)', () => {
+    expect(GUIDE).toContain(`docker buildx create --name ${BUILDER_NAME} --driver docker-container`);
+    expect(GUIDE).toContain(`--builder ${BUILDER_NAME} \\`);
+    expect(GUIDE).not.toMatch(/tytle-repro(?!-[0-9a-f]{12})/);
+  });
+
+  // E2b F-8: nothing signed covers attestationId, requestHash or apiMethod, and a version-2 challenge binds the
+  // document to a request only for the caller who chose it.
+  it('says which fields are signed, and never that requestHash or the id is checked (red)', () => {
+    expect(GUIDE).toContain('`attestationId`, `requestHash` and `apiMethod` are not signed');
+    expect(GUIDE).not.toMatch(/refuses a document without `requestHash`/);
+    expect(GUIDE).not.toMatch(/to one request\)/);
+    expect(MANIFESTS).not.toMatch(/requestHash → includes manifest hash → proves/);
+  });
+
+  // E2b F-11: the guarantees each page states are the ones the repository holds.
+  it('states no guarantee the repository does not enforce (red)', () => {
+    // CI is a check on a pull request; only branch protection on main (a GitHub setting) makes a merge wait for it
+    for (const text of [GUIDE, SECURITY]) expect(text).not.toMatch(/CI builds every enclave twice on each pull request and fails unless/);
+    // the enclave images install vendored, checksummed packages; the parent image installs from apt, unpinned
+    expect(SECURITY).not.toMatch(/^- System packages are pinned by version$/m);
   });
 });

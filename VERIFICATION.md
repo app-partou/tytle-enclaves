@@ -1,16 +1,26 @@
 # Verification Guide
 
-How to independently verify that a Tytle enclave attestation is authentic.
+How to independently verify a Tytle enclave attestation, and what a verified one says: which code answered, on genuine AWS Nitro hardware, and the values it signed.
 
 ## Overview
 
 Every API call made through a Tytle enclave produces an NSM (Nitro Security Module) attestation document. This document contains:
 
 - **PCR0**: Hash of the enclave image (code identity)
-- **Nonce**: SHA-256(responseHash|apiEndpoint|timestamp), with `|challenge` appended when the caller sent a challenge (version 2). It ties the attestation to a specific response (and, in version 2, to one request)
+- **Nonce**: SHA-256(responseHash|apiEndpoint|timestamp), with `|challenge` appended when the caller sent a challenge (version 2). It ties the attestation to a specific response (and, in version 2, to the request whose challenge it is, for the caller who chose it)
 - **user_data**: SHA-256 of the BN254 vector the enclave encoded from the response, when the service encodes one: it ties the attestation to the data you receive
 - **timestamp**: when the document was signed, stamped by the Nitro hypervisor
 - **COSE_Sign1 signature**: Signed by AWS Nitro hardware, verifiable against the Nitro root CA
+
+## What Is Signed
+
+The attestation is a JSON object, and only part of it is signed. The NSM signs its payload (`nsmDocument`): the PCRs, its own `timestamp` (milliseconds), `user_data` and the `nonce`. The nonce in turn covers `responseHash`, `apiEndpoint`, the document's `timestamp` (seconds) and, in version 2, the `challenge`. A check can rely on these values, and on nothing else.
+
+`attestationId`, `requestHash` and `apiMethod` are not signed. The enclave mints the id and hashes the request, but neither enters the nonce or `user_data`, so whoever hands you the JSON can write anything there: an id they want you to believe was verified, wrapped around another document's genuine signed parts. The CLI prints them under "Not signed" and needs none of them.
+
+So a pass says: this code, on genuine Nitro hardware, at this signed time, answered this endpoint with this response (and, with `bn254Hash`, this vector). Compare those values with what you expected: the CLI prints each one under "What a pass vouches for". A version-2 challenge binds the document to the request whose challenge it is, and only the caller who chose the challenge can tell that request is theirs. To anyone else, a version-2 document says no more than a version-1 one.
+
+A signed time more than a year old, or more than 5 minutes ahead of your clock, fails: the same bounds as Tytle's own verifier. The certificate chain is judged at the signed time, so without an age bound an old document would pass forever, and so would a backdated one if the key of a retired AWS CA ever leaked.
 
 This repository builds four enclave services, each with its own PCR0:
 
@@ -51,7 +61,7 @@ Which checks each document allows:
 | user_data equals bn254Hash; the vector you received (`--bn254`) | yes | yes |
 | Nonce recomputed from responseHash, apiEndpoint, timestamp (and challenge) | no: it needs `apiEndpoint` | yes |
 
-The nonce recompute and the request binding wait for the subject re-key ("Phase 8"), which takes the identifiers out of those two fields; until then they need the full document. The CLI below recomputes the nonce, so it needs the full document: it refuses a document without `requestHash` and `apiEndpoint`. With the anonymous document, do the other checks by hand (Manual Verification, steps 1-5, 7 and 9) or with any COSE library.
+The nonce recompute waits for the subject re-key ("Phase 8"), which takes the identifiers out of `apiEndpoint` and `requestHash`; until then it needs the full document. The CLI below recomputes the nonce, so it needs the full document: it refuses a document without `apiEndpoint`. It never needs `requestHash`, which nothing signs (What Is Signed). With the anonymous document, do the other checks by hand (Manual Verification, steps 1-5, 7 and 9) or with any COSE library.
 
 To download the document for independent verification (an employee's token gives the full document):
 
@@ -80,7 +90,7 @@ npm run build
 # Full verification (cryptographic + reproducible build; needs Docker):
 node dist/cli.js --service vies --attestation attestation.json
 
-# Cryptographic verification only (no Docker required):
+# Cryptographic verification only (no Docker required; the report marks the rebuild SKIP):
 node dist/cli.js --service vies --attestation attestation.json --skip-build
 
 # Also check the BN254 vector you received (base64, in a file) is the one signed:
@@ -101,14 +111,14 @@ curl -s -H "Authorization: Bearer $JWT" "https://api.tytle.io/api/attestations/v
 This will:
 1. Verify the COSE_Sign1 signature (ES384) with the leaf certificate in the document
 2. Validate the certificate chain to the AWS Nitro root CA embedded in the CLI (pinned by fingerprint), judged at the signed time; refuse a debug-mode enclave (PCR0 all zeroes)
-3. Recompute the nonce (version 1 or 2), check it is the nonce in the signed document (a document without one fails), and check the document's `timestamp` is within 10 minutes of the signed time
+3. Recompute the nonce (version 1 or 2), check it is the nonce in the signed document (a document without one fails), check the document's `timestamp` is within 10 minutes of the signed time, and check the signed time is at most a year old and at most 5 minutes ahead of your clock
 4. Check `user_data` equals `bn254Hash`; with `--bn254`, check the vector hashes to `bn254Hash` and, as base64, to `responseHash`
 5. Compare PCR0 against the published value from the API (or `--pcr0`), searching the published history for older releases
 6. With `--signing-cert`, check PCR8 is that certificate's: the EIF that ran was signed with it (without it, the report only says whether the EIF was signed)
-7. Reproduce the Docker build from the published commit of https://github.com/app-partou/tytle-enclaves (unless `--skip-build`); the build never comes from a repository the API names
-8. Extract PCR0 from the reproduced build with the pinned nitro-cli helper (`verify/Dockerfile.nitro-cli`)
+7. Reproduce the Docker build from the published commit of https://github.com/app-partou/tytle-enclaves (unless `--skip-build`: the report then marks the rebuild SKIP, never PASS, and its result line says what was not verified); the build never comes from a repository the API names
+8. Extract PCR0 from the reproduced build with the pinned nitro-cli helper (`verify/Dockerfile.nitro-cli`). A commit whose build recipe (`scripts/build-recipe.json`) or nitro-cli helper differs from the CLI's own is refused, never measured another way: rebuild it with the CLI of that commit
 9. Compare the reproduced PCR0 against the attestation
-10. Output a final pass/fail report
+10. Print what a pass vouches for (the signed values, to compare with what you expected) and the fields nothing signs, then a final pass/fail report
 
 ## Manual Verification
 
@@ -159,13 +169,15 @@ git checkout "$COMMIT"
 
 Build the enclave image with the build recipe of the commit you checked out, `scripts/build-recipe.json`: linux/amd64 (what a Nitro host runs), a fixed file time (`SOURCE_DATE_EPOCH`, the same for every commit: an image changes only when what goes into it changes) and a BuildKit pinned by digest, run as its own builder. `scripts/lib/recipe.sh` builds every image of this repository with these values, and the verify CLI rebuilds with them. The image goes to a tarball, then into Docker: Docker's containerd image store (Docker Desktop's default) refuses `rewrite-timestamp` on a direct load.
 
+The builder's name ends in the first 12 hex digits of the SHA-256 of the BuildKit image it runs, as the CLI names it (`node scripts/lib/recipe.mjs builder-name` prints it): a builder made for an earlier pin is never used for this one. The image does not depend on your umask either: a file an enclave image keeps from the checkout is copied with mode 0644, and the source folders are only compiled in build stages, so no mode from your checkout reaches the image.
+
 ```bash
 # The pinned BuildKit, as its own builder (one-time)
-docker buildx create --name tytle-repro --driver docker-container \
+docker buildx create --name tytle-repro-bc03338c6692 --driver docker-container \
   --driver-opt image=moby/buildkit:v0.27.1@sha256:1e110c71d389d6d24f67b9438e2f7b8da749a6ff407b22a1631e025c95599368
 
 SOURCE_DATE_EPOCH=1767225600 docker buildx build \
-  --builder tytle-repro \
+  --builder tytle-repro-bc03338c6692 \
   --platform linux/amd64 \
   --provenance=false --sbom=false \
   --output "type=docker,dest=verify-$SERVICE.tar,rewrite-timestamp=true,name=verify-$SERVICE:latest" \
@@ -174,11 +186,11 @@ SOURCE_DATE_EPOCH=1767225600 docker buildx build \
 docker load -i "verify-$SERVICE.tar"
 ```
 
-If the values in the commit's `scripts/build-recipe.json` differ from these, use the commit's. A commit without the file was built before the fixed recipe, with the time of its own commit.
+If the values in the commit's `scripts/build-recipe.json` differ from these, use the commit's (and a builder named after its BuildKit image). A commit without the file was built before the fixed recipe, with the time of its own commit.
 
 ### Step 4: Compute and Compare PCR0
 
-Convert the Docker image to an EIF (Enclave Image Format) and extract PCR0. This uses `nitro-cli`, which only runs on Amazon Linux - but you can run it inside Docker on any machine. The `verify/Dockerfile.nitro-cli` in this repo pins the base image by digest and the nitro-cli version, so you get the same helper binary regardless of when you run it (the CLI builds its helper from the same file). Build and run it for linux/amd64 on every machine: on an arm64 machine (an Apple Silicon Mac) Docker picks the arm64 variant, and that nitro-cli cannot read an amd64 image (error E48).
+Convert the Docker image to an EIF (Enclave Image Format) and extract PCR0. This uses `nitro-cli`, which only runs on Amazon Linux - but you can run it inside Docker on any machine. The `verify/Dockerfile.nitro-cli` in this repo pins the base image by digest and the nitro-cli version, so you get the same helper binary regardless of when you run it (the CLI builds its helper from the same file). Use the commit's own helper file: nitro-cli's kernel and init are in every PCR0, so another helper measures another PCR0. Build and run it for linux/amd64 on every machine: on an arm64 machine (an Apple Silicon Mac) Docker picks the arm64 variant, and that nitro-cli cannot read an amd64 image (error E48).
 
 ```bash
 # Build the portable nitro-cli helper container (one-time)
@@ -200,7 +212,7 @@ Your PCR0:        abc123...
 Expected PCR0:    abc123...  <- must match
 ```
 
-The commit's `scripts/expected-digests.json` records the same PCR0 (and the image's config digest) for each enclave: CI builds every enclave twice on each pull request and fails unless both builds are that record.
+The commit's `scripts/expected-digests.json` records the same PCR0 (and the image's config digest) for each enclave. On each pull request, CI builds every enclave twice and fails unless both builds are that record. That is a check on the pull request: a merge waits for it only where the main branch's protection requires it, which is a setting of the repository, not something a commit carries. Your own rebuild is what proves a commit.
 
 ### Step 5: Verify the COSE_Sign1 Signature and the Certificate Chain
 
@@ -216,6 +228,7 @@ The `nsmDocument` field in the attestation is a Base64-encoded COSE_Sign1 struct
 8. Verify `cabundle[0]` IS the [AWS Nitro Attestation PKI root CA](https://aws-nitro-enclaves.amazonaws.com/AWS_NitroEnclaves_Root-G1.zip): its SHA-256 fingerprint is `64:1A:03:21:A3:E2:44:EF:E4:56:46:31:95:D6:06:31:7E:D7:CD:CC:3C:17:56:E0:98:93:F3:C6:8F:79:BB:5B`
 9. Judge every certificate's validity at the payload's `timestamp` (milliseconds; the signing time), not at "now": the leaf lives about three hours, and the lower CAs days. The root itself must be valid now
 10. Check PCR0 in the payload's `pcrs` is not all zeroes: a debug-mode enclave measures zeroes, and its memory is readable from the host, so its document proves nothing
+11. Check the payload's `timestamp` is at most a year old and at most 5 minutes ahead of your clock (What Is Signed)
 
 ### Step 6: Verify the Nonce
 
@@ -251,14 +264,14 @@ When the service encodes a BN254 vector, the payload's `user_data` is SHA-256 of
 
 ### Step 8: Verify the Handler Manifest (Optional)
 
-Services that declare a handler manifest include a `x-manifest-hash` in the attestation's request headers. This hash is a SHA-256 of the manifest JSON (with deterministically sorted keys), binding the attestation to a specific handler specification.
+A handler's manifest is code in the enclave image, so PCR0 already covers it: the commit whose rebuild gives the document's PCR0 holds the manifest that ran. Services that declare one also send its hash, a SHA-256 of the manifest JSON (with deterministically sorted keys), in the `x-{service}-manifest-hash` response header and in the `x-manifest-hash` request header the enclave hashes into `requestHash`. Neither is signed (What Is Signed): use the hash to find the manifest, and the commit to trust it.
 
 To verify:
 
 1. Find the manifest hash in the response headers: `x-{service}-manifest-hash`
-2. Read the handler's `manifest.ts` from the source commit checked out in Step 2
+2. Read the handler's `manifest.ts` from the source commit checked out in Step 2 (the one whose rebuild gives the document's PCR0)
 3. Compute `SHA-256(stableStringify(manifest))` where `stableStringify` sorts object keys recursively
-4. Verify it matches the hash from step 1
+4. Verify it matches the hash from step 1: the header then names the manifest that ran
 
 The manifest describes every API query, every field derivation, and every validation policy. See [MANIFESTS.md](MANIFESTS.md) for the full specification.
 
@@ -281,11 +294,12 @@ Tytle will publish its signing certificate next to the PCR0s (`GET https://api.t
 1. **PCR0 is deterministic**: Same source code + same base images + same dependencies = same PCR0
 2. **PCR0 is in the attestation**: The NSM hardware includes PCR0 in the signed attestation document
 3. **The signature is unforgeable**: Only AWS Nitro hardware can produce valid COSE_Sign1 signatures that chain to the Nitro root CA
-4. **The nonce is bound**: The nonce commits the attestation to a specific API response (and, in version 2, to one request)
+4. **The nonce is bound**: The nonce commits the attestation to a specific API response (and, in version 2, to the request whose challenge it is: only the caller who chose the challenge can tell)
 5. **The data is bound**: `user_data` commits the attestation to the BN254 vector you receive
 6. **The operator is bound** (a signed EIF): PCR8 names the certificate whose key signed the EIF that ran
+7. **The time is bound**: the signed `timestamp` says when; a document more than a year old fails
 
-Together, this proves: "This specific response came from this specific code running in genuine Nitro hardware" - and, with PCR8, from an EIF Tytle signed.
+Together, this proves: "This specific response came from this specific code running in genuine Nitro hardware" - and, with PCR8, from an EIF Tytle signed. It proves nothing about the fields nothing signs: `attestationId`, `requestHash` and `apiMethod` (What Is Signed).
 
 ## PCR0 Drift
 
@@ -293,7 +307,7 @@ Any change to the enclave code, dependencies, or base image produces a new PCR0.
 
 1. The new PCR0 is recorded and published via the public API: `GET https://api.tytle.io/api/enclave/pcr0`
 2. The `history` array in the API response contains all previous PCR0 values with their git commits and deployment timestamps
-3. Previous attestations remain valid against their respective PCR0 values - use the `history` array to find the matching entry
+3. Previous attestations remain valid against their respective PCR0 values for a year after they were signed (the age bound) - use the `history` array to find the matching entry
 4. A new signing certificate changes PCR8 only: PCR0 stays the same
 
 ## Tools

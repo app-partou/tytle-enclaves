@@ -1,6 +1,6 @@
 # Handler Manifests
 
-Every enclave handler declares a **manifest** — a structured, machine-parseable specification of what the handler does. The manifest is baked into the Docker image (contributing to PCR0) and its SHA-256 hash is included in every attestation.
+Every enclave handler declares a **manifest** — a structured, machine-parseable specification of what the handler does. The manifest is baked into the Docker image (contributing to PCR0), and its SHA-256 hash is sent with every answer as a pointer to it (not signed: PCR0 is what binds it).
 
 ## Why Manifests Exist
 
@@ -14,15 +14,16 @@ PCR0 proves which code ran, but it's an opaque hash. The manifest makes the hand
 ## Cryptographic Chain
 
 ```
-PCR0 → proves which Docker image ran (includes manifest code)
-requestHash → includes manifest hash → proves which specification
+PCR0 → proves which Docker image ran, and so which manifest (the manifest is code in the image)
 BN254 fields + dataHash → proves the data transformation
 NSM signature → proves genuine Nitro hardware
 ```
 
 The manifest hash appears in:
 - **Response headers**: `x-{service}-manifest-hash`
-- **Attestation requestHash**: via `x-manifest-hash` in the attested request headers
+- **The request headers the enclave hashes into `requestHash`**: `x-manifest-hash`
+
+Neither is signed: `requestHash` is outside the nonce and `user_data` (VERIFICATION.md, What Is Signed). The hash names the manifest; the commit whose rebuild gives the document's PCR0 is what proves it ran (VERIFICATION.md, Step 8).
 
 ## Manifest Structure
 

@@ -4,8 +4,9 @@
  *
  * Version 1: nonce = SHA-256(responseHash|apiEndpoint|timestamp)
  * Version 2: nonce = SHA-256(responseHash|apiEndpoint|timestamp|challenge) - the caller's challenge (32 bytes as
- * 64 lowercase hex) binds the document to ONE request (enclave audit P1.3). A document says which one it signed
- * (`nonceVersion`, absent = 1) and echoes the challenge.
+ * 64 lowercase hex) binds the document to the request whose challenge it is (enclave audit P1.3): only the caller who
+ * chose it can tell the document answers its request. A document says which version it signed (`nonceVersion`,
+ * absent = 1) and echoes the challenge.
  */
 
 import crypto from 'node:crypto';

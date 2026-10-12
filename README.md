@@ -99,7 +99,7 @@ See [MANIFESTS.md](MANIFESTS.md) for the manifest framework — canonical query 
 
 ## Verification
 
-See [VERIFICATION.md](VERIFICATION.md) for how to reproduce PCR0 and verify attestations: who gets which attestation document, and which checks each allows. The `verify/` CLI runs every check end to end; it is not on npm yet, so build it from `verify/` (`npm ci && npm run build`, then `node dist/cli.js`).
+See [VERIFICATION.md](VERIFICATION.md) for how to reproduce PCR0 and verify attestations: who gets which attestation document, which checks each allows, and which fields are signed (`attestationId`, `requestHash` and `apiMethod` are not). The `verify/` CLI runs every check end to end and prints the signed values a pass vouches for; it is not on npm yet, so build it from `verify/` (`npm ci && npm run build`, then `node dist/cli.js`).
 
 ## Security
 

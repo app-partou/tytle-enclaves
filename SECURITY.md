@@ -73,7 +73,7 @@ Requests to any other host are rejected with HTTP 403. Since the allowlist is in
 ### Supply chain
 
 - Base images are pinned by digest (not tag)
-- System packages are pinned by version
+- The enclave images install system packages only from vendored `.apk` files, each checked against its `SHASUMS256.txt`, offline. The parent image is the exception: its build stage installs its build tools (`nodejs npm build-essential python3`) from Debian's apt, not pinned by version. The parent is in no PCR0 and outside every enclave's trust boundary, but it holds the host role's credentials and the parent token
 - npm dependencies are locked via `package-lock.json`
 - Rust dependencies are locked via the committed `Cargo.lock`: the build fails when it does not match `Cargo.toml` (`cargo fetch --locked`)
 
@@ -81,10 +81,10 @@ Requests to any other host are rejected with HTTP 403. Since the allowlist is in
 
 - ONE recipe builds every image (`scripts/lib/recipe.sh`, values in `scripts/build-recipe.json`): linux/amd64, and a BuildKit pinned by digest, run as its own builder
 - A fixed `SOURCE_DATE_EPOCH` and BuildKit `rewrite-timestamp=true` give every new file the same time: an image, and its PCR0, changes only when what goes into it changes
-- `scripts/expected-digests.json` records each enclave's image config digest and PCR0; CI builds every enclave twice on each pull request and fails unless both builds are that record
+- `scripts/expected-digests.json` records each enclave's image config digest and PCR0. On each pull request, CI builds every enclave twice and fails unless both builds are that record: a check on the pull request, which a merge waits for only where the main branch's protection requires it (a setting of the repository, not something a commit carries). A verifier's own rebuild is what proves a commit (VERIFICATION.md)
 - `scripts/build-eif.sh` writes an EIF, signed or not, only when its build is that record
 - `scripts/build-service.sh`, the deploy's build, loads and pushes an enclave image only when its config digest is that record's
-- Every file an enclave's Dockerfile copies from the checkout gets mode 0644 (`COPY --chmod=0644`): git keeps no read and write bits, so without it the image followed the umask of whoever checked out the repository
+- Every file an enclave image keeps from the checkout gets mode 0644 (`COPY --chmod=0644`), and the source folders are only compiled in build stages, so no mode from the checkout reaches an image: git keeps no read and write bits, so before, the image followed the umask of whoever checked out the repository
 - Fixed UID (1000) avoids `/etc/passwd` differences
 
 ## Reporting
