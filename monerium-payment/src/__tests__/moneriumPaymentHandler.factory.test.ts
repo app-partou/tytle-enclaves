@@ -8,7 +8,8 @@
  *
  * WHY (audit 2026-10 P1.4 and the caller-input row): the handler fetched any orderId it was given, signed an order
  * without checking it was the one asked, signed ANY JSON 404 as "not found", and signed a balance from a JSON-RPC
- * answer to another call. Now each of those is a 400 or an error, never signed.
+ * answer to another call. Now each of those is a 400 or an error, never signed. And since the enclave review of
+ * 2026-10-09 (E-5, F-15) no 404 is signed at all, and an order id in upper case is a 400.
  *
  * Labels: "lock" = the behaviour of the release before this one, kept; "red" = fails on that release.
  */
@@ -103,6 +104,7 @@ describe('a value Monerium is never asked with is a 400 before anything is fetch
     ['an orderId that is not a UUID', { orderId: 'test-order-id' }, /Invalid orderId: a Monerium order id is a UUID/],
     ['an orderId with a path in it', { orderId: `${ORDER_ID}/payments` }, /Invalid orderId/],
     ['an orderId that is not text', { orderId: 42 }, /Invalid orderId/],
+    ['an orderId in upper case (E2a F-15: Monerium\'s ids are lower-case; a 404 for one was signed under its hash)', { orderId: ORDER_ID.toUpperCase() }, /Invalid orderId: a Monerium order id is a UUID in lower case/],
     ['an accessToken that is not text', { accessToken: { token: TOKEN } }, /accessToken is required/],
   ])('%s', async (_label, overrides, error) => {
     const res = await ask(overrides);
@@ -202,23 +204,22 @@ describe('the bodies behind dataHash go out beside the answer, unsigned (enclave
   });
 });
 
-describe('404', () => {
-  it('Monerium\'s own error body with code 404 is signed as not_found, for the order asked (lock)', async () => {
-    fakeIo.reply(MONERIUM_PORT, json(404, NOT_FOUND));
+describe('a 404 is never signed (enclave review 2026-10-09, E-5; red: Monerium\'s own 404 was signed as not_found)', () => {
+  // Whose view of Monerium answered is not signed: another valid token gets Monerium's "no such order" for an order it
+  // cannot see, byte for byte the answer for an order that does not exist. So a 404 proves nothing and is passed on
+  // as Monerium sent it, without a signature or a body beside it; a found order is bound by its id (asked, answered).
+  it.each([
+    ['Monerium\'s own error body with code 404', () => json(404, NOT_FOUND), NOT_FOUND],
+    ['a JSON 404 that is not Monerium\'s error body', () => json(404, JSON.stringify({ message: 'Not Found' })), JSON.stringify({ message: 'Not Found' })],
+    ['a 404 page that is not JSON (a proxy\'s)', () => httpReply(404, '<html><body>Not Found</body></html>', { 'Content-Type': 'text/html' }), '<html><body>Not Found</body></html>'],
+  ])('%s: passed on as sent, unsigned, and no balance asked', async (_label, reply, body) => {
+    fakeIo.reply(MONERIUM_PORT, reply());
     const res = await ask();
-    const want = signed({ orderId: ORDER_ID, state: 'not_found', orderAmount: null, currency: null, balance: 0, dataHash: sha256(NOT_FOUND) });
-    expect(res).toMatchObject({ success: true, status: 404, rawBody: want.base64 });
+    expect(res).toMatchObject({ success: true, status: 404, rawBody: body });
+    expect(res.attestation).toBeUndefined();
+    expect(res.upstreamBody).toBeUndefined();
+    expect(fakeIo.nsmAsks).toHaveLength(0);
     expect(fakeIo.requests(RPC_PORT)).toEqual([]);
-  });
-
-  it('a JSON 404 that is not Monerium\'s error body is an error, never signed (red)', async () => {
-    fakeIo.reply(MONERIUM_PORT, json(404, JSON.stringify({ message: 'Not Found' })));
-    await expectError(ask(), /Monerium answered 404 without its error body \(code 404\)/);
-  });
-
-  it('a 404 page that is not JSON (a proxy\'s) is an error (lock)', async () => {
-    fakeIo.reply(MONERIUM_PORT, httpReply(404, '<html><body>Not Found</body></html>', { 'Content-Type': 'text/html' }));
-    await expectError(ask());
   });
 });
 
