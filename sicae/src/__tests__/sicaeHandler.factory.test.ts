@@ -389,6 +389,20 @@ describe('what the vector commits to besides the answer (red before the release)
   });
 });
 
+describe('the page behind dataHash goes out beside the answer, unsigned (enclave review 2026-10-09, E-4; red before)', () => {
+  it.each([
+    ['a results row', FOUND, '503504564'],
+    ['the "no data" row', NO_DATA, '980494796'],
+  ])('%s: upstreamBody is the page the answer was read from, and its SHA-256 is the signed dataHash', async (_label, answer, nif) => {
+    scriptSicae(html(SEARCH_PAGE), html(answer));
+    const res = await lookup(nif);
+    expect(res.success).toBe(true);
+    expect(res.upstreamBody).toBe(answer);
+    const dataHash = Buffer.from(res.rawBody, 'base64').subarray(6 * 32, 7 * 32);
+    expect(dataHash).toEqual(encodeFieldElements([{ name: 'dataHash', encoding: 'sha256' }], { dataHash: sha256(answer) }));
+  });
+});
+
 describe('the search page itself (lock)', () => {
   it('a GET that is not 200 is an error', async () => {
     fakeIo.reply(PORT, httpReply(503, 'Service Unavailable'));

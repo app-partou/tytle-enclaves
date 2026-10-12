@@ -321,6 +321,9 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
       bn254Headers: {
         'x-monerium-data-hash': dataHash,
       },
+      // The text dataHash commits to (the order body, a line break, the balance answer), beside the answer and never
+      // signed: a reader uses it only when its SHA-256 is the signed dataHash (enclave review 2026-10-09, E-4).
+      upstreamBody: combinedBody,
     };
   },
 };

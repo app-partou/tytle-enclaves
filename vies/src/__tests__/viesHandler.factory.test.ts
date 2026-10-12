@@ -246,6 +246,32 @@ describe('the whole upstream body is committed: dataHash (red before the release
   });
 });
 
+describe('the body behind dataHash goes out beside the answer, unsigned (enclave review 2026-10-09, E-4; red before)', () => {
+  // dataHash committed to a body that never left the enclave and cannot be fetched again (VIES dates every answer):
+  // nobody could ever open the commitment. Stripe's rule now holds for every enclave: the body goes out as
+  // upstreamBody, and a reader uses it only when its SHA-256 is the signed dataHash.
+  it.each([
+    ['VIES, a valid number', VIES_PORT, xml(VIES_VALID), { countryCode: 'PT', vatNumber: '503504564' }, VIES_VALID],
+    ['VIES, "not valid"', VIES_PORT, xml(VIES_NOT_VALID), { countryCode: 'PT', vatNumber: '123456789' }, VIES_NOT_VALID],
+    ['HMRC, a registered number', HMRC_PORT, json(200, HMRC_REGISTERED), { countryCode: 'GB', vatNumber: '123456789' }, HMRC_REGISTERED],
+    ['HMRC, "not registered"', HMRC_PORT, json(404, HMRC_NOT_REGISTERED), { countryCode: 'GB', vatNumber: '123456789' }, HMRC_NOT_REGISTERED],
+  ])('%s: upstreamBody is the body the register sent, and its SHA-256 is the signed dataHash', async (_label, port, reply, body, sent) => {
+    fakeIo.reply(port, reply);
+    const res = await check(body);
+    expect(res.success).toBe(true);
+    expect(res.upstreamBody).toBe(sent);
+    const dataHash = Buffer.from(res.rawBody, 'base64').subarray(5 * 32, 6 * 32);
+    expect(dataHash).toEqual(encodeFieldElements([{ name: 'dataHash', encoding: 'sha256' }], { dataHash: sha256(sent) }));
+  });
+
+  it('an error carries no body (lock)', async () => {
+    fakeIo.reply(VIES_PORT, xml(VIES_FAULT, 500));
+    const res = await check({ countryCode: 'PT', vatNumber: '503504564' });
+    expect(res.success).toBe(false);
+    expect(res.upstreamBody).toBeUndefined();
+  });
+});
+
 describe('manifest (lock)', () => {
   it('declares the VIES_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(VIES_SCHEMA.map((f) => [f.name, f.encoding]));

@@ -285,6 +285,9 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
         'x-vies-address': address || '',
         'x-vies-data-hash': dataHash,
       },
+      // The body dataHash commits to, beside the answer and never signed: a reader uses it only when its SHA-256 is
+      // the signed dataHash, so the commitment can be opened (enclave review 2026-10-09, E-4).
+      upstreamBody,
     };
   },
 };

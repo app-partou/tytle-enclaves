@@ -189,6 +189,19 @@ describe('an order and its balance', () => {
   });
 });
 
+describe('the bodies behind dataHash go out beside the answer, unsigned (enclave review 2026-10-09, E-4; red before)', () => {
+  it('upstreamBody is the order body, a line break, then the balance answer: the text whose SHA-256 is the signed dataHash', async () => {
+    const orderBody = order();
+    const rpcBody = rpc(word(BALANCE_WEI));
+    fakeIo.reply(MONERIUM_PORT, json(200, orderBody));
+    fakeIo.reply(RPC_PORT, json(200, rpcBody));
+    const res = await ask();
+    expect(res.success).toBe(true);
+    expect(res.upstreamBody).toBe(`${orderBody}\n${rpcBody}`);
+    expect(res.headers['x-monerium-data-hash']).toBe(sha256(res.upstreamBody ?? ''));
+  });
+});
+
 describe('404', () => {
   it('Monerium\'s own error body with code 404 is signed as not_found, for the order asked (lock)', async () => {
     fakeIo.reply(MONERIUM_PORT, json(404, NOT_FOUND));

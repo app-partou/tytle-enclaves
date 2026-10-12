@@ -74,7 +74,9 @@ export function parseHttpResponse(raw: Buffer): HttpResponse {
     throw new MalformedResponseError('head', 'no header/body separator');
   }
 
-  const lines = raw.subarray(0, headEnd).toString('ascii').split('\r\n');
+  // Byte for byte (latin1): read as 7-bit ASCII, the bytes 0x8D 0x8A became CR LF and split a header line in two
+  // (enclave review 2026-10-09, E1 F-13).
+  const lines = raw.subarray(0, headEnd).toString('latin1').split('\r\n');
   const statusMatch = lines[0].match(/^HTTP\/\d\.\d\s+(\d{3})(?:\s|$)/);
   if (!statusMatch) {
     throw new MalformedResponseError('status-line', JSON.stringify(lines[0].slice(0, 64)));
@@ -97,7 +99,23 @@ export function parseHttpResponse(raw: Buffer): HttpResponse {
   }
 
   const bodyBytes = raw.subarray(headEnd + HEAD_END.length);
-  return { status, headers, body: frameBody(bodyBytes, contentLengths, transferCodings).toString('utf-8') };
+  return { status, headers, body: utf8Of(frameBody(bodyBytes, contentLengths, transferCodings)) };
+}
+
+/** Bodies are UTF-8, decoded strictly and with a byte-order mark kept: the text is exactly the bytes sent. */
+const UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/**
+ * A body's text, or MalformedResponseError when its bytes are not UTF-8. Read loosely, each invalid byte became U+FFFD,
+ * and a handler hashed and signed that text as the upstream body (dataHash): a commitment to bytes nobody sent
+ * (enclave review 2026-10-09, E1 F-13). Every register the enclaves read answers in UTF-8.
+ */
+function utf8Of(body: Buffer): string {
+  try {
+    return UTF8.decode(body);
+  } catch {
+    throw new MalformedResponseError('body', 'not UTF-8');
+  }
 }
 
 function frameBody(body: Buffer, contentLengths: string[], transferCodings: string[]): Buffer {

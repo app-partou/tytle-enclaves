@@ -406,6 +406,7 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
         requestHeaders: { nif },
         responseHeaders: { 'x-sicae-nif': nif, 'x-sicae-not-found': outcome.why, 'x-sicae-data-hash': dataHash, 'x-sicae-transport': transport },
         bn254Headers: { 'x-sicae-data-hash': dataHash },
+        upstreamBody: answeredPage,
         status: 404,
       };
     }
@@ -446,6 +447,9 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
         'x-sicae-cae2-desc': cae2Desc || '',
         'x-sicae-data-hash': dataHash,
       },
+      // The page dataHash commits to, beside the answer and never signed: a reader uses it only when its SHA-256 is the
+      // signed dataHash, so the commitment can be opened (enclave review 2026-10-09, E-4).
+      upstreamBody: answeredPage,
     };
   },
 };
