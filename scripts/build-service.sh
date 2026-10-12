@@ -5,6 +5,11 @@
 # through each service's build.sh ("build.sh [tag] [ecr-uri]"). The same source gives the same image, and for an
 # enclave the same PCR0.
 #
+# An enclave's image must be its committed build, the one scripts/expected-digests.json records: else nothing is
+# loaded or pushed (enclave review 2026-10-09, H6). The host measures the PCR0 it publishes from this image, so a build
+# that drifted from the record would have become the production pin, and a verifier's rebuild would not match it. The
+# parent is no enclave (no src/enclave.ts): it has no record.
+#
 # Usage: scripts/build-service.sh <service> [tag] [ecr-uri]
 #
 set -euo pipefail
@@ -27,6 +32,9 @@ trap 'rm -rf "$WORK"' EXIT
 echo "Building ${IMAGE} (the recipe: $(recipe_summary))"
 recipe_build "$SERVICE" "$WORK/image.tar" "$IMAGE"
 IMAGE_DIGEST="$(recipe_config_digest "$WORK/image.tar")"
+if [ -f "$REPO_DIR/$SERVICE/src/enclave.ts" ]; then
+  node "$RECIPE_LIB/recipe.mjs" check-digest "$SERVICE" "$IMAGE_DIGEST"
+fi
 docker load -i "$WORK/image.tar" >/dev/null
 echo "Image built: ${IMAGE}"
 echo "Image digest: ${IMAGE_DIGEST}"

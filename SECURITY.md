@@ -83,6 +83,8 @@ Requests to any other host are rejected with HTTP 403. Since the allowlist is in
 - A fixed `SOURCE_DATE_EPOCH` and BuildKit `rewrite-timestamp=true` give every new file the same time: an image, and its PCR0, changes only when what goes into it changes
 - `scripts/expected-digests.json` records each enclave's image config digest and PCR0; CI builds every enclave twice on each pull request and fails unless both builds are that record
 - `scripts/build-eif.sh` writes an EIF, signed or not, only when its build is that record
+- `scripts/build-service.sh`, the deploy's build, loads and pushes an enclave image only when its config digest is that record's
+- Every file an enclave's Dockerfile copies from the checkout gets mode 0644 (`COPY --chmod=0644`): git keeps no read and write bits, so without it the image followed the umask of whoever checked out the repository
 - Fixed UID (1000) avoids `/etc/passwd` differences
 
 ## Reporting

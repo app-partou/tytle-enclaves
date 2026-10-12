@@ -7,6 +7,7 @@
  *   FAKE_DOCKER_CONFIG_DIGEST  the config digest (sha256:<hex>) of every image it builds
  *   FAKE_DOCKER_MEASUREMENTS   a file: what nitro-cli build-enclave prints for the unsigned EIF (its standard output)
  *   FAKE_DOCKER_PCR8           the PCR8 it prints for an EIF signed with --signing-certificate
+ *   FAKE_DOCKER_BUILD_FAILS    when set, every `buildx build` fails as a failed `npm ci` makes it fail, and writes nothing
  */
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -17,7 +18,10 @@ const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_DOCKER_LOG, `${JSON.stringify(args)}\n`);
 const valueAfter = (flag) => args[args.indexOf(flag) + 1];
 
-if (args[0] === 'buildx' && args[1] === 'build') {
+if (args[0] === 'buildx' && args[1] === 'build' && process.env.FAKE_DOCKER_BUILD_FAILS) {
+  process.stderr.write('ERROR: failed to solve: process "/bin/sh -c npm ci" did not complete successfully: exit code: 1\n');
+  process.exit(1);
+} else if (args[0] === 'buildx' && args[1] === 'build') {
   // --output type=docker,dest=<tar>,rewrite-timestamp=true,name=<name>: a docker tarball of one image
   const output = Object.fromEntries(valueAfter('--output').split(',').map((pair) => pair.split('=')));
   const dir = mkdtempSync(path.join(tmpdir(), 'fake-docker-'));

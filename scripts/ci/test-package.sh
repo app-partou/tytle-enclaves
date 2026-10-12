@@ -22,4 +22,9 @@ if [ "$PACKAGE" != shared ]; then
   npm ci --prefix "$REPO_DIR/$PACKAGE" --no-audit --no-fund
 fi
 cd "$REPO_DIR/$PACKAGE"
+# The verify CLI is what a third party builds (VERIFICATION.md: npm ci, npm run build): its compiler runs here, so
+# a type error fails CI, not their build (enclave review 2026-10-09, E2b F-7). vitest runs sources uncompiled.
+if [ "$PACKAGE" = verify ]; then
+  npm run build
+fi
 npm test

@@ -1,7 +1,7 @@
 # CI of the enclave repository (enclave audit P2.2; decision D-P2-1 A: every enclave's EIF on every pull request).
 #
 # Every pull request and every push to main runs:
-#   - each package's tests on Node.js 22 (scripts/ci/test-package.sh);
+#   - each package's tests on Node.js 22 (scripts/ci/test-package.sh), and the verify CLI compiled as its guide builds it;
 #   - the Rust addon's tests and clippy, warnings as errors (scripts/ci/test-native.sh);
 #   - the parent image, built as the deploy builds it (its Dockerfile runs a smoke test);
 #   - the determinism gate for each enclave (scripts/test-determinism.sh): built twice with the one recipe, its EIF
@@ -23,9 +23,11 @@ on:
 permissions:
   contents: read
 
+# A pull request's new push cancels its older run. A push to main never cancels: each commit on main keeps its
+# finished gate (enclave review 2026-10-09, E2b F-6).
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   packages:
