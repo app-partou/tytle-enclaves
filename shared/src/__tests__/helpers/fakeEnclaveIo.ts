@@ -51,7 +51,7 @@ class FakeVsock {
   private reply: Buffer | null = null;
   private offset = 0;
   constructor(private readonly exchange: Exchange, private readonly scripted: ScriptedReply, private readonly plain: boolean) {}
-  read(size: number): Buffer {
+  readWithin(size: number, _timeoutMs: number): Buffer | null {
     // Under TLS the vsock leg carries only TLS records: the reply arrives through the fake TLS socket instead.
     // Plain HTTP: the request is written before the first read, so a function reply sees all of it.
     this.reply ??= this.plain ? Buffer.from(replyText(this.scripted, this.exchange), 'utf-8') : Buffer.alloc(0);
@@ -59,7 +59,7 @@ class FakeVsock {
     this.offset += out.length;
     return out;
   }
-  write(data: Buffer): number {
+  writeWithin(data: Buffer, _timeoutMs: number): number {
     if (this.plain) this.exchange.written.push(Buffer.from(data));
     return data.length;
   }

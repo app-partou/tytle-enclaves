@@ -17,7 +17,7 @@ class ScriptedVsock {
   constructor(chunks: Buffer[]) {
     this.pending = [...chunks];
   }
-  read(size: number): Buffer {
+  readWithin(size: number, _timeoutMs: number): Buffer | null {
     const next = this.pending.shift();
     if (!next) return Buffer.alloc(0);
     if (next.length > size) {
@@ -26,7 +26,7 @@ class ScriptedVsock {
     }
     return next;
   }
-  write(data: Buffer): number {
+  writeWithin(data: Buffer, _timeoutMs: number): number {
     this.written.push(Buffer.from(data));
     return data.length;
   }

@@ -10,7 +10,7 @@ function trickle(bytes: Buffer, perRead: number, clock?: { now: number; msPerRea
   let offset = 0;
   const stream = {
     reads: 0,
-    read(size: number): Buffer {
+    readWithin(size: number, _timeoutMs: number): Buffer | null {
       stream.reads++;
       if (clock) clock.now += clock.msPerRead;
       const n = Math.min(size, perRead, bytes.length - offset);
@@ -18,7 +18,7 @@ function trickle(bytes: Buffer, perRead: number, clock?: { now: number; msPerRea
       offset += n;
       return out;
     },
-    write(data: Buffer): number {
+    writeWithin(data: Buffer, _timeoutMs: number): number {
       return data.length;
     },
   };
@@ -63,7 +63,7 @@ describe('readMessage (locks)', () => {
 
   it('writeMessage frames what readMessage reads', async () => {
     const written: Buffer[] = [];
-    await writeMessage({ read: () => Buffer.alloc(0), write: (d: Buffer) => { written.push(Buffer.from(d)); return d.length; } }, { b: 'é' });
+    await writeMessage({ readWithin: () => Buffer.alloc(0), writeWithin: (d: Buffer) => { written.push(Buffer.from(d)); return d.length; } }, { b: 'é' });
     await expect(readMessage(trickle(Buffer.concat(written), 3))).resolves.toEqual({ b: 'é' });
   });
 });

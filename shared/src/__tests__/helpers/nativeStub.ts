@@ -38,11 +38,11 @@ export class VsockStream {
   static connect(_cid: number, _port: number, _timeoutSecs?: number | null): VsockStream {
     return notInTests('VsockStream.connect');
   }
-  read(_size: number): Buffer {
-    return notInTests('VsockStream.read');
+  readWithin(_size: number, _timeoutMs: number): Buffer | null {
+    return notInTests('VsockStream.readWithin');
   }
-  write(_data: Buffer): number {
-    return notInTests('VsockStream.write');
+  writeWithin(_data: Buffer, _timeoutMs: number): number {
+    return notInTests('VsockStream.writeWithin');
   }
   close(): void {
     notInTests('VsockStream.close');
@@ -55,5 +55,8 @@ export class VsockStream {
   }
   get peerPort(): number {
     return notInTests('VsockStream.peerPort');
+  }
+  get openedAtMs(): number {
+    return notInTests('VsockStream.openedAtMs');
   }
 }

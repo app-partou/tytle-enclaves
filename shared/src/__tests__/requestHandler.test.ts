@@ -24,12 +24,12 @@ const sha256 = (s: string) => crypto.createHash('sha256').update(s).digest('hex'
 function upstreamReplies(raw: string) {
   let sent = false;
   connect.mockReturnValue({
-    read: () => {
+    readWithin: () => {
       if (sent) return Buffer.alloc(0);
       sent = true;
       return Buffer.from(raw, 'utf-8');
     },
-    write: (d: Buffer) => d.length,
+    writeWithin: (d: Buffer) => d.length,
     close: () => {},
   });
 }
@@ -84,13 +84,13 @@ describe('createRequestHandler and the request budget (D-P1-11)', () => {
     vi.spyOn(Date, 'now').mockImplementation(() => now);
     let sent = false;
     connect.mockReturnValue({
-      read: () => {
+      readWithin: () => {
         if (sent) return Buffer.alloc(0);
         sent = true;
         now += 12_001;
         return Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok', 'utf-8');
       },
-      write: (d: Buffer) => d.length,
+      writeWithin: (d: Buffer) => d.length,
       close: () => {},
     });
     const res = await handler(REQUEST, { deadlineMs: 3_000_000 + 12_000 });

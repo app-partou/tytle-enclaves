@@ -2,7 +2,9 @@
  * vsock Client - connects to Nitro Enclaves via AF_VSOCK using the native addon.
  *
  * Uses vsockConnectAsync() for non-blocking connect with kernel-level
- * timeouts, and the shared protocol module for length-prefixed message framing.
+ * timeouts, and the shared protocol module for length-prefixed message framing. The framing's reads and writes wait
+ * in slices (shared vsockWait.ts): while one enclave takes its time, this server goes on serving every other request
+ * and /health (enclave review 2026-10-09, D7: a blocking read froze the whole parent for an enclave's answer).
  *
  * Build note: The parent server runs on EC2 (Amazon Linux 2023, glibc).
  * The native addon must be compiled with a glibc-based Rust toolchain,
@@ -35,8 +37,8 @@ export async function sendToEnclave(
   request: EnclaveRequest,
   timeoutMs: number = ENCLAVE_ANSWER_BUDGET_MS,
 ): Promise<EnclaveResponse> {
-  // Reads are blocking libc calls: withTimeout's timer cannot fire while one waits, and a peer that
-  // sends one byte at a time resets the socket's per-read timeout. The deadline bounds the whole answer.
+  // The deadline bounds the whole exchange, the request's write and the answer's read: a peer that sends one byte
+  // at a time, or drains our bytes one at a time, cannot hold the connection past it.
   const deadlineMs = Date.now() + timeoutMs;
   const timeoutSecs = Math.max(1, Math.ceil(timeoutMs / 1000));
   const conn = await vsockConnectAsync(cid, port, timeoutSecs);
@@ -44,7 +46,7 @@ export async function sendToEnclave(
   try {
     return await withTimeout(
       async () => {
-        await writeMessage(conn, request);
+        await writeMessage(conn, request, { deadlineMs });
         return readMessage<EnclaveResponse>(conn, { deadlineMs });
       },
       timeoutMs,
@@ -83,7 +85,7 @@ export async function pingEnclave(
       return await withTimeout(
         async (): Promise<PingResult> => {
           const sentAtMs = Date.now();
-          await writeMessage(conn, { type: 'ping' });
+          await writeMessage(conn, { type: 'ping' }, { deadlineMs });
           const resp = await readMessage<{ type?: unknown; timestamp?: unknown }>(conn, { deadlineMs });
           const receivedAtMs = Date.now();
           if (resp.type !== 'pong') return { responsive: false, clockDriftMs: null };

@@ -33,7 +33,7 @@ import { startFakeImds, imdsCredentials } from './helpers/fakeImds.js';
 /** The bytes the shared protocol writes for `message`: what an enclave sends. */
 async function frame(message: unknown): Promise<Buffer> {
   const out: Buffer[] = [];
-  await writeMessage({ read: () => Buffer.alloc(0), write: (data: Buffer) => { out.push(Buffer.from(data)); return data.length; } }, message);
+  await writeMessage({ readWithin: () => Buffer.alloc(0), writeWithin: (data: Buffer) => { out.push(Buffer.from(data)); return data.length; } }, message);
   return Buffer.concat(out);
 }
 
@@ -41,12 +41,12 @@ async function frame(message: unknown): Promise<Buffer> {
 function bytesStream(bytes: Buffer): MessageStream {
   let offset = 0;
   return {
-    read(size: number): Buffer {
+    readWithin(size: number): Buffer | null {
       const out = bytes.subarray(offset, Math.min(bytes.length, offset + size));
       offset += out.length;
       return out;
     },
-    write: () => 0,
+    writeWithin: () => 0,
   };
 }
 
@@ -55,8 +55,8 @@ async function enclaveConnection(answer: unknown) {
   const reply = bytesStream(await frame(answer));
   const written: Buffer[] = [];
   return {
-    read: (size: number): Buffer => reply.read(size),
-    write(data: Buffer): number {
+    readWithin: (size: number, timeoutMs: number): Buffer | null => reply.readWithin(size, timeoutMs),
+    writeWithin(data: Buffer): number {
       written.push(Buffer.from(data));
       return data.length;
     },
@@ -361,7 +361,7 @@ describe('GET /health', () => {
       if (silent.includes(cid)) throw new Error('connection refused');
       const off = drift[cid];
       const reply = bytesStream(await frame(off === null || off === undefined ? { type: 'pong' } : { type: 'pong', timestamp: Date.now() + off }));
-      return { read: (size: number) => reply.read(size), write: (data: Buffer) => data.length, close: () => {} };
+      return { readWithin: (size: number, timeoutMs: number) => reply.readWithin(size, timeoutMs), writeWithin: (data: Buffer) => data.length, close: () => {} };
     });
     if (unitFiles instanceof Error) io.readdir.mockRejectedValue(unitFiles);
     else io.readdir.mockResolvedValue(unitFiles);

@@ -24,7 +24,10 @@ export type { HttpResponse } from './httpParse.js';
 /** CID 3 = host parent from inside the enclave */
 const HOST_CID = 3;
 
-/** The socket read/write timeout for a fetch budget: whole seconds, at least 1 (0 means "never" to the kernel). */
+/**
+ * The socket read/write timeout for a fetch budget: whole seconds, at least 1 (0 means "never" to the kernel). A
+ * backstop: each read and write waits only a slice (vsockWait.ts), and the fetch's own timer below ends the fetch.
+ */
 function socketTimeoutSecs(timeoutMs: number): number {
   return Math.max(1, Math.ceil(timeoutMs / 1000));
 }
@@ -67,8 +70,8 @@ export async function proxyFetch(
     }, timeoutMs);
 
     try {
-      // Step 1: Connect to host's vsock-proxy. Every read and write on the socket gives up within the
-      // fetch budget: a proxy that accepts and goes silent must not block libc::read forever.
+      // Step 1: Connect to host's vsock-proxy. Each read and write waits a slice at a time (VsockDuplex), so this
+      // fetch's timer fires on time: a proxy that accepts and goes silent ends the fetch at its timeout.
       const vsockRaw = VsockStream.connect(HOST_CID, vsockPort, socketTimeoutSecs(timeoutMs));
       duplex = new VsockDuplex(vsockRaw);
 
@@ -181,7 +184,7 @@ export async function proxyFetchPlain(
     }, timeoutMs);
 
     try {
-      // Connect to host's vsock-proxy (no TLS — write raw HTTP); reads and writes give up within the budget
+      // Connect to host's vsock-proxy (no TLS — write raw HTTP); reads and writes wait a slice at a time
       const vsockRaw = VsockStream.connect(HOST_CID, vsockPort, socketTimeoutSecs(timeoutMs));
       duplex = new VsockDuplex(vsockRaw);
 
