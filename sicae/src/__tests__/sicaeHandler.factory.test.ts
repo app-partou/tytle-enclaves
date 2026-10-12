@@ -159,11 +159,12 @@ describe('SICAE\'s own "not found" answers are signed (red before the release)',
     expect(posts()).toHaveLength(1);
   });
 
-  it('the "NIPC not valid" refusal is not_found too, attested, after one form', async () => {
+  it('the "NIPC not valid" refusal of a number whose check digit is right is not_found too, attested, after one form', async () => {
+    // 123456789 passes the check digit (123456788, the number the page was recorded for, is now a 400 before any fetch).
     scriptSicae(html(INVALID_NIPC));
-    const res = await lookup('123456788');
+    const res = await lookup('123456789');
 
-    const want = NOT_FOUND('123456788', INVALID_NIPC);
+    const want = NOT_FOUND('123456789', INVALID_NIPC);
     expect(res).toMatchObject({ success: true, status: 404, rawBody: want.base64 });
     expect(res.headers['x-sicae-not-found']).toBe('invalid_nipc');
     expect(fakeIo.nsmAsks.map((a) => a.userData?.toString('hex'))).toEqual([want.hash]);
@@ -207,12 +208,12 @@ describe('a page that is not one of SICAE\'s answers is an error, never signed (
 
   it('the "NIPC not valid" label beside a second label', async () => {
     scriptSicae(html(INVALID_NIPC.replace("não é válido</span>", 'não é válido</span><span class="ClassErro">Tente mais tarde.</span>')));
-    await expectError('123456788', /an error label this handler does not know: "O campo 'NIPC' não é válido \| Tente mais tarde\."/);
+    await expectError('123456789', /an error label this handler does not know: "O campo 'NIPC' não é válido \| Tente mais tarde\."/);
   });
 
   it('an error label with any other text', async () => {
     scriptSicae(html(INVALID_NIPC.replace("O campo 'NIPC' não é válido", 'Ocorreu um erro inesperado.')));
-    await expectError('123456788', /SICAE page unreadable: an error label this handler does not know: "Ocorreu um erro inesperado\."/);
+    await expectError('123456789', /SICAE page unreadable: an error label this handler does not know: "Ocorreu um erro inesperado\."/);
   });
 
   it('the "NIPC not valid" label beside a results grid', async () => {
@@ -235,6 +236,129 @@ describe('a page that is not one of SICAE\'s answers is an error, never signed (
   it('one refused variant, then a page with neither marker: still an error', async () => {
     scriptSicae(httpReply(500, 'Server Error'), html(SEARCH_PAGE));
     await expectError('503504564', /SICAE processed no form variant/);
+  });
+});
+
+describe('the NIF itself is checked before anything is fetched (enclave review 2026-10-09, E2a F-7 and F-8; red before)', () => {
+  it.each([
+    ['a wrong check digit (F-7: it was fetched, and SICAE\'s refusal signed as "not found")', '123456788', 'fails its check digit'],
+    ['a number, not text (F-8: it passed the 9-digit rule)', 503504564, 'Invalid NIF: must be text'],
+  ])('%s is a 400', async (_label, nif, error) => {
+    const res = await lookup(nif);
+    expect(res).toMatchObject({ success: false, status: 400 });
+    expect(res.error).toContain(error);
+    expect(fakeIo.requests(PORT)).toHaveLength(0);
+  });
+});
+
+describe('the results row is read by one strict rule (enclave review 2026-10-09, E-2 and E2a F-6, F-8; red before)', () => {
+  async function expectUnreadable(nif: string) {
+    const res = await lookup(nif);
+    expect(res).toMatchObject({ success: false, status: 502 });
+    expect(res.error).toMatch(/SICAE page unreadable/);
+    expect(res.attestation).toBeUndefined();
+    expect(fakeIo.nsmAsks).toHaveLength(0);
+  }
+  const NAME = 'EDP COMERCIAL-COMERCIALIZAÇÃO DE ENERGIA, S.A.';
+  const nameCell = (title: string, text: string) => `<div style="cursor: pointer;" title="${title}">${text}</div>`;
+  const withName = (title: string, text = title) => FOUND.replace(nameCell(NAME, NAME), nameCell(title, text));
+
+  it('a grid whose header class changed is unreadable: no looser rule reads it (E-2)', async () => {
+    scriptSicae(html(FOUND.replace('class="gridHeader"', 'class="gridHead"')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a five-digit number in the name is never signed as the primary CAE (E-2, probe S2b)', async () => {
+    scriptSicae(html(withName('CLINICA 24500 SAUDE, S.A.').replace('class="gridHeader"', 'class="gridHead"')));
+    await expectUnreadable('503504564');
+  });
+
+  it('the primary CAE is the code its cell shows, never a number in its description (E-2)', async () => {
+    const desc = 'Comércio de eletricidade 12345 kV';
+    scriptSicae(html(FOUND.replace('title="Comércio de eletricidade, exceto para mobilidade elétrica"', `title="${desc}"`)));
+    const res = await lookup('503504564');
+    expect(res).toMatchObject({ success: true, status: 200 });
+    expect(res.headers).toMatchObject({ 'x-sicae-cae1-code': '35151', 'x-sicae-cae1-desc': desc });
+  });
+
+  it('a secondary CAE whose shown text is not a code is unreadable: it was skipped, and the next one signed as the first (E-2)', async () => {
+    scriptSicae(html(FOUND.replace('35230,</div>', 'ver lista</div>')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a grid whose columns moved is unreadable: a cell is never read by its place alone (E-2)', async () => {
+    scriptSicae(html(FOUND.replace('<td>CAE Principal</td><td>CAEs Secundários</td>', '<td>CAEs Secundários</td><td>CAE Principal</td>')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a primary CAE with no description is unreadable, never signed with an empty one (E-2)', async () => {
+    scriptSicae(html(FOUND.replace('title="Comércio de eletricidade, exceto para mobilidade elétrica"', 'title=""')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a secondary CAE with no description is unreadable, never signed with an empty one (E-2)', async () => {
+    scriptSicae(html(FOUND.replace('title="Comércio de gás por condutas"', 'title=""')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a secondary description with a double quote SICAE does not encode is unreadable, never signed cut short (F-6)', async () => {
+    scriptSicae(html(FOUND.replace('title="Comércio de gás por condutas"', 'title="Comércio de gás "natural" por condutas"')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a character reference this reader does not know is unreadable, never guessed (F-6)', async () => {
+    scriptSicae(html(withName('EDP COM&eacute;RCIO, S.A.')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a name with a double quote SICAE does not encode is unreadable, never signed cut short (F-6, probe S3)', async () => {
+    scriptSicae(html(withName('SOCIEDADE AGRICOLA "QUINTA DO VALE", LDA')));
+    await expectUnreadable('503504564');
+  });
+
+  it('a name whose shown text is not its title is unreadable (F-6)', async () => {
+    scriptSicae(html(withName('EDP COMERCIAL A, S.A.', 'EDP COMERCIAL B, S.A.')));
+    await expectUnreadable('503504564');
+  });
+
+  it('entities are decoded before the name and the descriptions are signed (F-6)', async () => {
+    const page = withName('EDP &amp; FILHOS, S.A.')
+      .replace('title="Comércio de gás por condutas"', 'title="Comércio de gás &quot;natural&quot; por condutas"');
+    scriptSicae(html(page));
+    const res = await lookup('503504564');
+    expect(res).toMatchObject({ success: true, status: 200 });
+    expect(res.headers).toMatchObject({ 'x-sicae-name': 'EDP & FILHOS, S.A.', 'x-sicae-cae2-desc': 'Comércio de gás "natural" por condutas' });
+    const want = signed({
+      nif: '503504564', name: 'EDP & FILHOS, S.A.', cae1Code: '35151',
+      cae1Desc: 'Comércio de eletricidade, exceto para mobilidade elétrica', cae2Code: '35230',
+      cae2Desc: 'Comércio de gás "natural" por condutas', dataHash: sha256(page), transport: 'http',
+    });
+    expect(res.rawBody).toBe(want.base64);
+  });
+
+  it('a grid without its NIPC column is unreadable, never signed under the NIF asked (F-8, probe S6)', async () => {
+    scriptSicae(html(FOUND.replace('<td>NIPC</td>', '').replace('<td>503504564</td>', '')));
+    await expectUnreadable('999999990');
+  });
+});
+
+describe('the session cookie among several Set-Cookie headers (enclave review 2026-10-09, E1 F-1, E2a F-9)', () => {
+  /** SICAE's search page with these Set-Cookie headers, in this order, then the found page. */
+  function scriptCookies(...cookies: string[]): void {
+    const head = ['HTTP/1.1 200 OK', 'Content-Type: text/html; charset=utf-8', ...cookies.map((c) => `Set-Cookie: ${c}`),
+      `Content-Length: ${Buffer.byteLength(SEARCH_PAGE, 'utf-8')}`];
+    fakeIo.reply(PORT, `${head.join('\r\n')}\r\n\r\n${SEARCH_PAGE}`);
+    fakeIo.reply(PORT, html(FOUND));
+  }
+
+  it.each([
+    ['a balancer cookie after it (red before: the last Set-Cookie was the only one kept)', [`ASP.NET_SessionId=${SESSION}; path=/; HttpOnly`, 'BIGipServerpool=1234567.20480.0000; path=/']],
+    ['a balancer cookie before it (lock)', ['BIGipServerpool=1234567.20480.0000; path=/', `ASP.NET_SessionId=${SESSION}; path=/; HttpOnly`]],
+  ])('%s: the form post carries the session cookie', async (_label, cookies) => {
+    scriptCookies(...cookies);
+    const res = await lookup('503504564');
+    expect(res).toMatchObject({ success: true, status: 200 });
+    expect(posts()[0]).toContain(`Cookie: ASP.NET_SessionId=${SESSION}\r\n`);
   });
 });
 

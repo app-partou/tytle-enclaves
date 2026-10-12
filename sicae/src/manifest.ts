@@ -60,7 +60,12 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     {
       id: 'nif_format',
       check: { type: 'field_matches', path: 'nif', pattern: '^\\d{9}$' },
-      reason: 'NIF must be exactly 9 digits',
+      reason: 'NIF must be text of exactly 9 digits (a number or an array is a 400)',
+    },
+    {
+      id: 'nif_check_digit',
+      check: { type: 'behavioral', description: 'The NIF\'s mod-11 check digit (weights 9 to 2 over the first eight digits; a remainder of 0 or 1 gives 0) is checked before any fetch: a wrong one is a 400' },
+      reason: 'SICAE refuses such a number, and that refusal read as "not found", the same signed answer as "SICAE holds nothing for this number" (enclave review 2026-10-09, E2a F-7)',
     },
     {
       id: 'asp_tokens_required',
@@ -69,8 +74,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'session_cookie_forwarding',
-      check: { type: 'behavioral', description: 'ASP.NET_SessionId cookie from GET is forwarded to POST if present' },
-      reason: 'SICAE requires session continuity between GET and POST',
+      check: { type: 'behavioral', description: 'The ASP.NET_SessionId cookie, among every Set-Cookie the GET answered, is forwarded to the POST if present' },
+      reason: 'SICAE requires session continuity between GET and POST; a cookie after the session one used to drop it (enclave review 2026-10-09, E1 F-1)',
     },
     {
       id: 'form_variant_fallback',
@@ -80,7 +85,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     {
       id: 'not_found',
       check: { type: 'status_attest', code: 404, overrides: {} },
-      reason: 'SICAE\'s own "no data" row or its "NIPC not valid" refusal is a definitive answer, attested (success: true, status: 404; nif set, every other field null)',
+      reason: 'SICAE\'s own "no data" row, or its "NIPC not valid" refusal of a number whose check digit is right, is a definitive answer, attested (success: true, status: 404; nif set, every other field null)',
     },
     {
       id: 'no_data_row',
@@ -94,8 +99,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'parse_miss_is_error',
-      check: { type: 'behavioral', description: 'A results grid or error label the handler cannot read, a results row for another NIPC, or no form variant processed throws 502 - never not_found' },
+      check: { type: 'behavioral', description: 'A results grid or error label the handler cannot read, a results row for another NIPC or without its NIPC, or no form variant processed throws 502 - never not_found' },
       reason: 'A page that is not one of SICAE\'s known answers is no answer (audit 2026-10 P1.4)',
+    },
+    {
+      id: 'one_strict_row_reader',
+      check: { type: 'behavioral', description: 'One reader for the results row: SICAE\'s five column names in order; a code is the text its cell shows (a primary CAE, then secondary ones each with a description); the name\'s shown text is its title; character references decoded, an unknown one unreadable; a double quote that cuts a title unreadable. No looser reader answers when this one does not' },
+      reason: 'The looser reader signed the first five-digit number of the row as the primary CAE and every secondary CAE without its description (enclave review 2026-10-09, E-2, E2a F-6)',
     },
     {
       id: 'http_transport',

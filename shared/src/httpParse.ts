@@ -63,7 +63,10 @@ export class ResponseCollector {
  * Parse one complete HTTP/1.1 response. Works on bytes so chunk sizes index the data correctly when the
  * body holds multi-byte UTF-8; the header section is ASCII, the body is decoded after de-chunking.
  * Header names are lower-cased; a repeated header keeps its last value (Content-Length and
- * Transfer-Encoding are checked across every occurrence).
+ * Transfer-Encoding are checked across every occurrence), except Set-Cookie: RFC 9110 §5.3 says it is never
+ * combined, so every value is kept, one per line, in order (a header value never holds a line break). A site, or a
+ * load balancer before it, may send several: SICAE's session cookie was dropped when another came after it
+ * (enclave review 2026-10-09, E1 F-1).
  */
 export function parseHttpResponse(raw: Buffer): HttpResponse {
   const headEnd = raw.indexOf(HEAD_END);
@@ -86,7 +89,7 @@ export function parseHttpResponse(raw: Buffer): HttpResponse {
     if (colon <= 0) continue;
     const key = lines[i].substring(0, colon).trim().toLowerCase();
     const value = lines[i].substring(colon + 1).trim();
-    headers[key] = value;
+    headers[key] = key === 'set-cookie' && headers[key] !== undefined ? `${headers[key]}\n${value}` : value;
     if (key === 'content-length') contentLengths.push(value);
     if (key === 'transfer-encoding') {
       transferCodings.push(...value.split(',').map((c) => c.trim().toLowerCase()).filter((c) => c !== ''));
