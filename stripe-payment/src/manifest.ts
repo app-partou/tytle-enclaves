@@ -29,6 +29,21 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       },
     },
     {
+      id: 'stripe_own_account',
+      description: 'Stripe GET /v1/account with the same key, for an answer to sign when the request named no Stripe-Account: the account the key belongs to is the account signed',
+      method: 'GET',
+      host: 'api.stripe.com',
+      path: '/v1/account',
+      headers: {
+        'Stripe-Version': '2025-12-15.clover',
+      },
+      auth: {
+        header: 'Authorization',
+        scheme: 'Bearer',
+        strippedBeforeAttestation: true,
+      },
+    },
+    {
       id: 'kms_decrypt',
       description: 'KMS Decrypt of a sealed API key (only when the request sends sealedApiKey), with this enclave\'s attestation document as the Recipient: the answer is the key encrypted to that document\'s public key, opened only inside the enclave',
       method: 'POST',
@@ -51,7 +66,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     outputBytes: 192,
     fields: [
       { name: 'operation',  encoding: 'shortString', source: { from: 'request', param: 'operation' } },
-      { name: 'accountId',  encoding: 'shortString', source: { from: 'request', param: 'stripeAccount' } },
+      { name: 'accountId',  encoding: 'shortString', source: { from: 'response', query: 'stripe_own_account', path: 'id' } },
       { name: 'objectType', encoding: 'shortString', source: { from: 'response', query: 'stripe_api', path: 'object' } },
       { name: 'dataHash',   encoding: 'sha256',      source: { from: 'derived', inputs: ['stripe_api:rawBody'], join: '', transform: 'sha256' } },
       { name: 'totalCount', encoding: 'uint',         source: { from: 'response', query: 'stripe_api', path: 'data.length', transform: 'array_length' } },
@@ -91,8 +106,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'account_is_the_one_asked',
-      check: { type: 'behavioral', description: 'accountId is the Stripe-Account the request named (null when it named none). Stripe refuses a Stripe-Account the API key cannot act as (error code account_invalid): that 4xx is never signed. When the answer names an account in its own Stripe-Account header, it must be the one asked, else the answer is an error' },
-      reason: 'The signed account is the one Stripe acted as, never a value the caller only claimed',
+      check: { type: 'behavioral', description: 'accountId is the Stripe-Account the request named, or, when it named none, the account of the API key itself (GET /v1/account with that key, asked with each such answer; anything but an account object is an error, never a null account). Stripe refuses a Stripe-Account the API key cannot act as (error code account_invalid): that 4xx is never signed. When the answer names an account in its own Stripe-Account header, it must be the one asked, else the answer is an error' },
+      reason: 'The signed account is the one Stripe acted as, never a value the caller only claimed; with no Stripe-Account, another key\'s answer no longer reads as the platform\'s (enclave review 2026-10-09, H5)',
     },
     {
       id: 'single_object_is_the_one_asked',
@@ -101,8 +116,18 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'list_shape',
-      check: { type: 'behavioral', description: 'A list answer must carry its data array and has_more (boolean): totalCount and hasMore are read from them; otherwise the answer is an error' },
-      reason: 'A list the handler cannot read is never signed as an empty one',
+      check: { type: 'behavioral', description: 'A list answer must carry its data array and has_more (boolean), and each item must be the operation\'s object (charge, customer, invoice): totalCount (the length of this page, never a total) and hasMore are read from them; otherwise the answer is an error' },
+      reason: 'A list the handler cannot read is never signed as an empty one, and a list of other objects is never signed as this one (enclave review 2026-10-09, E2a F-12)',
+    },
+    {
+      id: 'the_question_is_signed',
+      check: { type: 'behavioral', description: 'The signed endpoint is the whole question: the path with the object\'s id, and the query with its keys in code-unit order, form-encoded' },
+      reason: 'Two lists of different time windows or pages were the same signed answer (enclave review 2026-10-09, H5)',
+    },
+    {
+      id: 'query_keys',
+      check: { type: 'behavioral', description: 'Query keys are the ones the operation takes - a list: limit (1-100), starting_after, ending_before (object ids), created[gt|gte|lt|lte] (Unix seconds), and for list_invoices status (draft, open, paid, uncollectible, void); a single object: none. Any other key, expand[] first, or another value is a 400' },
+      reason: 'The key reads only what the operation\'s list holds: expand[] read nested objects in full (enclave review 2026-10-09, E2a F-13)',
     },
     {
       id: 'not_found_is_stripes_own',
