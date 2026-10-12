@@ -55,6 +55,10 @@ What this gives: the key is never in clear on the host, in data-bridge, in the p
 
 What it does not give: until every caller sends the sealed key, `apiKey` (the key in clear) is still accepted. And the credentials sent with a sealed key are the whole host role's, not a session scoped to the one `Decrypt`: the role can also write the PCR0 pins in SSM. The enclave neither logs nor echoes them, but scoping them to the call (an STS session with a `kms:Decrypt` session policy) needs an IAM change outside this repository.
 
+## Caller Tokens
+
+Two enclaves take a short-lived token from their caller with each request, in clear: Monerium (the caller's OAuth access token) and VIES for a UK number (`hmrcAccessToken`: HMRC's OAuth token for Check a UK VAT number 2.0, scope `read:vat`, valid 4 hours, which data-bridge gets with Tytle's HMRC client credentials; the client secret never reaches the host or the enclave). Each goes to its upstream as `Authorization: Bearer` and nowhere else: no attested value carries it (the manifests' `strip_auth`), no error repeats it (`redact_bearer`, and the input checks never quote it), and no log line names it. A token is checked before it goes into a header line (VIES: RFC 6750's bearer token syntax, at most 4096 characters). Neither is sealed: each lasts hours, reads only what its upstream answers anyone with such a token, and the credentials that make one stay with the caller.
+
 ## The Parent Token
 
 The parent on the host (port 5001) is outside every enclave's trust boundary, and each enclave checks what it is asked on its own. Until a caller can check the parent itself, the parent answers `/attest/fetch`, `/metrics` and `/routes` only to a caller that sends `Authorization: Bearer <ENCLAVE_PARENT_AUTH_TOKEN>`, when the host sets that token: data-bridge sends it. `/health` stays open for the host's watchdog and data-bridge's health probe. Without the token set, every route is open, and the parent says so when it starts.

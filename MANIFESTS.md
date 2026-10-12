@@ -169,7 +169,7 @@ The manifest hash uses `stableStringify()` — a deterministic JSON serializatio
 
 ## Versions
 
-A version names one manifest. Each package's tests list the manifests its releases shipped (version and hash): a manifest that changes while keeping a shipped version fails them. A release appends its own. The second enclave release moves VIES and SICAE to 1.1.0 (both kept 1.0.0 across vector version 2) and Stripe and Monerium to 1.2.0.
+A version names one manifest. Each package's tests list the manifests its releases shipped (version and hash): a manifest that changes while keeping a shipped version fails them. A release appends its own. The second enclave release moves VIES and SICAE to 1.1.0 (both kept 1.0.0 across vector version 2) and Stripe and Monerium to 1.2.0. VIES 1.1.0 also asks HMRC's Check a UK VAT number 2.0 with the caller's OAuth token (`gb_needs_hmrc_token`, `strip_auth`, `redact_bearer`): HMRC removed version 1.0 on 17 February 2025.
 
 ## Adding a Manifest to a New Service
 

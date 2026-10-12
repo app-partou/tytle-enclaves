@@ -5,7 +5,7 @@
  */
 
 import {
-  computeManifestHash, validateManifest, VIES_SCHEMA,
+  computeManifestHash, validateManifest, VIES_SCHEMA, STRIP_AUTH, REDACT_BEARER,
 } from '@tytle-enclaves/shared';
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
@@ -27,12 +27,17 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'hmrc_rest',
-      description: 'HMRC VAT lookup (UK only, countryCode === "GB")',
+      description: 'HMRC Check a UK VAT number 2.0, the simple check (UK only, countryCode === "GB"), with the caller\'s OAuth token (scope read:vat)',
       method: 'GET',
       host: 'api.service.hmrc.gov.uk',
       path: '/organisations/vat/check-vat-number/lookup/{vatNumber}',
       headers: {
-        'Accept': 'application/vnd.hmrc.1.0+json',
+        'Accept': 'application/vnd.hmrc.2.0+json',
+      },
+      auth: {
+        header: 'Authorization',
+        scheme: 'Bearer',
+        strippedBeforeAttestation: true,
       },
     },
   ],
@@ -71,6 +76,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       check: { type: 'behavioral', description: 'countryCode === "GB": vatNumber must be 9 or 12 digits (HMRC targetVrn), else 400 before any fetch' },
       reason: 'HMRC refuses any other targetVrn; a refused value is never asked and never signed',
     },
+    {
+      id: 'gb_needs_hmrc_token',
+      check: { type: 'behavioral', description: 'countryCode === "GB": hmrcAccessToken, an OAuth 2.0 bearer token (RFC 6750 b64token, at most 4096 characters), is required, else 400 before any fetch; it is sent to HMRC as "Authorization: Bearer" and nowhere else, and it is never signed, logged or repeated in an error. Any other countryCode with hmrcAccessToken is a 400' },
+      reason: 'HMRC removed Check a UK VAT number 1.0 on 17 February 2025; 2.0 is application-restricted (OAuth client credentials, scope read:vat), and the token is the caller\'s',
+    },
+    STRIP_AUTH,
+    REDACT_BEARER,
     {
       id: 'routing',
       check: { type: 'behavioral', description: 'countryCode === "GB" routes to hmrc_rest; all others route to vies_soap' },

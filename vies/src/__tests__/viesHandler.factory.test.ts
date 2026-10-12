@@ -41,6 +41,10 @@ const HMRC_REGISTERED = JSON.stringify({
 
 const VIES_PORT = 8443;
 const HMRC_PORT = 8444;
+/** A stand-in for the OAuth token data-bridge gets from HMRC (client credentials, scope read:vat): TEST ONLY. */
+const HMRC_TOKEN = 'testonly-hmrc-access-token-0001';
+/** A UK lookup as data-bridge sends it: the VRN and HMRC's OAuth token (Check a UK VAT number 2.0, D-P1-9). */
+const gb = (vatNumber: string) => ({ countryCode: 'GB', vatNumber, hmrcAccessToken: HMRC_TOKEN });
 const xml = (body: string, status = 200) => httpReply(status, body, { 'Content-Type': 'text/xml; charset=UTF-8' });
 const json = (status: number, body: string) => httpReply(status, body, { 'Content-Type': 'application/json' });
 
@@ -132,7 +136,7 @@ describe('VIES', () => {
 describe('HMRC', () => {
   it('a registered number: valid, name and address are signed (lock)', async () => {
     fakeIo.reply(HMRC_PORT, json(200, HMRC_REGISTERED));
-    const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
+    const res = await check(gb('123456789'));
     const want = signed({ countryCode: 'GB', vatNumber: '123456789', valid: 1, name: 'EXAMPLE TRADING LTD', address: '10 EXAMPLE STREET, EXAMPLETOWN, EX1 1EX', dataHash: sha256(HMRC_REGISTERED) });
     expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64 });
     expect(res.headers).toMatchObject({ 'x-vies-valid': 'true', 'x-vies-name': 'EXAMPLE TRADING LTD' });
@@ -143,7 +147,7 @@ describe('HMRC', () => {
 
   it('HMRC\'s own "not registered" (404, code NOT_FOUND) is signed as valid 0 (lock)', async () => {
     fakeIo.reply(HMRC_PORT, json(404, HMRC_NOT_REGISTERED));
-    const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
+    const res = await check(gb('123456789'));
     const want = signed({ countryCode: 'GB', vatNumber: '123456789', valid: 0, name: null, address: null, dataHash: sha256(HMRC_NOT_REGISTERED) });
     expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64 });
     expect(res.headers['x-vies-valid']).toBe('false');
@@ -151,9 +155,85 @@ describe('HMRC', () => {
 
   it('an HMRC 500 is an error (lock)', async () => {
     fakeIo.reply(HMRC_PORT, json(500, '{}'));
-    const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
+    const res = await check(gb('123456789'));
     expect(res).toMatchObject({ success: false, status: 502 });
     expect(fakeIo.nsmAsks).toHaveLength(0);
+  });
+});
+
+// D-P1-9 (LJ "A", 2026-10-12): HMRC removed version 1.0 of Check a UK VAT number on 17 February 2025, and version 2.0
+// is application-restricted - an OAuth 2.0 bearer token with the read:vat scope (hmrc/vat-registered-companies-api,
+// public/api/conf/2.0/application.yaml). data-bridge gets the token and passes it with each UK lookup; the enclave
+// sends it to HMRC and nowhere else. Before, every UK lookup asked version 1.0 and got its 404: no verdict, ever.
+describe('HMRC Check a UK VAT number 2.0: the caller\'s OAuth token goes to HMRC and nowhere else (red before D-P1-9)', () => {
+  it('asks version 2.0, with the token as its Bearer credentials', async () => {
+    fakeIo.reply(HMRC_PORT, json(200, HMRC_REGISTERED));
+    const res = await check(gb('123456789'));
+    expect(res).toMatchObject({ success: true, status: 200 });
+    const [request] = fakeIo.requests(HMRC_PORT);
+    expect(request).toMatch(/\r\nAccept: application\/vnd\.hmrc\.2\.0\+json\r\n/);
+    expect(request).toContain(`\r\nAuthorization: Bearer ${HMRC_TOKEN}\r\n`);
+  });
+
+  it('a token of 4096 characters with "=" padding is a bearer token (RFC 6750 b64token)', async () => {
+    const token = `${'a'.repeat(4094)}==`;
+    fakeIo.reply(HMRC_PORT, json(200, HMRC_REGISTERED));
+    const res = await check({ ...gb('123456789'), hmrcAccessToken: token });
+    expect(res).toMatchObject({ success: true, status: 200 });
+    expect(fakeIo.requests(HMRC_PORT)[0]).toContain(`\r\nAuthorization: Bearer ${token}\r\n`);
+  });
+
+  it('the token is in nothing the enclave answers or signs: the attested request names the number only (lock)', async () => {
+    fakeIo.reply(HMRC_PORT, json(200, HMRC_REGISTERED));
+    const res = await check(gb('123456789'));
+    expect(JSON.stringify(res)).not.toContain(HMRC_TOKEN);
+    const requestConfig = `https://api.service.hmrc.gov.uk/organisations/vat/check-vat-number/lookup/123456789|GET|${JSON.stringify({ countryCode: 'GB', vatNumber: '123456789', 'x-manifest-hash': MANIFEST_HASH })}`;
+    expect(res.attestation?.requestHash).toBe(createHash('sha256').update(requestConfig).digest('hex'));
+  });
+
+  it('a UK number without a token is a 400, and nothing is fetched', async () => {
+    const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
+    expect(res).toMatchObject({ success: false, status: 400 });
+    expect(res.error).toMatch(/hmrcAccessToken is required for a UK number/);
+    expect(fakeIo.requests(HMRC_PORT)).toEqual([]);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['not text', 12345],
+    ['with a space', 'testonly token'],
+    ['with a line break that would add a header of its own', 'testonly\r\nX-Forged: 1'],
+    ['longer than 4096 characters', 'a'.repeat(4097)],
+    ['with a character no bearer token has', 'testonly"token'],
+    ['with "=" before its end', 'testonly=token'],
+  ])('a token %s is a 400, nothing is fetched, and the error does not repeat it', async (_label, token) => {
+    const res = await check({ countryCode: 'GB', vatNumber: '123456789', hmrcAccessToken: token });
+    expect(res).toMatchObject({ success: false, status: 400 });
+    expect(res.error).toMatch(/hmrcAccessToken/);
+    if (typeof token === 'string' && token !== '') expect(res.error).not.toContain(token);
+    expect(fakeIo.requests(HMRC_PORT)).toEqual([]);
+  });
+
+  it('a token on a lookup that is not for a UK number is a 400: VIES is never asked with it', async () => {
+    const res = await check({ countryCode: 'PT', vatNumber: '503504564', hmrcAccessToken: HMRC_TOKEN });
+    expect(res).toMatchObject({ success: false, status: 400 });
+    expect(res.error).toMatch(/hmrcAccessToken is only for a UK number/);
+    expect(fakeIo.requests(VIES_PORT)).toEqual([]);
+  });
+
+  it('HMRC refusing the token (401) is an error, never signed, and nothing answered carries the token (lock)', async () => {
+    fakeIo.reply(HMRC_PORT, json(401, JSON.stringify({ code: 'INVALID_CREDENTIALS', message: 'Invalid Authentication information provided' })));
+    const res = await check(gb('123456789'));
+    expect(res).toMatchObject({ success: false, status: 502 });
+    expect(fakeIo.nsmAsks).toHaveLength(0);
+    expect(JSON.stringify(res)).not.toContain(HMRC_TOKEN);
+  });
+
+  it('the manifest names version 2.0 and the Bearer token, stripped before attestation', () => {
+    const hmrc = HANDLER_MANIFEST.queries.find((q) => q.id === 'hmrc_rest');
+    expect(hmrc?.headers).toEqual({ Accept: 'application/vnd.hmrc.2.0+json' });
+    expect(hmrc?.auth).toEqual({ header: 'Authorization', scheme: 'Bearer', strippedBeforeAttestation: true });
+    expect(HANDLER_MANIFEST.policies.map((p) => p.id)).toEqual(expect.arrayContaining(['strip_auth', 'redact_bearer', 'gb_needs_hmrc_token']));
   });
 });
 
@@ -178,17 +258,17 @@ describe('a reply that is not the register\'s answer is an error, never signed (
 
   it('the 404 HMRC answers for the removed version-1.0 API (MATCHING_RESOURCE_NOT_FOUND, recorded live)', async () => {
     fakeIo.reply(HMRC_PORT, json(404, HMRC_V1_GONE));
-    await expectError({ countryCode: 'GB', vatNumber: '123456789' }, /HMRC returned 404 MATCHING_RESOURCE_NOT_FOUND - not a "not registered" answer/);
+    await expectError(gb('123456789'), /HMRC returned 404 MATCHING_RESOURCE_NOT_FOUND - not a "not registered" answer/);
   });
 
   it('an HMRC 404 without a JSON error code (a proxy or WAF page)', async () => {
     fakeIo.reply(HMRC_PORT, httpReply(404, '<html><body>Not Found</body></html>', { 'Content-Type': 'text/html' }));
-    await expectError({ countryCode: 'GB', vatNumber: '123456789' }, /HMRC returned 404 without an error code/);
+    await expectError(gb('123456789'), /HMRC returned 404 without an error code/);
   });
 
   it('an HMRC 200 that names no company', async () => {
     fakeIo.reply(HMRC_PORT, json(200, '{}'));
-    await expectError({ countryCode: 'GB', vatNumber: '123456789' }, /HMRC response has no target/);
+    await expectError(gb('123456789'), /HMRC response has no target/);
   });
 });
 
@@ -241,7 +321,7 @@ describe('the whole upstream body is committed: dataHash (red before the release
 
   it('HMRC: the body HMRC sent, the "not registered" answer too', async () => {
     fakeIo.reply(HMRC_PORT, json(404, HMRC_NOT_REGISTERED));
-    const res = await check({ countryCode: 'GB', vatNumber: '123456789' });
+    const res = await check(gb('123456789'));
     expect(res.headers['x-vies-data-hash']).toBe(sha256(HMRC_NOT_REGISTERED));
   });
 });
@@ -253,8 +333,8 @@ describe('the body behind dataHash goes out beside the answer, unsigned (enclave
   it.each([
     ['VIES, a valid number', VIES_PORT, xml(VIES_VALID), { countryCode: 'PT', vatNumber: '503504564' }, VIES_VALID],
     ['VIES, "not valid"', VIES_PORT, xml(VIES_NOT_VALID), { countryCode: 'PT', vatNumber: '123456789' }, VIES_NOT_VALID],
-    ['HMRC, a registered number', HMRC_PORT, json(200, HMRC_REGISTERED), { countryCode: 'GB', vatNumber: '123456789' }, HMRC_REGISTERED],
-    ['HMRC, "not registered"', HMRC_PORT, json(404, HMRC_NOT_REGISTERED), { countryCode: 'GB', vatNumber: '123456789' }, HMRC_NOT_REGISTERED],
+    ['HMRC, a registered number', HMRC_PORT, json(200, HMRC_REGISTERED), gb('123456789'), HMRC_REGISTERED],
+    ['HMRC, "not registered"', HMRC_PORT, json(404, HMRC_NOT_REGISTERED), gb('123456789'), HMRC_NOT_REGISTERED],
   ])('%s: upstreamBody is the body the register sent, and its SHA-256 is the signed dataHash', async (_label, port, reply, body, sent) => {
     fakeIo.reply(port, reply);
     const res = await check(body);
@@ -343,7 +423,7 @@ describe('an HMRC 200 is signed valid only for a target that names the VRN asked
     ['an array of the company', target([{ name: 'EXAMPLE TRADING LTD', vatNumber: '123456789' }])],
   ])('a target that is %s is an error', async (_label, body) => {
     fakeIo.reply(HMRC_PORT, json(200, body));
-    await expectRefused({ countryCode: 'GB', vatNumber: '123456789' }, /^HMRC response has no target$/);
+    await expectRefused(gb('123456789'), /^HMRC response has no target$/);
   });
 
   it.each([
@@ -352,7 +432,7 @@ describe('an HMRC 200 is signed valid only for a target that names the VRN asked
     ['a VRN that is not text', target({ name: 'EXAMPLE TRADING LTD', vatNumber: 123456789 })],
   ])('a target for %s is an error', async (_label, body) => {
     fakeIo.reply(HMRC_PORT, json(200, body));
-    await expectRefused({ countryCode: 'GB', vatNumber: '123456789' }, /^HMRC answered for another VRN than 123456789$/);
+    await expectRefused(gb('123456789'), /^HMRC answered for another VRN than 123456789$/);
   });
 
   it.each([
@@ -360,7 +440,7 @@ describe('an HMRC 200 is signed valid only for a target that names the VRN asked
     ['an empty name', target({ name: '', vatNumber: '123456789' })],
   ])('a target with %s is an error', async (_label, body) => {
     fakeIo.reply(HMRC_PORT, json(200, body));
-    await expectRefused({ countryCode: 'GB', vatNumber: '123456789' }, /^HMRC's target has no name$/);
+    await expectRefused(gb('123456789'), /^HMRC's target has no name$/);
   });
 });
 
@@ -377,7 +457,7 @@ describe('the manifest says what the handler does (red before part 9)', () => {
   ])('%s answering %i', async (register, status) => {
     if (register === 'VIES') fakeIo.reply(VIES_PORT, httpReply(status, '<html>no answer</html>', { 'Content-Type': 'text/html' }));
     else fakeIo.reply(HMRC_PORT, json(status, JSON.stringify({ code: 'SERVER_ERROR' })));
-    const res = await check(register === 'VIES' ? { countryCode: 'PT', vatNumber: '503504564' } : { countryCode: 'GB', vatNumber: '123456789' });
+    const res = await check(register === 'VIES' ? { countryCode: 'PT', vatNumber: '503504564' } : gb('123456789'));
     expect(res.success && res.status === status && res.attestation === undefined).toBe(shouldSkipAttestation(HANDLER_MANIFEST.policies, status));
     expect(res.success && res.attestation !== undefined).toBe(getAttestOverrides(HANDLER_MANIFEST.policies, status) !== null);
   });
