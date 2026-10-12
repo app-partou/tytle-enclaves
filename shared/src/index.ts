@@ -32,7 +32,7 @@ export type {
   QueryAuth, RpcCall, QueryDef, PolicyCheck, PolicyDef,
   RepeatabilityDef, HandlerManifest,
 } from './manifest.js';
-export { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from './policies.js';
+export { SKIP_TRANSIENT_ERRORS, STRIP_AUTH, REDACT_BEARER } from './policies.js';
 export { toErrorMessage } from './errorUtils.js';
 export { sanitizeError, stripSensitiveHeaders } from './sanitize.js';
 export { proxyFetchWithRetry } from './retryProxy.js';

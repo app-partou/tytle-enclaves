@@ -1,14 +1,19 @@
 /**
- * Handler Manifest — executable specification for enclave handlers.
+ * Handler Manifest — the specification of an enclave handler.
  *
  * Every enclave handler declares a manifest describing its queries,
  * field provenance, policies, and repeatability guarantees. The manifest
- * is baked into the Docker image (contributing to PCR0) and its SHA-256
- * hash is included in every attestation, creating a cryptographic chain:
+ * is baked into the Docker image, so PCR0 binds it:
  *
- *   PCR0 → proves which code ran (includes manifest)
- *   requestHash → includes manifest hash → proves which specification
+ *   PCR0 → proves which code ran, and so which manifest
  *   BN254 + dataHash → proves the data transformation
+ *
+ * Its SHA-256 hash goes with every answer (the x-<service>-manifest-hash header, and the request headers the enclave
+ * hashes into requestHash) as a pointer to it. Neither is signed: requestHash is outside the nonce and user_data.
+ *
+ * The factory applies header_strip and error_redact. Every other check describes what the handler's code does, and
+ * each package's tests hold the two together: its status rules are run against the handler (enclave review
+ * 2026-10-09, E2a F-17).
  */
 
 import crypto from 'node:crypto';
@@ -166,7 +171,12 @@ export type PolicyCheck =
   | { type: 'field_equals';   path: string; value: string | number | boolean }
   | { type: 'field_matches';  path: string; pattern: string }
   | { type: 'field_required'; paths: string[] }
-  | { type: 'status_skip';    codes: number[]; except?: number[] }
+  /**
+   * An upstream status the handler passes on unsigned, as it was sent: one in `codes`, or of at least `atLeast`, unless
+   * it is in `except`. A status no status_skip names is never passed on: the handler answers it or fails (502).
+   */
+  | { type: 'status_skip';    codes: number[]; atLeast?: number; except?: number[] }
+  /** An upstream status the handler signs as an answer, with these values. */
   | { type: 'status_attest';  code: number; overrides?: Record<string, string | number> }
   | { type: 'header_strip';   headers: string[] }
   | { type: 'error_redact';   pattern: string; replacement: string }
@@ -210,7 +220,10 @@ export interface RepeatabilityDef {
  * rule, and how to reproduce the encoding. Baked into the Docker image.
  */
 export interface HandlerManifest {
-  /** Semantic version — bump on any change to queries, schema, or policies. */
+  /**
+   * Semantic version — bump on any change to queries, schema, or policies. A version names one manifest: each
+   * package's tests hold every released version to its manifest hash.
+   */
   version: string;
   /** Every external API call the handler makes. */
   queries: QueryDef[];

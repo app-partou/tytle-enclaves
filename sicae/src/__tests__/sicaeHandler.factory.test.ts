@@ -17,7 +17,7 @@ import { createHash } from 'node:crypto';
 vi.mock('@tytle-enclaves/native', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).nativeModule);
 vi.mock('node:tls', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).tlsModule);
 
-import { createHandler } from '@tytle-enclaves/shared';
+import { createHandler, getAttestOverrides, shouldSkipAttestation } from '@tytle-enclaves/shared';
 import type { EnclaveResponse } from '@tytle-enclaves/shared';
 import { encodeFieldElements, hashFieldElements, SICAE_SCHEMA } from '../../../shared/src/bn254Codec.js';
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
@@ -431,6 +431,41 @@ describe('manifest (lock)', () => {
   it('declares the SICAE_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(SICAE_SCHEMA.map((f) => [f.name, f.encoding]));
     expect(HANDLER_MANIFEST.schema.outputBytes).toBe(SICAE_SCHEMA.length * 32);
+  });
+});
+
+// Enclave review 2026-10-09, E2a F-17: the manifest said a 404 is attested (status_attest), and read SICAE's two "not
+// found" texts as substrings of the whole page; SICAE never answers a 404 (the enclave's not_found is its own reading
+// of a 200 page, by exact rules), and SICAE kept version 1.0.0 across vector version 2 and part 2's rules.
+describe('the manifest says what the handler does (red before part 9)', () => {
+  const STATUSES = [201, 301, 400, 401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504];
+
+  // Each status, answered by SICAE's search page with a body that is no page: the handler passes it on unsigned
+  // exactly when a status_skip policy of the manifest names it, and signs it exactly when a status_attest policy does.
+  it.each(STATUSES)('SICAE answering %i', async (status) => {
+    fakeIo.reply(PORT, httpReply(status, '<html>no answer</html>', { 'Content-Type': 'text/html' }));
+    const res = await lookup('503504564');
+    expect(res.success && res.status === status && res.attestation === undefined).toBe(shouldSkipAttestation(HANDLER_MANIFEST.policies, status));
+    expect(res.success && res.attestation !== undefined).toBe(getAttestOverrides(HANDLER_MANIFEST.policies, status) !== null);
+  });
+
+  it('no policy reads a "not found" text as a substring of the page: the handler reads it by exact rules', () => {
+    const substringRules = HANDLER_MANIFEST.policies.filter((p) => p.check.type === 'field_matches' && p.check.path === 'responseBody');
+    expect(substringRules.map((p) => p.id)).toEqual([]);
+  });
+
+  /**
+   * The manifests the enclave releases shipped, with their versions: a version names one manifest, so a changed manifest
+   * moves its version. 718b999 = the 2026-10-09 release. The next release appends its own.
+   */
+  const SHIPPED: ReadonlyArray<readonly [version: string, hash: string]> = [
+    ['1.0.0', '147584a06d97543af953db3b8f076711616d6fe5ac6d63df2bd778d06b4358a7'],
+  ];
+
+  it('a version names one manifest: a changed manifest moves its version', () => {
+    for (const [version, hash] of SHIPPED) {
+      expect(HANDLER_MANIFEST.version === version, `shipped ${version}`).toBe(MANIFEST_HASH === hash);
+    }
   });
 });
 

@@ -1,15 +1,18 @@
 /**
  * Stripe Payment Handler Manifest
+ *
+ * Its status rules are run against the handler by the package's tests (stripePaymentHandler.factory.test.ts).
  */
 
 import {
   computeManifestHash, validateManifest, STRIPE_PAYMENT_SCHEMA,
-  SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER,
+  SKIP_TRANSIENT_ERRORS, STRIP_AUTH, REDACT_BEARER,
 } from '@tytle-enclaves/shared';
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.1.0',
+  // 1.1.0 = the 2026-10-09 release; 1.2.0 = the second enclave release (R4)
+  version: '1.2.0',
 
   queries: [
     {
@@ -76,9 +79,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
 
   policies: [
     SKIP_TRANSIENT_ERRORS,
-    ATTEST_NOT_FOUND,
     STRIP_AUTH,
     REDACT_BEARER,
+    {
+      id: 'only_a_200_is_an_answer',
+      check: { type: 'behavioral', description: 'stripe_api: a 200 is read as the answer, a 404 by not_found_is_stripes_own, an error (400 or more) passed on unsigned; any other status (a 201, a 302) throws 502. stripe_own_account: anything but a 200 throws 502' },
+      reason: 'Only Stripe\'s own answer is signed (enclave review 2026-10-09, E2a F-17)',
+    },
     {
       id: 'valid_operations',
       check: { type: 'field_required', paths: ['operation'] },

@@ -7,7 +7,6 @@ import {
 } from '../policyEngine.js';
 import {
   SKIP_TRANSIENT_ERRORS,
-  ATTEST_NOT_FOUND,
   STRIP_AUTH,
   REDACT_BEARER,
 } from '../policies.js';
@@ -15,7 +14,6 @@ import type { PolicyDef } from '../manifest.js';
 
 const STANDARD_POLICIES: PolicyDef[] = [
   SKIP_TRANSIENT_ERRORS,
-  ATTEST_NOT_FOUND,
   STRIP_AUTH,
   REDACT_BEARER,
 ];
@@ -59,11 +57,33 @@ describe('shouldSkipAttestation', () => {
     expect(shouldSkipAttestation([policy], 500)).toBe(true);
     expect(shouldSkipAttestation([policy], 404)).toBe(false);
   });
+
+  // Enclave review 2026-10-09, E2a F-17: the handlers pass on EVERY error status but 404 (Stripe) or every one
+  // (Monerium), and a list of seven codes said otherwise: 402, 409, 504 were passed on with no rule naming them.
+  it('a status_skip with atLeast skips every status from it, but those in except (red)', () => {
+    const policy: PolicyDef = {
+      id: 'test',
+      check: { type: 'status_skip', codes: [], atLeast: 400, except: [404] },
+      reason: 'test',
+    };
+    expect([399, 400, 402, 404, 409, 504, 599].map((status) => shouldSkipAttestation([policy], status)))
+      .toEqual([false, true, true, false, true, true, true]);
+  });
+
+  it('SKIP_TRANSIENT_ERRORS skips every status of 400 or more but 404: 402, 409, 422 and 504 too (red)', () => {
+    for (const status of [400, 401, 402, 403, 405, 409, 422, 429, 500, 501, 502, 503, 504, 599]) {
+      expect(shouldSkipAttestation([SKIP_TRANSIENT_ERRORS], status), String(status)).toBe(true);
+    }
+    for (const status of [200, 201, 204, 301, 399, 404]) {
+      expect(shouldSkipAttestation([SKIP_TRANSIENT_ERRORS], status), String(status)).toBe(false);
+    }
+  });
 });
 
 describe('getAttestOverrides', () => {
   it('returns overrides for 404', () => {
-    const overrides = getAttestOverrides(STANDARD_POLICIES, 404);
+    const notFound: PolicyDef = { id: 'test', check: { type: 'status_attest', code: 404, overrides: { state: 'not_found' } }, reason: 'test' };
+    const overrides = getAttestOverrides([...STANDARD_POLICIES, notFound], 404);
     expect(overrides).toEqual({ state: 'not_found' });
   });
 

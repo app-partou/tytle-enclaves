@@ -402,6 +402,12 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
       };
     }
 
+    // Only a 200 is an answer. A status under 400 that is no error (a 201, a 302) was read as one and could be signed
+    // (found while matching the manifest to the code, enclave review 2026-10-09, E2a F-17).
+    if (response.status !== 200) {
+      throw new Error(`Stripe answered HTTP ${response.status}: only a 200 is an answer`);
+    }
+
     // Parse and validate response
     let parsed: unknown;
     try {

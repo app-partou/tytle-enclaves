@@ -1,21 +1,24 @@
 /**
- * Policy Engine - evaluates manifest PolicyDef[] at runtime.
+ * Policy Engine - evaluates manifest PolicyDef[].
  *
- * Pure functions with no side effects. The handler factory calls these
- * automatically based on each handler's manifest policies.
+ * Pure functions with no side effects. The handler factory applies getHeadersToStrip and redactError to every request.
+ * shouldSkipAttestation and getAttestOverrides read what a manifest says of an upstream status; each package's tests
+ * run them against the handler, so a manifest that says other than the code fails there (enclave review 2026-10-09,
+ * E2a F-17).
  */
 
 import type { PolicyDef } from './manifest.js';
 
 /**
- * Evaluate whether a response status should skip attestation.
- * Matches status_skip policies: transient errors that are not definitive.
+ * Whether a manifest says an upstream answer with this status is passed on unsigned: a status_skip policy names it, by
+ * its code or by `atLeast`, and does not except it.
  */
 export function shouldSkipAttestation(policies: PolicyDef[], status: number): boolean {
   for (const p of policies) {
     const check = p.check;
     if (check.type === 'status_skip') {
-      if (check.codes.includes(status) && !(check.except ?? []).includes(status)) {
+      const named = check.codes.includes(status) || (check.atLeast !== undefined && status >= check.atLeast);
+      if (named && !(check.except ?? []).includes(status)) {
         return true;
       }
     }

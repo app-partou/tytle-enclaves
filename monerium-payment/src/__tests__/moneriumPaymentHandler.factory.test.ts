@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 vi.mock('@tytle-enclaves/native', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).nativeModule);
 vi.mock('node:tls', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).tlsModule);
 
-import { createHandler } from '@tytle-enclaves/shared';
+import { createHandler, getAttestOverrides, shouldSkipAttestation } from '@tytle-enclaves/shared';
 import type { EnclaveResponse } from '@tytle-enclaves/shared';
 import { encodeFieldElements, hashFieldElements, MONERIUM_PAYMENT_SCHEMA } from '../../../shared/src/bn254Codec.js';
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
@@ -276,5 +276,37 @@ describe('manifest (lock)', () => {
   it('declares the MONERIUM_PAYMENT_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(MONERIUM_PAYMENT_SCHEMA.map((f) => [f.name, f.encoding]));
     expect(HANDLER_MANIFEST.schema.outputBytes).toBe(MONERIUM_PAYMENT_SCHEMA.length * 32);
+  });
+});
+
+// Enclave review 2026-10-09, E2a F-17: the manifest said only 400, 401, 403, 429, 500, 502, 503 (and, since part 5,
+// 404) pass unsigned; the handler passes every error Monerium answers: 402, 409, 504 too.
+describe('the manifest says what the handler does (red before part 9)', () => {
+  const STATUSES = [201, 301, 400, 401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504];
+
+  // Each status, answered by Monerium with a body that is no answer: the handler passes it on unsigned exactly when a
+  // status_skip policy of the manifest names it, and signs it exactly when a status_attest policy does.
+  it.each(STATUSES)('Monerium answering %i', async (status) => {
+    const body = JSON.stringify({ code: status, status: 'Error', message: 'no answer' });
+    fakeIo.reply(MONERIUM_PORT, json(status, body));
+    const res = await ask();
+    const passedOn = res.success && res.status === status && res.attestation === undefined && res.rawBody === body;
+    expect(passedOn).toBe(shouldSkipAttestation(HANDLER_MANIFEST.policies, status));
+    expect(res.success && res.attestation !== undefined).toBe(getAttestOverrides(HANDLER_MANIFEST.policies, status) !== null);
+    expect(fakeIo.requests(RPC_PORT)).toEqual([]);
+  });
+
+  /**
+   * The manifests the enclave releases shipped, with their versions: a version names one manifest, so a changed manifest
+   * moves its version. 718b999 = the 2026-10-09 release. The next release appends its own.
+   */
+  const SHIPPED: ReadonlyArray<readonly [version: string, hash: string]> = [
+    ['1.1.0', '1e437540b0f6e11bf59f5997d527490c4b2f8f28772f4171b9076f35f92be4ab'],
+  ];
+
+  it('a version names one manifest: a changed manifest moves its version', () => {
+    for (const [version, hash] of SHIPPED) {
+      expect(HANDLER_MANIFEST.version === version, `shipped ${version}`).toBe(MANIFEST_HASH === hash);
+    }
   });
 });

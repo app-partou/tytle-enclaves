@@ -67,10 +67,18 @@ describe('the handler context and the request budget (D-P1-11)', () => {
     const kms = fakeKms({ sealed: 'sk_test_TESTONLY_budget' });
     fakeIo.reply(KMS_PORT, kms.reply);
     const handler = createHandler(defDoing((ctx) => ctx.unsealSecret('c2VhbGVkLWJ1ZGdldC10ZXN0', 'stripe_payment')), HOSTS);
+    // The clock stands still: the RSA key pair made before the first KMS call took 2 s on a loaded host, and the KMS
+    // call takes what is LEFT of the budget, so a moving clock made this test depend on the host's load.
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
 
-    const res = await handler(REQUEST, { deadlineMs: Date.now() + 4_000 });
+    try {
+      const res = await handler(REQUEST, { deadlineMs: now + 4_000 });
 
-    expect(res).toMatchObject({ success: true, status: 200 });
-    expect(fakeIo.timeouts(KMS_PORT)).toEqual([4]);
+      expect(res).toMatchObject({ success: true, status: 200 });
+      expect(fakeIo.timeouts(KMS_PORT)).toEqual([4]);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

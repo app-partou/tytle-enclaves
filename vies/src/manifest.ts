@@ -1,5 +1,7 @@
 /**
  * VIES/HMRC VAT Handler Manifest
+ *
+ * Its status rules are run against the handler by the package's tests (viesHandler.factory.test.ts).
  */
 
 import {
@@ -8,7 +10,8 @@ import {
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.0.0',
+  // 1.0.0 was kept across vector version 2 (the 2026-10-09 release); 1.1.0 is the second enclave release (R4)
+  version: '1.1.0',
 
   queries: [
     {
@@ -74,24 +77,39 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       reason: 'UK VAT is verified via HMRC REST API, EU VAT via VIES SOAP',
     },
     {
+      id: 'gb_provenance',
+      check: { type: 'behavioral', description: 'For GB, valid, name and address are read from hmrc_rest\'s JSON, not from vies_soap: valid 1 for a 200 (name = target.name; address = target.address line1, line2 and postcode, joined by ", "), valid 0 for HMRC\'s NOT_FOUND 404 (no name, no address)' },
+      reason: 'The schema names vies_soap as the source of these three fields; a GB answer comes from HMRC',
+    },
+    {
       id: 'hmrc_404_is_invalid',
-      check: { type: 'status_attest', code: 404, overrides: { valid: 0 } },
-      reason: 'Only HMRC\'s 404 whose JSON body code is NOT_FOUND ("targetVrn does not match a registered company") is valid=false, attested; any other 404 throws 502',
+      check: { type: 'behavioral', description: 'HMRC: a 404 whose JSON body code is NOT_FOUND ("targetVrn does not match a registered company") is signed valid 0; any other 404 throws 502' },
+      reason: 'The 404 of HMRC\'s removed version-1.0 API, or a proxy\'s page, is not HMRC saying the number is not registered',
     },
     {
       id: 'hmrc_200_needs_target',
-      check: { type: 'behavioral', description: 'An HMRC 200 without a target object throws 502 (never valid=true)' },
-      reason: 'A 200 that names no registered company is no answer',
-    },
-    {
-      id: 'vies_valid_required',
-      check: { type: 'field_matches', path: 'responseBody', pattern: '<(?:\\w+:)?valid>(true|false)</(?:\\w+:)?valid>' },
-      reason: 'A VIES reply without <valid>true|false</valid> throws 502 (a parse miss is never valid=false)',
+      check: { type: 'behavioral', description: 'HMRC: a 200 is signed valid 1 only when its target is an object (not an array) whose vatNumber is the VRN asked and whose name is text; otherwise 502' },
+      reason: 'A 200 that names no company, or another company, is no answer (enclave review 2026-10-09, E2a F-3)',
     },
     {
       id: 'hmrc_non_200_error',
-      check: { type: 'status_skip', codes: [429, 500, 502, 503], except: [404] },
-      reason: 'HMRC non-200/non-404 responses throw 502',
+      check: { type: 'behavioral', description: 'HMRC: a status other than 200 or 404 throws 502; nothing is passed on unsigned' },
+      reason: 'Only HMRC\'s own answer is read',
+    },
+    {
+      id: 'vies_answer_complete',
+      check: { type: 'behavioral', description: 'VIES: every field is read inside the one checkVatResponse element, and only when its closing tag is there; a reply without it throws 502' },
+      reason: 'A reply cut after <valid> was signed valid with no name and no address (enclave review 2026-10-09, E2a F-2)',
+    },
+    {
+      id: 'vies_echo_is_the_number_asked',
+      check: { type: 'behavioral', description: 'VIES: the countryCode and vatNumber VIES says it checked must be the ones asked, character for character; a different or missing one throws 502' },
+      reason: 'The signed countryCode and vatNumber are the number VIES confirmed, never only the caller\'s spelling (enclave review 2026-10-09, E2a F-1)',
+    },
+    {
+      id: 'vies_valid_required',
+      check: { type: 'behavioral', description: 'VIES: an answer without <valid>true</valid> or <valid>false</valid> throws 502' },
+      reason: 'A parse miss is never valid=false',
     },
     {
       id: 'vies_soap_fault',
@@ -100,8 +118,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'vies_non_200_error',
-      check: { type: 'status_skip', codes: [500, 502, 503], except: [] },
-      reason: 'VIES non-200 HTTP status throws 502',
+      check: { type: 'behavioral', description: 'VIES: a status other than 200 throws 502; nothing is passed on unsigned' },
+      reason: 'Only VIES\'s own answer is read',
     },
   ],
 

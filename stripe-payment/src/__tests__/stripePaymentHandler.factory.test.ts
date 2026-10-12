@@ -20,7 +20,7 @@ import { createHash } from 'node:crypto';
 vi.mock('@tytle-enclaves/native', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).nativeModule);
 vi.mock('node:tls', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).tlsModule);
 
-import { createHandler, KMS_HOST } from '@tytle-enclaves/shared';
+import { createHandler, getAttestOverrides, KMS_HOST, shouldSkipAttestation } from '@tytle-enclaves/shared';
 import type { EnclaveResponse } from '@tytle-enclaves/shared';
 import { encodeFieldElements, hashFieldElements, STRIPE_PAYMENT_SCHEMA } from '../../../shared/src/bn254Codec.js';
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
@@ -549,5 +549,47 @@ describe('manifest (lock)', () => {
   it('declares the STRIPE_PAYMENT_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(STRIPE_PAYMENT_SCHEMA.map((f) => [f.name, f.encoding]));
     expect(HANDLER_MANIFEST.schema.outputBytes).toBe(STRIPE_PAYMENT_SCHEMA.length * 32);
+  });
+});
+
+// Enclave review 2026-10-09, E2a F-17: the manifest said only 400, 401, 403, 429, 500, 502 and 503 pass unsigned (the
+// handler passes every error but 404: 402, 409, 504 too), and that every 404 is signed with state not_found (the
+// vector has no state; only Stripe's own resource_missing is signed). Found with it: a status other than 200 that is
+// no error (a 201, a 302) was read as an answer and could be signed.
+describe('the manifest says what the handler does (red before part 9)', () => {
+  const STATUSES = [201, 301, 400, 401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504];
+
+  // Each status, answered by Stripe with a body that is no answer: the handler passes it on unsigned exactly when a
+  // status_skip policy of the manifest names it, and signs it exactly when a status_attest policy does.
+  it.each(STATUSES)('Stripe answering %i', async (status) => {
+    const body = JSON.stringify({ error: { type: 'api_error', message: 'no answer' } });
+    fakeIo.reply(STRIPE_PORT, json(status, body));
+    const res = await call({ operation: 'list_charges', apiKey: API_KEY });
+    const passedOn = res.success && res.status === status && res.attestation === undefined && res.rawBody === body;
+    expect(passedOn).toBe(shouldSkipAttestation(HANDLER_MANIFEST.policies, status));
+    expect(res.success && res.attestation !== undefined).toBe(getAttestOverrides(HANDLER_MANIFEST.policies, status) !== null);
+  });
+
+  it.each([201, 203, 302])('a %i that carries a list is an error, never signed: only a 200 is an answer', async (status) => {
+    fakeIo.reply(STRIPE_PORT, json(status, LIST_CHARGES));
+    ownAccount();
+    const res = await call({ operation: 'list_charges', apiKey: API_KEY });
+    expect(res).toMatchObject({ success: false, status: 502 });
+    expect(res.error).toBe(`Stripe answered HTTP ${status}: only a 200 is an answer`);
+    expect(fakeIo.nsmAsks).toHaveLength(0);
+  });
+
+  /**
+   * The manifests the enclave releases shipped, with their versions: a version names one manifest, so a changed manifest
+   * moves its version. 718b999 = the 2026-10-09 release. The next release appends its own.
+   */
+  const SHIPPED: ReadonlyArray<readonly [version: string, hash: string]> = [
+    ['1.1.0', '89dfb85f0a9d971738e96f6fb5e5ab1c28dd887318d72d785674a33c68a06e09'],
+  ];
+
+  it('a version names one manifest: a changed manifest moves its version', () => {
+    for (const [version, hash] of SHIPPED) {
+      expect(HANDLER_MANIFEST.version === version, `shipped ${version}`).toBe(MANIFEST_HASH === hash);
+    }
   });
 });

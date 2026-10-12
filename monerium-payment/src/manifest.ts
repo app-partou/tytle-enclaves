@@ -1,9 +1,9 @@
 /**
  * Monerium Payment Handler Manifest
  *
- * Executable specification of the handler's queries, field provenance,
- * policies, and repeatability guarantees. Baked into the Docker image
- * (contributing to PCR0) and its hash is included in every attestation.
+ * The specification of the handler's queries, field provenance, policies, and repeatability guarantees. Baked into
+ * the Docker image, so PCR0 binds it; its hash goes with every answer as a pointer, unsigned. Its status rules are run
+ * against the handler by the package's tests (moneriumPaymentHandler.factory.test.ts).
  */
 
 import {
@@ -13,7 +13,8 @@ import {
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.1.0',
+  // 1.1.0 = the 2026-10-09 release; 1.2.0 = the second enclave release (R4)
+  version: '1.2.0',
 
   queries: [
     {
@@ -104,8 +105,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       reason: 'A signed order is the order the request asked for',
     },
     {
+      id: 'order_status',
+      check: { type: 'behavioral', description: 'fetch_order: a 200 is read as the order; an error (400 or more, a 404 too) is passed on unsigned; any other status throws 502' },
+      reason: 'Only Monerium\'s own order is signed',
+    },
+    {
       id: 'rpc_answer_is_this_call',
-      check: { type: 'behavioral', description: 'The JSON-RPC answer must carry the id of the balanceOf call (1) and a 0x-hex uint256 result; otherwise the answer is an error' },
+      check: { type: 'behavioral', description: 'fetch_balance: the answer must be a 200 whose JSON-RPC body carries the id of the balanceOf call (1) and a 0x-hex uint256 result; otherwise the answer is an error (502), never passed on' },
       reason: 'The signed balance is the chain\'s answer to this call',
     },
   ],

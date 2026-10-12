@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 vi.mock('@tytle-enclaves/native', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).nativeModule);
 vi.mock('node:tls', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).tlsModule);
 
-import { createHandler } from '@tytle-enclaves/shared';
+import { createHandler, getAttestOverrides, shouldSkipAttestation } from '@tytle-enclaves/shared';
 import type { EnclaveResponse } from '@tytle-enclaves/shared';
 import { encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '../../../shared/src/bn254Codec.js';
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
@@ -276,5 +276,123 @@ describe('manifest (lock)', () => {
   it('declares the VIES_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(VIES_SCHEMA.map((f) => [f.name, f.encoding]));
     expect(HANDLER_MANIFEST.schema.outputBytes).toBe(VIES_SCHEMA.length * 32);
+  });
+});
+
+/** The answer is an error (502): nothing signed, nothing passed on. */
+async function expectRefused(body: unknown, error: RegExp): Promise<void> {
+  const res = await check(body);
+  expect(res).toMatchObject({ success: false, status: 502 });
+  expect(res.error).toMatch(error);
+  expect(res.attestation).toBeUndefined();
+  expect(fakeIo.nsmAsks).toHaveLength(0);
+}
+
+// Enclave review 2026-10-09, E2a F-1: VIES answers with the countryCode and vatNumber it checked. The handler signed
+// the request's spelling and never read them, so a vector could name a number VIES never confirmed.
+describe("VIES's own echo of the number it checked must be the number asked (red before part 9)", () => {
+  it('an answer for another number is an error, never signed', async () => {
+    fakeIo.reply(VIES_PORT, xml(VIES_VALID));                // VIES checked PT503504564
+    await expectRefused({ countryCode: 'PT', vatNumber: '503504565' }, /^VIES answered for PT503504564, not for PT503504565$/);
+  });
+
+  it('an answer for another country is an error', async () => {
+    fakeIo.reply(VIES_PORT, xml(VIES_VALID));
+    await expectRefused({ countryCode: 'ES', vatNumber: '503504564' }, /^VIES answered for PT503504564, not for ES503504564$/);
+  });
+
+  it('a spelling VIES rewrites is an error: only the number VIES confirmed is ever signed', async () => {
+    fakeIo.reply(VIES_PORT, xml(VIES_VALID));
+    await expectRefused({ countryCode: 'PT', vatNumber: '503.504.564' }, /^VIES answered for PT503504564, not for PT503\.504\.564$/);
+  });
+
+  it.each([
+    ['its countryCode', '<ns2:countryCode>PT</ns2:countryCode>'],
+    ['its vatNumber', '<ns2:vatNumber>503504564</ns2:vatNumber>'],
+  ])('an answer without %s is an error', async (_label, echo) => {
+    fakeIo.reply(VIES_PORT, xml(VIES_VALID.replace(echo, '')));
+    await expectRefused({ countryCode: 'PT', vatNumber: '503504564' }, /^VIES response does not say which number it checked$/);
+  });
+});
+
+// E2a F-2: only <valid> was required, so a reply that ended early was signed valid with no name and no address.
+describe('a VIES answer is read only when it is complete (red before part 9)', () => {
+  it.each([
+    ['inside the name', VIES_VALID.slice(0, VIES_VALID.indexOf('<ns2:name>') + '<ns2:name>EDP COMER'.length)],
+    ['after the address, before the answer closes', VIES_VALID.slice(0, VIES_VALID.indexOf('</ns2:checkVatResponse>'))],
+  ])('a reply cut %s is an error, never signed', async (_label, cut) => {
+    fakeIo.reply(VIES_PORT, xml(cut));
+    await expectRefused({ countryCode: 'PT', vatNumber: '503504564' }, /^VIES response has no complete checkVatResponse$/);
+  });
+
+  it('a field outside the answer is not read: a name before checkVatResponse is no name of it', async () => {
+    const reply = VIES_NOT_VALID.replace('<env:Header/>', '<env:Header><ns2:name>FORGED</ns2:name><ns2:valid>true</ns2:valid></env:Header>');
+    fakeIo.reply(VIES_PORT, xml(reply));
+    const res = await check({ countryCode: 'PT', vatNumber: '123456789' });
+    const want = signed({ countryCode: 'PT', vatNumber: '123456789', valid: 0, name: null, address: null, dataHash: sha256(reply) });
+    expect(res).toMatchObject({ success: true, rawBody: want.base64 });
+  });
+});
+
+// E2a F-3: any JSON object or array under target was signed valid, and the VRN HMRC answered for was never compared.
+describe('an HMRC 200 is signed valid only for a target that names the VRN asked (red before part 9)', () => {
+  const target = (t: unknown) => JSON.stringify({ target: t, processingDate: '2026-10-08T03:00:00+01:00' });
+
+  it.each([
+    ['an array', target([])],
+    ['an array of the company', target([{ name: 'EXAMPLE TRADING LTD', vatNumber: '123456789' }])],
+  ])('a target that is %s is an error', async (_label, body) => {
+    fakeIo.reply(HMRC_PORT, json(200, body));
+    await expectRefused({ countryCode: 'GB', vatNumber: '123456789' }, /^HMRC response has no target$/);
+  });
+
+  it.each([
+    ['another VRN', target({ name: 'EXAMPLE TRADING LTD', vatNumber: '987654321' })],
+    ['no VRN', target({ name: 'EXAMPLE TRADING LTD' })],
+    ['a VRN that is not text', target({ name: 'EXAMPLE TRADING LTD', vatNumber: 123456789 })],
+  ])('a target for %s is an error', async (_label, body) => {
+    fakeIo.reply(HMRC_PORT, json(200, body));
+    await expectRefused({ countryCode: 'GB', vatNumber: '123456789' }, /^HMRC answered for another VRN than 123456789$/);
+  });
+
+  it.each([
+    ['no name', target({ vatNumber: '123456789' })],
+    ['an empty name', target({ name: '', vatNumber: '123456789' })],
+  ])('a target with %s is an error', async (_label, body) => {
+    fakeIo.reply(HMRC_PORT, json(200, body));
+    await expectRefused({ countryCode: 'GB', vatNumber: '123456789' }, /^HMRC's target has no name$/);
+  });
+});
+
+// E2a F-17: the manifest's status rules described other code than the handler's (status_skip codes the handler turns
+// into a 502, status_attest for every HMRC 404), and VIES kept version 1.0.0 across vector version 2.
+describe('the manifest says what the handler does (red before part 9)', () => {
+  const STATUSES = [201, 301, 400, 401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504];
+
+  // Each status, answered by the register with a body that is no answer: the handler passes it on unsigned exactly
+  // when a status_skip policy of the manifest names it, and signs it exactly when a status_attest policy does.
+  it.each([
+    ...STATUSES.map((status) => ['VIES', status] as const),
+    ...STATUSES.map((status) => ['HMRC', status] as const),
+  ])('%s answering %i', async (register, status) => {
+    if (register === 'VIES') fakeIo.reply(VIES_PORT, httpReply(status, '<html>no answer</html>', { 'Content-Type': 'text/html' }));
+    else fakeIo.reply(HMRC_PORT, json(status, JSON.stringify({ code: 'SERVER_ERROR' })));
+    const res = await check(register === 'VIES' ? { countryCode: 'PT', vatNumber: '503504564' } : { countryCode: 'GB', vatNumber: '123456789' });
+    expect(res.success && res.status === status && res.attestation === undefined).toBe(shouldSkipAttestation(HANDLER_MANIFEST.policies, status));
+    expect(res.success && res.attestation !== undefined).toBe(getAttestOverrides(HANDLER_MANIFEST.policies, status) !== null);
+  });
+
+  /**
+   * The manifests the enclave releases shipped, with their versions: a version names one manifest, so a changed manifest
+   * moves its version. 718b999 = the 2026-10-09 release. The next release appends its own.
+   */
+  const SHIPPED: ReadonlyArray<readonly [version: string, hash: string]> = [
+    ['1.0.0', 'ff9e64d530c112defa3a325c4cae3d1477d64706dd3ec28092c8a993f287ac67'],
+  ];
+
+  it('a version names one manifest: a changed manifest moves its version', () => {
+    for (const [version, hash] of SHIPPED) {
+      expect(HANDLER_MANIFEST.version === version, `shipped ${version}`).toBe(MANIFEST_HASH === hash);
+    }
   });
 });

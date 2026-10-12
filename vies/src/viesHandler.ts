@@ -74,19 +74,36 @@ function unescapeXml(str: string): string {
     .replace(/&amp;/g, '&');
 }
 
-function parseCheckVatSoapResponse(xml: string): {
+function parseCheckVatSoapResponse(xml: string, countryCode: string, vatNumber: string): {
   valid: boolean;
   name?: string;
   address?: string;
 } {
+  // Every field is read inside the one checkVatResponse element, and only when it is complete: its closing tag must
+  // be there. A reply that ended early (no length framing, the connection closed) once kept <valid> and lost the
+  // name, and was signed valid with no name (enclave review 2026-10-09, E2a F-2).
+  const answer = xml.match(/<(\w+:)?checkVatResponse(?:\s[^>]*)?>([\s\S]*)<\/\1checkVatResponse>/)?.[2];
+  if (answer === undefined) {
+    throw new Error('VIES response has no complete checkVatResponse');
+  }
+  // VIES says which number it checked. Only that number is signed, and it must be the one asked: the handler once
+  // signed the request's spelling, which VIES may have rewritten (E2a F-1).
+  const echoedCountry = answer.match(/<(?:\w+:)?countryCode>([^<]*)<\/(?:\w+:)?countryCode>/)?.[1];
+  const echoedNumber = answer.match(/<(?:\w+:)?vatNumber>([^<]*)<\/(?:\w+:)?vatNumber>/)?.[1];
+  if (echoedCountry === undefined || echoedNumber === undefined) {
+    throw new Error('VIES response does not say which number it checked');
+  }
+  if (echoedCountry !== countryCode || echoedNumber !== vatNumber) {
+    throw new Error(`VIES answered for ${echoedCountry}${echoedNumber}, not for ${countryCode}${vatNumber}`);
+  }
   // VIES's answer is <valid>true</valid> or <valid>false</valid>. A reply without it - a WAF page, a cut
   // body, a schema change - is no answer and must never be signed as "not valid" (audit 2026-10 r2 row 5.5).
-  const validMatch = xml.match(/<(?:\w+:)?valid>(true|false)<\/(?:\w+:)?valid>/);
+  const validMatch = answer.match(/<(?:\w+:)?valid>(true|false)<\/(?:\w+:)?valid>/);
   if (!validMatch) {
     throw new Error('VIES response has no <valid>true|false</valid> answer');
   }
-  const nameMatch = xml.match(/<(?:\w+:)?name>([^<]*)<\/(?:\w+:)?name>/);
-  const addressMatch = xml.match(/<(?:\w+:)?address>([^<]*)<\/(?:\w+:)?address>/);
+  const nameMatch = answer.match(/<(?:\w+:)?name>([^<]*)<\/(?:\w+:)?name>/);
+  const addressMatch = answer.match(/<(?:\w+:)?address>([^<]*)<\/(?:\w+:)?address>/);
 
   return {
     valid: validMatch[1] === 'true',
@@ -99,9 +116,10 @@ function parseCheckVatSoapResponse(xml: string): {
 // HMRC JSON Helpers
 // =============================================================================
 
-/** The part of HMRC's lookup answer this handler reads (OAS 2.0: target.name, target.address.line1..). */
+/** The part of HMRC's lookup answer this handler reads (OAS 2.0: target.name, target.vatNumber, target.address.line1..). */
 interface HmrcTarget {
   name?: unknown;
+  vatNumber?: unknown;
   address?: { line1?: unknown; line2?: unknown; postcode?: unknown } | null;
 }
 
@@ -118,7 +136,7 @@ function hmrcErrorCodeOf(json: string): string | null {
   return null;
 }
 
-function parseHmrcResponse(json: string, status: number): {
+function parseHmrcResponse(json: string, status: number, vatNumber: string): {
   valid: boolean;
   name?: string;
   address?: string;
@@ -147,12 +165,20 @@ function parseHmrcResponse(json: string, status: number): {
     throw new Error('HMRC returned invalid JSON response');
   }
   const target = (data !== null && typeof data === 'object') ? (data as { target?: unknown }).target : undefined;
-  if (target === null || typeof target !== 'object') {
+  if (target === null || typeof target !== 'object' || Array.isArray(target)) {
     // A 200 that names no target is no answer: never signed as "valid".
     throw new Error('HMRC response has no target');
   }
-  const { name, address } = target as HmrcTarget;
+  const { name, vatNumber: answeredVrn, address } = target as HmrcTarget;
   const textOf = (v: unknown): string | undefined => (typeof v === 'string' && v !== '' ? v : undefined);
+  // The company HMRC named is the one asked, and HMRC names it: before, any object or array under target was signed
+  // valid (enclave review 2026-10-09, E2a F-3).
+  if (answeredVrn !== vatNumber) {
+    throw new Error(`HMRC answered for another VRN than ${vatNumber}`);
+  }
+  if (textOf(name) === undefined) {
+    throw new Error("HMRC's target has no name");
+  }
 
   return {
     valid: true,
@@ -223,7 +249,7 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
         { 'Accept': 'application/vnd.hmrc.1.0+json' },
       );
 
-      const parsed = parseHmrcResponse(response.body, response.status);
+      const parsed = parseHmrcResponse(response.body, response.status, vatNumber);
       upstreamBody = response.body;
       valid = parsed.valid;
       name = parsed.name;
@@ -246,7 +272,7 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
         throw new Error(`VIES SOAP error: ${faultCode}`);
       }
 
-      const parsed = parseCheckVatSoapResponse(response.body);
+      const parsed = parseCheckVatSoapResponse(response.body, countryCode, vatNumber);
       upstreamBody = response.body;
       valid = parsed.valid;
       name = parsed.name;
