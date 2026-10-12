@@ -14,7 +14,7 @@ Fargate (data-bridge)
     v
 Parent Server (EC2 host, port 5001)     <- generic router
     |  vsock (CID 16, port 5000)
-    |  + the host role's AWS credentials (IMDSv2), only to an enclave that opens sealed secrets (Stripe)
+    |  + the host role's AWS credentials (IMDSv2), only with a request that sends a sealed key (Stripe's sealedApiKey)
     v
 Nitro Enclave                            <- this repo
     |  1. Validate URL against allowlist

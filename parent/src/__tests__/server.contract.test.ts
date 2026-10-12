@@ -641,6 +641,9 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
   const STRIPE = 'https://api.stripe.com/v1/charges';
   const EXPIRES = Date.now() + 6 * 3600_000;
   const CREDS = { accessKeyId: 'ASIATESTONLY00000001', secretAccessKey: 'testonly-secret-access-key-1', sessionToken: 'testonly-session-token-1' };
+  /** A Stripe request that sends its key sealed: the one kind that needs the credentials (enclave review E2b F-12). */
+  const sealed = (over: Record<string, unknown> = {}) =>
+    request({ url: STRIPE, body: JSON.stringify({ operation: 'list_charges', sealedApiKey: 'dGVzdG9ubHktc2VhbGVkLWtleQ==' }), ...over });
   const opened: Array<{ close(): Promise<void> }> = [];
   afterEach(async () => {
     for (const each of opened.splice(0)) await each.close();
@@ -675,21 +678,57 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
     return { res, framed: await framedRequest(conn) };
   }
 
-  it('a request to the Stripe enclave carries them, read from IMDSv2 (red)', async () => {
+  it('a request to the Stripe enclave that sends a sealed key carries them, read from IMDSv2 (red)', async () => {
     const { imds, url } = await withImds();
-    const { res, framed } = await forwardTo(url, request({ url: STRIPE }));
+    const { res, framed } = await forwardTo(url, sealed());
     expect(res.status).toBe(200);
     expect(io.vsockConnectAsync).toHaveBeenCalledWith(18, 5000, expect.any(Number));
-    expect(framed).toEqual({ ...request({ url: STRIPE }), awsCredentials: CREDS });
+    expect(framed).toEqual({ ...sealed(), awsCredentials: CREDS });
     expect(imds.calls).toContain('GET /latest/meta-data/iam/security-credentials/tytle-staging-enclave-host token');
   });
 
   it('they are kept: the next Stripe requests do not read IMDS again (red)', async () => {
     const { imds, url } = await withImds();
-    await forwardTo(url, request({ url: STRIPE }));
-    await forwardTo(url, request({ url: STRIPE }));
-    await forwardTo(url, request({ url: STRIPE }));
+    await forwardTo(url, sealed());
+    await forwardTo(url, sealed());
+    await forwardTo(url, sealed());
     expect(imds.reads()).toBe(1);
+  });
+
+  // Enclave review 2026-10-09, E2b F-12: they are the whole host role's credentials, which can also write the PCR0 pins
+  // in SSM, and before they went with every request to the Stripe enclave. Only a sealed key needs them.
+  it('a Stripe request that sends its key in clear (apiKey) gets none, and the host role is not read (red)', async () => {
+    const { reader, url } = await withReader();
+    const clear = request({ url: STRIPE, body: JSON.stringify({ operation: 'list_charges', apiKey: 'sk_test_testonly' }) });
+    const { res, framed } = await forwardTo(url, clear);
+    expect(res.status).toBe(200);
+    expect(framed).toEqual(clear);
+    expect(reader.calls).toBe(0);
+  });
+
+  it.each([
+    ['no body', undefined],
+    ['an empty body', ''],
+    ['a body that is not JSON', 'sealedApiKey=dGVzdA=='],
+    ['a JSON null', 'null'],
+    ['a JSON array', JSON.stringify([{ sealedApiKey: 'dGVzdA==' }])],
+    ['an empty sealedApiKey', JSON.stringify({ operation: 'list_charges', sealedApiKey: '' })],
+    ['a sealedApiKey that is not text', JSON.stringify({ operation: 'list_charges', sealedApiKey: 7 })],
+    ['a sealedApiKey of null', JSON.stringify({ operation: 'list_charges', sealedApiKey: null })],
+  ])('a Stripe request with %s sends no sealed key: it gets none (red)', async (_name, body) => {
+    const { reader, url } = await withReader();
+    const asked = request({ url: STRIPE, body });          // body undefined: JSON leaves it out
+    const { framed } = await forwardTo(url, asked);
+    expect(framed).toEqual(asked);
+    expect(reader.calls).toBe(0);
+  });
+
+  it('a sealed key sent to an enclave that opens none gets none (lock)', async () => {
+    const { reader, url } = await withReader();
+    // A field named "undefined" too: which field carries a sealed key is the enclave's, never the body's
+    const toVies = request({ body: JSON.stringify({ sealedApiKey: 'dGVzdA==', undefined: 'dGVzdA==' }) });
+    expect((await forwardTo(url, toVies)).framed).toEqual(toVies);
+    expect(reader.calls).toBe(0);
   });
 
   it.each([
@@ -706,12 +745,13 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
     const { url } = await withReader();
     const forged = { accessKeyId: 'AKIAFORGEDFORGEDFORG', secretAccessKey: 'forged', sessionToken: 'forged' };
     expect((await forwardTo(url, { ...request(), awsCredentials: forged })).framed).not.toHaveProperty('awsCredentials');
-    expect((await forwardTo(url, { ...request({ url: STRIPE }), awsCredentials: forged })).framed.awsCredentials).toEqual(CREDS);
+    expect((await forwardTo(url, { ...request({ url: STRIPE }), awsCredentials: forged })).framed).not.toHaveProperty('awsCredentials');
+    expect((await forwardTo(url, { ...sealed(), awsCredentials: forged })).framed.awsCredentials).toEqual(CREDS);
   });
 
   it('they never reach a log line (red)', async () => {
     const { url } = await withImds();
-    const { framed } = await forwardTo(url, request({ url: STRIPE }));
+    const { framed } = await forwardTo(url, sealed());
     expect(framed.awsCredentials).toEqual(CREDS);
     const all = [...logs, ...errors].join('\n');
     expect(all).not.toContain(CREDS.secretAccessKey);
@@ -720,9 +760,9 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
 
   it('IMDS down: the Stripe request still goes, without them (only a sealed key then fails, in the enclave) (red)', async () => {
     const { url } = await withImds(true);
-    const { res, framed } = await forwardTo(url, request({ url: STRIPE }));
+    const { res, framed } = await forwardTo(url, sealed());
     expect(res.status).toBe(200);
-    expect(framed).toEqual(request({ url: STRIPE }));
+    expect(framed).toEqual(sealed());
     expect(errors).toEqual(['[parent] IMDSv2: no host role credentials: "IMDS answered 500 to PUT /latest/api/token"']);
   });
 });
@@ -759,7 +799,11 @@ describe('a caller that has gone (enclave review 2026-10-09, E2b F-1, item 2)', 
         headers: { 'Content-Type': 'application/json' },
       });
       caller.on('error', () => { /* destroyed below, on purpose */ });
-      caller.end(JSON.stringify(request({ url: 'https://api.stripe.com/v1/charges' })));
+      // A sealed key: the one kind of Stripe request that waits for the host role's credentials
+      caller.end(JSON.stringify(request({
+        url: 'https://api.stripe.com/v1/charges',
+        body: JSON.stringify({ operation: 'list_charges', sealedApiKey: 'dGVzdG9ubHktc2VhbGVkLWtleQ==' }),
+      })));
       await imdsAsked;
       caller.destroy();
       await vi.waitFor(async () => expect(await connectionsOf(parent)).toBe(0));

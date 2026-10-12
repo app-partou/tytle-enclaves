@@ -12,7 +12,7 @@
 import express from 'express';
 import crypto from 'node:crypto';
 import type { Server } from 'node:http';
-import { findRoute, getAllRoutes, opensSealedSecrets } from './enclaveRouter.js';
+import { findRoute, getAllRoutes, sendsSealedSecret } from './enclaveRouter.js';
 import { sendToEnclave } from './vsockClient.js';
 import { checkHealth, type HealthStatus } from './healthCheck.js';
 import { MAX_REQUEST_BODY, parseFetchRequest } from './requestSchema.js';
@@ -124,7 +124,10 @@ export interface ParentOptions {
    * open, as before.
    */
   authToken?: string;
-  /** The host role's credentials, for an enclave that opens sealed secrets (hostCredentials.ts). Unset: none sent. */
+  /**
+   * The host role's credentials, for a request that sends a sealed secret to an enclave that opens one
+   * (hostCredentials.ts, enclaveRouter.ts sendsSealedSecret). Unset: none sent.
+   */
   hostCredentials?: HostCredentials;
   /**
    * How long one /health check answers every probe after it (HEALTH_CACHE_MS when unset). At 0 each probe checks anew,
@@ -192,9 +195,12 @@ export function createApp(options: ParentOptions = {}): express.Express {
 
     const start = Date.now();
     try {
-      // The host role's credentials go only to an enclave that opens sealed secrets; without them the request still
-      // goes, and only a sealed secret fails, in the enclave (NO_CREDENTIALS)
-      const awsCredentials = hostCredentials && opensSealedSecrets(route) ? await hostCredentials.get() : null;
+      // The host role's credentials go only with a request that sends a sealed secret to an enclave that opens one
+      // (enclaveRouter.ts sendsSealedSecret); without them the request still goes, and only a sealed secret fails, in
+      // the enclave (NO_CREDENTIALS)
+      const awsCredentials = hostCredentials && sendsSealedSecret(route, parsed.request.body)
+        ? await hostCredentials.get()
+        : null;
       if (callerGone) {
         console.log(`[parent] ${requestId}: the caller has gone; not sent to the enclave`);
         return;

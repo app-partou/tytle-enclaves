@@ -20,8 +20,9 @@ export interface EnclaveRequest {
   /** The caller's challenge (64 lowercase hex), forwarded untouched; the enclave signs it into the nonce. */
   challenge?: string;
   /**
-   * The host role's credentials (hostCredentials.ts), set by the parent itself and only for an enclave that opens
-   * sealed secrets (enclaveRouter.ts opensSealedSecrets). Never taken from a caller, never logged.
+   * The host role's credentials (hostCredentials.ts), set by the parent itself and only for a request that sends a
+   * sealed secret to an enclave that opens one (enclaveRouter.ts sendsSealedSecret). Never taken from a caller, never
+   * logged.
    */
   awsCredentials?: AwsCredentials;
 }
