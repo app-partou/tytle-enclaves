@@ -17,7 +17,7 @@ class ScriptedVsock {
   constructor(chunks: Buffer[]) {
     this.pending = [...chunks];
   }
-  read(size: number): Buffer {
+  readWithin(size: number, _timeoutMs: number): Buffer | null {
     const next = this.pending.shift();
     if (!next) return Buffer.alloc(0);
     if (next.length > size) {
@@ -26,7 +26,7 @@ class ScriptedVsock {
     }
     return next;
   }
-  write(data: Buffer): number {
+  writeWithin(data: Buffer, _timeoutMs: number): number {
     this.written.push(Buffer.from(data));
     return data.length;
   }
@@ -43,6 +43,7 @@ vi.mock('node:tls', () => ({ connect: tlsConnect }));
 
 import { proxyFetch, proxyFetchPlain } from '../httpProxy.js';
 import { IncompleteBodyError, MalformedResponseError, ResponseTooLargeError } from '../httpErrors.js';
+import { BlockingVsock } from './helpers/blockingVsock.js';
 
 function scripted(...parts: Array<string | Buffer>): ScriptedVsock {
   const sock = new ScriptedVsock(parts.map((p) => (typeof p === 'string' ? Buffer.from(p, 'utf-8') : p)));
@@ -102,6 +103,138 @@ describe('proxyFetchPlain - replies it reads completely (locks)', () => {
     const sent = Buffer.concat(sock.written).toString('utf-8');
     expect(sent).toBe('POST /Consulta.aspx HTTP/1.1\r\nHost: www.sicae.pt\r\nX-A: b\r\nConnection: close\r\nContent-Length: 3\r\n\r\na=1');
   });
+
+  it('drops a caller Host, Connection, Content-Length or Transfer-Encoding in any case: the enclave writes its own, once (red)', async () => {
+    // Enclave review 2026-10-09, E1 F-5: object keys are case-sensitive, so `host` or `content-length` was written beside
+    // the enclave's own. A name with a space before it would start a line with a space: an old-style continuation line.
+    const own = { host: 'evil', CONNECTION: 'keep-alive', 'content-length': '99', 'Transfer-Encoding': 'chunked', ' Host': 'folded', 'X-A': 'b' };
+    const want = 'POST /Consulta.aspx HTTP/1.1\r\nHost: www.sicae.pt\r\nX-A: b\r\nConnection: close\r\nContent-Length: 3\r\n\r\na=1';
+
+    const sock = scripted('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n');
+    await proxyFetchPlain(8445, 'www.sicae.pt', 'POST', '/Consulta.aspx', own, 'a=1', 5_000);
+    expect(Buffer.concat(sock.written).toString('utf-8')).toBe(want);
+
+    // The TLS path writes the same request
+    scripted();
+    const tlsSocket = Object.assign(new EventEmitter(), { write: vi.fn(), destroy: vi.fn() });
+    tlsConnect.mockImplementation((_opts: unknown, onSecure: () => void) => {
+      setImmediate(() => {
+        onSecure();
+        tlsSocket.emit('data', Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n'));
+        tlsSocket.emit('end');
+      });
+      return tlsSocket;
+    });
+    await proxyFetch(8443, 'www.sicae.pt', 'POST', '/Consulta.aspx', own, 'a=1', 5_000);
+    expect(tlsSocket.write).toHaveBeenCalledWith(want);
+  });
+});
+
+describe('a reply complete by its own framing is read before the connection ends (enclave review 2026-10-09, E1 F-3)', () => {
+  // A server may keep the connection open after a whole answer, whatever `Connection: close` asked. Read at the end of
+  // the connection alone, its answer became a timeout. Real clock: the server's socket blocks each read for up to a
+  // slice, as the native one does (helpers/blockingVsock.ts).
+  function server(sends: Array<{ atMs: number; bytes: string }>, closesAtMs?: number): BlockingVsock {
+    const sock = new BlockingVsock({ sends, closesAtMs, socketTimeoutSecs: 5 });
+    connect.mockReturnValue(sock);
+    return sock;
+  }
+
+  async function timedFetch(timeoutMs = 2_000) {
+    const start = Date.now();
+    const res = await proxyFetchPlain(8445, 'www.sicae.pt', 'GET', '/', {}, undefined, timeoutMs);
+    return { ...res, took: Date.now() - start };
+  }
+
+  it('a Content-Length reply, the connection left open: read at once, and the connection closed (red)', async () => {
+    const sock = server([{ atMs: 0, bytes: 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' }]);
+    const res = await timedFetch();
+    expect(res).toMatchObject({ status: 200, body: 'ok' });
+    expect(res.took).toBeLessThan(1_000);
+    expect(sock.closed).toBe(true);
+  });
+
+  it('a head whose end comes in two parts, the connection left open: read when the second part comes (red)', async () => {
+    server([
+      { atMs: 0, bytes: 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r' },
+      { atMs: 200, bytes: '\nok' },
+    ]);
+    const res = await timedFetch();
+    expect(res).toMatchObject({ status: 200, body: 'ok' });
+    expect(res.took).toBeGreaterThanOrEqual(150);
+    expect(res.took).toBeLessThan(1_000);
+  });
+
+  it('a chunked reply cut at every line end, the connection left open: read when its last line comes (red)', async () => {
+    server([
+      { atMs: 0, bytes: 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r' },
+      { atMs: 100, bytes: '\nhello\r' },
+      { atMs: 200, bytes: '\n0\r\nX-Trailer: 1\r' },
+      { atMs: 300, bytes: '\n\r' },
+      { atMs: 400, bytes: '\n' },
+    ]);
+    const res = await timedFetch();
+    expect(res).toMatchObject({ status: 200, body: 'hello' });
+    expect(res.took).toBeGreaterThanOrEqual(350);
+    expect(res.took).toBeLessThan(1_200);
+  });
+
+  it('after an interim 100 Continue, the answer complete by its own framing, the connection left open (red)', async () => {
+    server([{ atMs: 0, bytes: 'HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' }]);
+    await expect(timedFetch()).resolves.toMatchObject({ status: 200, headers: { 'content-length': '2' }, body: 'ok' });
+  });
+
+  it('over TLS the same: read at once, both sockets closed (red)', async () => {
+    const sock = scripted();
+    const tlsSocket = Object.assign(new EventEmitter(), { write: vi.fn(), destroy: vi.fn() });
+    tlsConnect.mockImplementation((_opts: unknown, onSecure: () => void) => {
+      setImmediate(() => {
+        onSecure();
+        tlsSocket.emit('data', Buffer.from('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok'));
+      });
+      return tlsSocket;
+    });
+    const res = await proxyFetch(8443, 'ec.europa.eu', 'POST', '/x', {}, 'b', 2_000);
+    expect(res.body).toBe('ok');
+    expect(tlsSocket.destroy).toHaveBeenCalled();
+    expect(sock.closed).toBe(true);
+  });
+
+  it('bytes after a complete reply that come in a later read are not read: the answer is what its framing holds (red)', async () => {
+    // RFC 9112 §6.3: data after a complete final reply may be discarded, and must never be read as a reply. Before, it was
+    // read at the end of the connection, and the body was "longer than its Content-Length". In the same read it still
+    // is (the "body longer than its Content-Length" test above).
+    server([
+      { atMs: 0, bytes: 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' },
+      { atMs: 300, bytes: 'HTTP/1.1 200 OK\r\n\r\nsmuggled' },
+    ], 600);
+    const res = await timedFetch();
+    expect(res.body).toBe('ok');
+    expect(res.took).toBeLessThan(300);
+  });
+
+  it('a reply with neither Content-Length nor chunked still runs to the end of the connection (lock)', async () => {
+    server([
+      { atMs: 0, bytes: 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>' },
+      { atMs: 200, bytes: '</html>' },
+    ], 400);
+    const res = await timedFetch();
+    expect(res.body).toBe('<html></html>');
+    expect(res.took).toBeGreaterThanOrEqual(350);
+  });
+
+  it('a Content-Length body still waits for all its bytes (lock)', async () => {
+    server([
+      { atMs: 0, bytes: 'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab' },
+      { atMs: 300, bytes: 'cd' },
+    ], 600);
+    await expect(timedFetch()).resolves.toMatchObject({ body: 'abcd' });
+  });
+
+  it('a chunked body still waits for its terminal chunk, and a connection that ends first is an error (lock)', async () => {
+    server([{ atMs: 0, bytes: 'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n' }], 300);
+    await expect(timedFetch()).rejects.toBeInstanceOf(IncompleteBodyError);
+  });
 });
 
 describe('the vsock socket of a fetch gets the fetch budget as its read/write timeout', () => {
@@ -134,7 +267,9 @@ describe('the vsock socket of a fetch gets the fetch budget as its read/write ti
     });
     await proxyFetch(8443, 'ec.europa.eu', 'POST', '/x', {}, 'b', 25_000);
     expect(connect).toHaveBeenCalledWith(3, 8443, 25);
-    expect(sock.closed).toBe(false);
+    // The reply is complete by its Content-Length: the enclave closes the socket itself, not waiting for the server
+    // (E1 F-3). Before, nothing here closed it.
+    expect(sock.closed).toBe(true);
   });
 });
 

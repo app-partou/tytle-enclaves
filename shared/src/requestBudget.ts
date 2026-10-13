@@ -3,12 +3,15 @@
  *
  * The budgets run from the outside in, each longer than the one inside it, so no step works on for a caller that
  * already gave up: ai-agent-server 60 s for a whole call, data-bridge 45 s, the parent 35 s for the enclave's answer
- * (parent/src/vsockClient.ts), the enclave 30 s for a request from the moment it accepts the connection. Before, the
- * enclave gave a handler 60 s - and that timer did not even stop it - while the parent waited 30 s: a slow upstream let
- * an enclave read on, hold one of its request slots and mint a document long after the parent had answered.
+ * (parent/src/vsockClient.ts), the enclave 30 s for a request from the moment its connection arrived (the native
+ * accept takes that time on the thread pool, so a connection that waited for the event loop gets no fresh budget:
+ * enclave review 2026-10-09, E-1). Before, the enclave gave a handler 60 s - and that timer did not even stop it -
+ * while the parent waited 30 s: a slow upstream let an enclave read on, hold one of its request slots and mint a
+ * document long after the parent had answered.
  *
  * Every upstream read, the KMS call, every retry and every pause between retries take what is left of the budget;
- * nothing starts once it is spent, and no document is minted after it (RequestDeadlineError, answered 504).
+ * nothing starts once it is spent, and no document is minted after it (RequestDeadlineError, answered 504). The time
+ * bounds hold because no native read or write waits longer than a slice (vsockWait.ts): the timers run on time.
  */
 
 /** The work of one request: from accept to the last upstream read and the attestation. */
@@ -22,6 +25,13 @@ export const DEFAULT_FETCH_TIMEOUT_MS = 25_000;
  * written) before the enclave answers 504 itself. 30 s + 2 s stays inside the parent's 35 s.
  */
 export const ANSWER_GRACE_MS = 2_000;
+
+/**
+ * After the answer is due (the budget plus ANSWER_GRACE_MS), the time its write to the parent may still take: the
+ * writes of one connection end by 34 s after it arrived, inside the parent's 35 s (enclave review 2026-10-09, E1 F-10:
+ * a write had no deadline).
+ */
+export const ANSWER_WRITE_MS = 2_000;
 
 export interface RequestBudget {
   /** Epoch ms after which no step of this request starts */

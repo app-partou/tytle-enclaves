@@ -10,6 +10,9 @@
 #
 # CRITICAL: All base images pinned by digest. All system packages pinned by version.
 # npm ci with lockfile. SOURCE_DATE_EPOCH + BuildKit rewrite-timestamp for determinism.
+# Every file copied from the checkout gets mode 0644 (--chmod): git keeps only the executable bit, so a
+# checked-out file's mode is 0666 minus its builder's umask, and a mode is part of the image and its PCR0.
+# A directory is copied only into a builder stage: its files are compiled, and their modes reach nothing kept.
 
 # Stage 1: Rust builder for native addon (vsock + NSM ioctl)
 # Pin by digest for reproducibility — update via:
@@ -20,18 +23,18 @@ FROM rust:1.83-alpine@sha256:0ac946ed7597a9f053a1be2ce38c09aa88b3d7079a91ea49149
 # rust:1.83-alpine lacks nodejs/npm/musl-dev, and Alpine removes old package
 # versions from its mirrors over time, so we vendor the exact .apk closure.
 # See deps/rust-builder-apks/README.md for rationale and regenerate.sh to update.
-COPY deps/rust-builder-apks/SHASUMS256.txt /tmp/apks/SHASUMS256.txt
-COPY deps/rust-builder-apks/*.apk /tmp/apks/
+COPY --chmod=0644 deps/rust-builder-apks/SHASUMS256.txt /tmp/apks/SHASUMS256.txt
+COPY --chmod=0644 deps/rust-builder-apks/*.apk /tmp/apks/
 RUN cd /tmp/apks && \
     sha256sum -c SHASUMS256.txt && \
     apk add --no-cache --allow-untrusted ./*.apk && \
     rm -rf /tmp/apks
 
 WORKDIR /build/native
-COPY native/package.json native/package-lock.json* ./
+COPY --chmod=0644 native/package.json native/package-lock.json* ./
 RUN npm ci
 
-COPY native/Cargo.toml native/Cargo.lock native/build.rs ./
+COPY --chmod=0644 native/Cargo.toml native/Cargo.lock native/build.rs ./
 COPY native/src/ ./src/
 RUN npm run build
 
@@ -44,14 +47,14 @@ FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18
 WORKDIR /shared
 
 # Install shared deps from pre-stripped docker lockfile (deterministic)
-COPY shared/package.docker.json ./package.json
-COPY shared/package-lock.docker.json ./package-lock.json
+COPY --chmod=0644 shared/package.docker.json ./package.json
+COPY --chmod=0644 shared/package-lock.docker.json ./package-lock.json
 RUN npm ci
 
 # Copy native addon into shared's node_modules
 COPY --from=rust-builder /build/native/index.js /build/native/index.d.ts /build/native/package.json ./node_modules/@tytle-enclaves/native/
 COPY --from=rust-builder /build/native/*.node ./node_modules/@tytle-enclaves/native/
-COPY shared/tsconfig.json ./
+COPY --chmod=0644 shared/tsconfig.json ./
 COPY shared/src/ ./src/
 RUN npx tsc
 
@@ -64,8 +67,8 @@ FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18
 WORKDIR /app
 
 # Install sicae deps from pre-stripped docker lockfile (deterministic)
-COPY sicae/package.docker.json ./package.json
-COPY sicae/package-lock.docker.json ./package-lock.json
+COPY --chmod=0644 sicae/package.docker.json ./package.json
+COPY --chmod=0644 sicae/package-lock.docker.json ./package-lock.json
 RUN npm ci
 
 # Copy native addon
@@ -77,7 +80,7 @@ COPY --from=shared-builder /shared/dist ./node_modules/@tytle-enclaves/shared/di
 COPY --from=shared-builder /shared/package.json ./node_modules/@tytle-enclaves/shared/
 
 # Build sicae TypeScript
-COPY sicae/tsconfig.json ./
+COPY --chmod=0644 sicae/tsconfig.json ./
 COPY sicae/src/ ./src/
 RUN npx tsc
 
@@ -104,7 +107,7 @@ FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18
 WORKDIR /app
 COPY --from=node-builder /app/dist ./dist
 COPY --from=node-builder /app/node_modules ./node_modules
-COPY sicae/package.json ./
+COPY --chmod=0644 sicae/package.json ./
 
 # Fixed UID — avoids /etc/passwd differences across builds
 USER 1000

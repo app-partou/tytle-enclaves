@@ -28,22 +28,24 @@ export type { FieldDef, FieldEncoding } from './bn254Codec.js';
 export { stableStringify, computeManifestHash, validateManifest } from './manifest.js';
 export type {
   FieldTransform, ResponseFieldSource, RequestParamSource, RequestHeaderSource,
-  ParsedSource, DerivedSource, HostSource, FieldSource, FieldProvenance,
+  ParsedSource, DerivedSource, HostSource, ApiKeySource, FieldSource, FieldProvenance,
   QueryAuth, RpcCall, QueryDef, PolicyCheck, PolicyDef,
   RepeatabilityDef, HandlerManifest,
 } from './manifest.js';
-export { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from './policies.js';
+export { SKIP_TRANSIENT_ERRORS, STRIP_AUTH, REDACT_BEARER } from './policies.js';
 export { toErrorMessage } from './errorUtils.js';
 export { sanitizeError, stripSensitiveHeaders } from './sanitize.js';
 export { proxyFetchWithRetry } from './retryProxy.js';
 export type { RetryConfig } from './retryProxy.js';
 export { shouldSkipAttestation, getAttestOverrides, getHeadersToStrip, redactError } from './policyEngine.js';
 export { createHandler } from './handlerFactory.js';
-export { REQUEST_BUDGET_MS, ANSWER_GRACE_MS, DEFAULT_FETCH_TIMEOUT_MS, RequestDeadlineError, requestBudget, timeFor } from './requestBudget.js';
+export { REQUEST_BUDGET_MS, ANSWER_GRACE_MS, ANSWER_WRITE_MS, DEFAULT_FETCH_TIMEOUT_MS, RequestDeadlineError, requestBudget, timeFor } from './requestBudget.js';
 export type { RequestBudget } from './requestBudget.js';
 export type { HandlerDef, HandlerResult, HandlerContext } from './handlerFactory.js';
-export { readMessage, writeMessage, ReadDeadlineError } from './protocol.js';
-export type { MessageStream, ReadOptions } from './protocol.js';
+export { readMessage, writeMessage, ReadDeadlineError, WriteDeadlineError } from './protocol.js';
+export type { MessageStream, ReadOptions, WriteOptions } from './protocol.js';
+export { WAIT_SLICE_MS } from './vsockWait.js';
+export type { SlicedStream } from './vsockWait.js';
 export { ResponseTooLargeError, IncompleteBodyError, MalformedResponseError } from './httpErrors.js';
 export { createLogger } from './logger.js';
 export type { Logger } from './logger.js';

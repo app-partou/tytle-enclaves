@@ -3,7 +3,8 @@
  * launch template sets HttpTokens required): real HTTP on 127.0.0.1, so hostCredentials.ts runs its own fetch calls.
  * PUT /latest/api/token needs the TTL header and gives a session token; every GET needs a token it gave (401
  * otherwise, as IMDSv2 answers); GET .../iam/security-credentials/ names the role, and GET .../<role> answers the
- * credentials JSON that `answer(read)` gives for the n-th read (from 1). Every call is recorded.
+ * credentials JSON that `answer(read)` gives for the n-th read (from 1), when it gives it (a promise: IMDS takes its time).
+ * Every call is recorded.
  */
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -36,7 +37,7 @@ export function imdsCredentials(n: number, expiresAt: number): Record<string, un
 
 export async function startFakeImds({ role = 'tytle-staging-enclave-host', answer }: {
   role?: string;
-  answer: (read: number) => ImdsAnswer;
+  answer: (read: number) => ImdsAnswer | Promise<ImdsAnswer>;
 }): Promise<FakeImds> {
   const calls: string[] = [];
   const tokens = new Set<string>();
@@ -59,10 +60,10 @@ export async function startFakeImds({ role = 'tytle-staging-enclave-host', answe
     if (!withToken) return send(401, 'Unauthorized');
     if (req.url === '/latest/meta-data/iam/security-credentials/') return send(200, role);
     if (req.url === `/latest/meta-data/iam/security-credentials/${role}`) {
-      const out = answer(++reads);
-      return 'status' in out && typeof out.status === 'number' && typeof out.body === 'string'
+      void Promise.resolve(answer(++reads)).then((out) => ('status' in out && typeof out.status === 'number' && typeof out.body === 'string'
         ? send(out.status, out.body)
-        : send(200, JSON.stringify(out));
+        : send(200, JSON.stringify(out))));
+      return;
     }
     return send(404, 'Not Found');
   });

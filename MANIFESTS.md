@@ -1,28 +1,29 @@
 # Handler Manifests
 
-Every enclave handler declares a **manifest** — a structured, machine-parseable specification of what the handler does. The manifest is baked into the Docker image (contributing to PCR0) and its SHA-256 hash is included in every attestation.
+Every enclave handler declares a **manifest** — a structured, machine-parseable specification of what the handler does. The manifest is baked into the Docker image (contributing to PCR0), and its SHA-256 hash is sent with every answer as a pointer to it (not signed: PCR0 is what binds it).
 
 ## Why Manifests Exist
 
 PCR0 proves which code ran, but it's an opaque hash. The manifest makes the handler's behavior inspectable without reading source code. Verification tools can use it to:
 
 1. **Trace field provenance** — which API response field each BN254 value came from
-2. **Validate policies** — confirm error handling and security rules match expectations
+2. **Read the policies** — the error handling and security rules the handler applies (Policies, below: which the factory runs, and which each package's tests hold to the code)
 3. **Reproduce encodings** — independently recompute BN254 output from raw API responses
-4. **Detect changes** — the manifest version and hash change when behavior changes
+4. **Detect changes** — the manifest version and hash change when behavior changes: each package's tests hold every released version to its manifest hash, so a changed manifest must move its version
 
 ## Cryptographic Chain
 
 ```
-PCR0 → proves which Docker image ran (includes manifest code)
-requestHash → includes manifest hash → proves which specification
+PCR0 → proves which Docker image ran, and so which manifest (the manifest is code in the image)
 BN254 fields + dataHash → proves the data transformation
 NSM signature → proves genuine Nitro hardware
 ```
 
 The manifest hash appears in:
 - **Response headers**: `x-{service}-manifest-hash`
-- **Attestation requestHash**: via `x-manifest-hash` in the attested request headers
+- **The request headers the enclave hashes into `requestHash`**: `x-manifest-hash`
+
+Neither is signed: `requestHash` is outside the nonce and `user_data` (VERIFICATION.md, What Is Signed). The hash names the manifest; the commit whose rebuild gives the document's PCR0 is what proves it ran (VERIFICATION.md, Step 8).
 
 ## Manifest Structure
 
@@ -96,25 +97,28 @@ Each BN254 field traces to its data source. Two shapes:
 
 Available transforms: `identity`, `BigInt(hex)`, `sha256`, `boolean_uint`, `array_length`.
 
+**From the API key** - a property of the key the handler asked with, never the key:
+```typescript
+{ name: 'livemode', encoding: 'uint', source: { from: 'api_key', property: 'stripe_livemode' } }
+```
+
 ### Policies
 
-Policies are composable building blocks. Four standard policies ship with the shared library:
+Policies are composable building blocks. Three standard policies ship with the shared library:
 
 | Policy | Type | Description |
 |--------|------|-------------|
-| `SKIP_TRANSIENT_ERRORS` | error_handling | HTTP 4xx/5xx (except 404) returned without attestation |
-| `ATTEST_NOT_FOUND` | error_handling | HTTP 404 attested with `state="not_found"` |
+| `SKIP_TRANSIENT_ERRORS` | error_handling | Every upstream error (400 or more, but 404) passed on unsigned, as it was sent; a 404 is each handler's own rule |
 | `STRIP_AUTH` | security | Authorization header excluded from attestation hash |
 | `REDACT_BEARER` | security | Bearer tokens redacted from error messages |
 
 Services compose standard policies and add custom ones:
 
 ```typescript
-import { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from '@tytle-enclaves/shared';
+import { SKIP_TRANSIENT_ERRORS, STRIP_AUTH, REDACT_BEARER } from '@tytle-enclaves/shared';
 
 policies: [
   SKIP_TRANSIENT_ERRORS,
-  ATTEST_NOT_FOUND,
   STRIP_AUTH,
   REDACT_BEARER,
   // Custom: only Gnosis chain supported
@@ -129,10 +133,17 @@ Policy check types:
 | `field_equals` | `path`, `value` | `order.chain === "gnosis"` |
 | `field_matches` | `path`, `pattern` | `address matches /^0x[a-fA-F0-9]{40}$/` |
 | `field_required` | `paths[]` | `id, state, amount must exist` |
-| `status_skip` | `codes[]`, `except[]?` | `skip attestation for 401, 429, 5xx` |
-| `status_attest` | `code`, `overrides?` | `attest 404 with state=not_found` |
+| `status_skip` | `codes[]`, `atLeast?`, `except[]?` | `pass on unsigned every status of 400 or more, but 404` |
+| `status_attest` | `code`, `overrides?` | `sign a 410 with these values` |
 | `header_strip` | `headers[]` | `remove Authorization before attestation` |
 | `error_redact` | `pattern`, `replacement` | `redact Bearer tokens in errors` |
+| `behavioral` | `description` | `the answered order's id must be the one asked` |
+
+Which checks run where:
+
+- `header_strip` and `error_redact` are applied by the shared handler factory to every request.
+- `status_skip` and `status_attest` say what the handler does with an upstream status: `status_skip` names the statuses it passes on unsigned, as they were sent, and `status_attest` the ones it signs. A status neither names is never passed on: the handler reads it as an answer or fails (502). Each package's tests run these rules against the handler for a spread of statuses, so a manifest that says other than the code fails there. A rule narrower than a status (Stripe signs a 404 only with Stripe's own `resource_missing` code) is a `behavioral` check, never a `status_attest`.
+- `field_*` and `behavioral` checks describe what the handler's code does; the package's tests lock that behavior.
 
 ### Repeatability
 
@@ -160,6 +171,10 @@ If the manifest drifts from the schema, the handler crashes at startup — not s
 ## Manifest Hash Stability
 
 The manifest hash uses `stableStringify()` — a deterministic JSON serialization with recursively sorted object keys. This guarantees the same manifest always produces the same hash, regardless of JavaScript property insertion order.
+
+## Versions
+
+A version names one manifest. Each package's tests list the manifests its releases shipped (version and hash): a manifest that changes while keeping a shipped version fails them. A release appends its own. The second enclave release moves VIES and SICAE to 1.1.0 (both kept 1.0.0 across vector version 2) and Stripe and Monerium to 1.2.0. VIES 1.1.0 also asks HMRC's Check a UK VAT number 2.0 with the caller's OAuth token (`gb_needs_hmrc_token`, `strip_auth`, `redact_bearer`): HMRC removed version 1.0 on 17 February 2025. Stripe 1.2.0 also signs the mode of the key it asked with (`livemode`, version 2 of its vector, `the_key_mode_is_signed`), and takes only a key that names its mode.
 
 ## Adding a Manifest to a New Service
 

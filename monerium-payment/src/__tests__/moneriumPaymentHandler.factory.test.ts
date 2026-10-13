@@ -8,7 +8,8 @@
  *
  * WHY (audit 2026-10 P1.4 and the caller-input row): the handler fetched any orderId it was given, signed an order
  * without checking it was the one asked, signed ANY JSON 404 as "not found", and signed a balance from a JSON-RPC
- * answer to another call. Now each of those is a 400 or an error, never signed.
+ * answer to another call. Now each of those is a 400 or an error, never signed. And since the enclave review of
+ * 2026-10-09 (E-5, F-15) no 404 is signed at all, and an order id in upper case is a 400.
  *
  * Labels: "lock" = the behaviour of the release before this one, kept; "red" = fails on that release.
  */
@@ -18,7 +19,7 @@ import { createHash } from 'node:crypto';
 vi.mock('@tytle-enclaves/native', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).nativeModule);
 vi.mock('node:tls', async () => (await import('../../../shared/src/__tests__/helpers/fakeEnclaveIo.js')).tlsModule);
 
-import { createHandler } from '@tytle-enclaves/shared';
+import { createHandler, getAttestOverrides, shouldSkipAttestation } from '@tytle-enclaves/shared';
 import type { EnclaveResponse } from '@tytle-enclaves/shared';
 import { encodeFieldElements, hashFieldElements, MONERIUM_PAYMENT_SCHEMA } from '../../../shared/src/bn254Codec.js';
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
@@ -103,6 +104,7 @@ describe('a value Monerium is never asked with is a 400 before anything is fetch
     ['an orderId that is not a UUID', { orderId: 'test-order-id' }, /Invalid orderId: a Monerium order id is a UUID/],
     ['an orderId with a path in it', { orderId: `${ORDER_ID}/payments` }, /Invalid orderId/],
     ['an orderId that is not text', { orderId: 42 }, /Invalid orderId/],
+    ['an orderId in upper case (E2a F-15: Monerium\'s ids are lower-case; a 404 for one was signed under its hash)', { orderId: ORDER_ID.toUpperCase() }, /Invalid orderId: a Monerium order id is a UUID in lower case/],
     ['an accessToken that is not text', { accessToken: { token: TOKEN } }, /accessToken is required/],
   ])('%s', async (_label, overrides, error) => {
     const res = await ask(overrides);
@@ -189,23 +191,35 @@ describe('an order and its balance', () => {
   });
 });
 
-describe('404', () => {
-  it('Monerium\'s own error body with code 404 is signed as not_found, for the order asked (lock)', async () => {
-    fakeIo.reply(MONERIUM_PORT, json(404, NOT_FOUND));
+describe('the bodies behind dataHash go out beside the answer, unsigned (enclave review 2026-10-09, E-4; red before)', () => {
+  it('upstreamBody is the order body, a line break, then the balance answer: the text whose SHA-256 is the signed dataHash', async () => {
+    const orderBody = order();
+    const rpcBody = rpc(word(BALANCE_WEI));
+    fakeIo.reply(MONERIUM_PORT, json(200, orderBody));
+    fakeIo.reply(RPC_PORT, json(200, rpcBody));
     const res = await ask();
-    const want = signed({ orderId: ORDER_ID, state: 'not_found', orderAmount: null, currency: null, balance: 0, dataHash: sha256(NOT_FOUND) });
-    expect(res).toMatchObject({ success: true, status: 404, rawBody: want.base64 });
+    expect(res.success).toBe(true);
+    expect(res.upstreamBody).toBe(`${orderBody}\n${rpcBody}`);
+    expect(res.headers['x-monerium-data-hash']).toBe(sha256(res.upstreamBody ?? ''));
+  });
+});
+
+describe('a 404 is never signed (enclave review 2026-10-09, E-5; red: Monerium\'s own 404 was signed as not_found)', () => {
+  // Whose view of Monerium answered is not signed: another valid token gets Monerium's "no such order" for an order it
+  // cannot see, byte for byte the answer for an order that does not exist. So a 404 proves nothing and is passed on
+  // as Monerium sent it, without a signature or a body beside it; a found order is bound by its id (asked, answered).
+  it.each([
+    ['Monerium\'s own error body with code 404', () => json(404, NOT_FOUND), NOT_FOUND],
+    ['a JSON 404 that is not Monerium\'s error body', () => json(404, JSON.stringify({ message: 'Not Found' })), JSON.stringify({ message: 'Not Found' })],
+    ['a 404 page that is not JSON (a proxy\'s)', () => httpReply(404, '<html><body>Not Found</body></html>', { 'Content-Type': 'text/html' }), '<html><body>Not Found</body></html>'],
+  ])('%s: passed on as sent, unsigned, and no balance asked', async (_label, reply, body) => {
+    fakeIo.reply(MONERIUM_PORT, reply());
+    const res = await ask();
+    expect(res).toMatchObject({ success: true, status: 404, rawBody: body });
+    expect(res.attestation).toBeUndefined();
+    expect(res.upstreamBody).toBeUndefined();
+    expect(fakeIo.nsmAsks).toHaveLength(0);
     expect(fakeIo.requests(RPC_PORT)).toEqual([]);
-  });
-
-  it('a JSON 404 that is not Monerium\'s error body is an error, never signed (red)', async () => {
-    fakeIo.reply(MONERIUM_PORT, json(404, JSON.stringify({ message: 'Not Found' })));
-    await expectError(ask(), /Monerium answered 404 without its error body \(code 404\)/);
-  });
-
-  it('a 404 page that is not JSON (a proxy\'s) is an error (lock)', async () => {
-    fakeIo.reply(MONERIUM_PORT, httpReply(404, '<html><body>Not Found</body></html>', { 'Content-Type': 'text/html' }));
-    await expectError(ask());
   });
 });
 
@@ -262,5 +276,39 @@ describe('manifest (lock)', () => {
   it('declares the MONERIUM_PAYMENT_SCHEMA fields in order, and their size', () => {
     expect(HANDLER_MANIFEST.schema.fields.map((f) => [f.name, f.encoding])).toEqual(MONERIUM_PAYMENT_SCHEMA.map((f) => [f.name, f.encoding]));
     expect(HANDLER_MANIFEST.schema.outputBytes).toBe(MONERIUM_PAYMENT_SCHEMA.length * 32);
+  });
+});
+
+// Enclave review 2026-10-09, E2a F-17: the manifest said only 400, 401, 403, 429, 500, 502, 503 (and, since part 5,
+// 404) pass unsigned; the handler passes every error Monerium answers: 402, 409, 504 too.
+describe('the manifest says what the handler does (red before part 9)', () => {
+  const STATUSES = [201, 301, 400, 401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504];
+
+  // Each status, answered by Monerium with a body that is no answer: the handler passes it on unsigned exactly when a
+  // status_skip policy of the manifest names it, and signs it exactly when a status_attest policy does.
+  it.each(STATUSES)('Monerium answering %i', async (status) => {
+    const body = JSON.stringify({ code: status, status: 'Error', message: 'no answer' });
+    fakeIo.reply(MONERIUM_PORT, json(status, body));
+    const res = await ask();
+    const passedOn = res.success && res.status === status && res.attestation === undefined && res.rawBody === body;
+    expect(passedOn).toBe(shouldSkipAttestation(HANDLER_MANIFEST.policies, status));
+    expect(res.success && res.attestation !== undefined).toBe(getAttestOverrides(HANDLER_MANIFEST.policies, status) !== null);
+    expect(fakeIo.requests(RPC_PORT)).toEqual([]);
+  });
+
+  /**
+   * The manifests the enclave releases shipped, with their versions: a version names one manifest, so a changed manifest
+   * moves its version. The first entry is the 2026-10-09 release's (718b999), the second the R4 release's. The next
+   * release appends its own.
+   */
+  const SHIPPED: ReadonlyArray<readonly [version: string, hash: string]> = [
+    ['1.1.0', '1e437540b0f6e11bf59f5997d527490c4b2f8f28772f4171b9076f35f92be4ab'],
+    ['1.2.0', 'bd42a6850c11b4deeeadae4a29a3f1b3b33383c026218fa2e7b2a261caaecc50'],
+  ];
+
+  it('a version names one manifest: a changed manifest moves its version', () => {
+    for (const [version, hash] of SHIPPED) {
+      expect(HANDLER_MANIFEST.version === version, `shipped ${version}`).toBe(MANIFEST_HASH === hash);
+    }
   });
 });

@@ -13,6 +13,7 @@ import path from 'node:path';
 import type { ServiceName } from './types.js';
 import { validateCommitHash, validateRepoUrl } from './validation.js';
 import { BUILD_RECIPE, BUILDER_NAME, assertCommitRecipe, configDigestOf } from './buildRecipe.js';
+import { assertCommitHelper } from './nitroCli.js';
 import * as report from './report.js';
 
 /**
@@ -130,8 +131,10 @@ export function reproduceBuild(
     );
   }
 
-  // Only the recipe this CLI holds: a commit built another way is refused before anything is built.
+  // Only the recipe and the nitro-cli helper this CLI holds: a commit built or measured another way is refused before
+  // anything is built.
   assertCommitRecipe(repoDir, safeCommit);
+  assertCommitHelper(repoDir, safeCommit);
   ensureBuilder();
 
   const imageTag = `verify-${service}:${safeCommit.slice(0, 7)}`;

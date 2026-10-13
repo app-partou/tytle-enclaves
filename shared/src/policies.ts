@@ -6,12 +6,11 @@
  * policies for domain-specific validation.
  *
  * Usage:
- *   import { SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER } from '@tytle-enclaves/shared';
+ *   import { SKIP_TRANSIENT_ERRORS, STRIP_AUTH, REDACT_BEARER } from '@tytle-enclaves/shared';
  *
  *   const manifest = {
  *     policies: [
  *       SKIP_TRANSIENT_ERRORS,
- *       ATTEST_NOT_FOUND,
  *       STRIP_AUTH,
  *       REDACT_BEARER,
  *       // ...custom service-specific policies
@@ -22,25 +21,16 @@
 import type { PolicyDef } from './manifest.js';
 
 /**
- * Skip attestation for transient HTTP errors.
- * Rate limits, auth failures, and server errors are not definitive answers —
- * they should not be attested because the same query may succeed later.
+ * Pass every upstream error on unsigned, as it was sent: every status of 400 or more but 404. An error is never a
+ * signed answer: a rate limit, an auth failure or a server error says nothing definitive, and the same question may
+ * succeed later. A 404 is each handler's own rule (Stripe signs only its own "no such object"; Monerium passes every
+ * 404 on too). Before, the list named seven codes while the handlers passed on every error, 402, 409 and 504
+ * included (enclave review 2026-10-09, E2a F-17).
  */
 export const SKIP_TRANSIENT_ERRORS: PolicyDef = {
   id: 'skip_transient_errors',
-  check: { type: 'status_skip', codes: [400, 401, 403, 429, 500, 502, 503] },
-  reason: 'Transient HTTP errors are not attested (404 handled by ATTEST_NOT_FOUND)',
-};
-
-/**
- * Attest 404 responses as definitive "not found".
- * A resource that doesn't exist is a valid, attestable answer —
- * proving non-existence is as valuable as proving existence.
- */
-export const ATTEST_NOT_FOUND: PolicyDef = {
-  id: 'attest_not_found',
-  check: { type: 'status_attest', code: 404, overrides: { state: 'not_found' } },
-  reason: 'Non-existence is a definitive, attestable answer',
+  check: { type: 'status_skip', codes: [], atLeast: 400, except: [404] },
+  reason: 'An upstream error (400 or more, but 404) is passed on unsigned, as it was sent: never a signed answer',
 };
 
 /**

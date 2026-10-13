@@ -1,19 +1,20 @@
 /**
  * Monerium Payment Handler Manifest
  *
- * Executable specification of the handler's queries, field provenance,
- * policies, and repeatability guarantees. Baked into the Docker image
- * (contributing to PCR0) and its hash is included in every attestation.
+ * The specification of the handler's queries, field provenance, policies, and repeatability guarantees. Baked into
+ * the Docker image, so PCR0 binds it; its hash goes with every answer as a pointer, unsigned. Its status rules are run
+ * against the handler by the package's tests (moneriumPaymentHandler.factory.test.ts).
  */
 
 import {
   computeManifestHash, validateManifest, MONERIUM_PAYMENT_SCHEMA,
-  SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER,
+  SKIP_TRANSIENT_ERRORS, STRIP_AUTH, REDACT_BEARER,
 } from '@tytle-enclaves/shared';
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.1.0',
+  // 1.1.0 = the 2026-10-09 release; 1.2.0 = the second enclave release (R4)
+  version: '1.2.0',
 
   queries: [
     {
@@ -61,7 +62,11 @@ export const HANDLER_MANIFEST: HandlerManifest = {
 
   policies: [
     SKIP_TRANSIENT_ERRORS,
-    ATTEST_NOT_FOUND,
+    {
+      id: 'not_found_is_never_signed',
+      check: { type: 'status_skip', codes: [404] },
+      reason: 'Whose view of Monerium answered is not signed: another valid token gets "no such order" for an order it cannot see, so a 404 proves nothing; it is passed on unsigned, like every other error (enclave review 2026-10-09, E-5)',
+    },
     STRIP_AUTH,
     REDACT_BEARER,
     {
@@ -91,8 +96,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'order_id_format',
-      check: { type: 'field_matches', path: 'orderId', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' },
-      reason: 'A Monerium order id is a UUID; any other value is refused before the fetch',
+      check: { type: 'field_matches', path: 'orderId', pattern: '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' },
+      reason: 'A Monerium order id is a UUID in lower case, as Monerium writes it; any other value is refused before the fetch',
     },
     {
       id: 'order_is_the_one_asked',
@@ -100,13 +105,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       reason: 'A signed order is the order the request asked for',
     },
     {
-      id: 'not_found_is_moneriums_own',
-      check: { type: 'behavioral', description: 'A 404 is signed (state not_found) only when its body is Monerium\'s error object with code 404; any other 404 is an error' },
-      reason: 'A proxy\'s page, or a 404 in another shape, is not Monerium saying the order does not exist',
+      id: 'order_status',
+      check: { type: 'behavioral', description: 'fetch_order: a 200 is read as the order; an error (400 or more, a 404 too) is passed on unsigned; any other status throws 502' },
+      reason: 'Only Monerium\'s own order is signed',
     },
     {
       id: 'rpc_answer_is_this_call',
-      check: { type: 'behavioral', description: 'The JSON-RPC answer must carry the id of the balanceOf call (1) and a 0x-hex uint256 result; otherwise the answer is an error' },
+      check: { type: 'behavioral', description: 'fetch_balance: the answer must be a 200 whose JSON-RPC body carries the id of the balanceOf call (1) and a 0x-hex uint256 result; otherwise the answer is an error (502), never passed on' },
       reason: 'The signed balance is the chain\'s answer to this call',
     },
   ],

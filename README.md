@@ -14,7 +14,7 @@ Fargate (data-bridge)
     v
 Parent Server (EC2 host, port 5001)     <- generic router
     |  vsock (CID 16, port 5000)
-    |  + the host role's AWS credentials (IMDSv2), only to an enclave that opens sealed secrets (Stripe)
+    |  + the host role's AWS credentials (IMDSv2), only with a request that sends a sealed key (Stripe's sealedApiKey)
     v
 Nitro Enclave                            <- this repo
     |  1. Validate URL against allowlist
@@ -79,10 +79,11 @@ Each enclave image contains ONLY shared core + its service config. PCR0 proves e
 Every image is built by ONE recipe, `scripts/lib/recipe.sh`, with the values of `scripts/build-recipe.json`: linux/amd64; a fixed `SOURCE_DATE_EPOCH=1767225600` (2026-01-01T00:00:00Z), so an image - and its PCR0 - changes only when what goes into it changes; and BuildKit `moby/buildkit:v0.27.1@sha256:1e110c71d389d6d24f67b9438e2f7b8da749a6ff407b22a1631e025c95599368`, run as its own docker-container builder. The image goes to a docker tarball (`type=docker,dest=...,rewrite-timestamp=true`) and is then loaded into Docker.
 
 ```bash
-cd vies && ./build.sh [tag] [ecr-uri]                    # each service: vies, sicae, stripe-payment, monerium-payment, parent
+cd vies && ./build.sh [tag] [ecr-uri]                    # each service: vies, sicae, stripe-payment, monerium-payment, parent;
+                                                         # an enclave is loaded and pushed only when it is the record
 ./scripts/test-determinism.sh [service]                  # build twice, compare, check scripts/expected-digests.json
 ./scripts/test-determinism.sh --update [service]         # record a meant change, then commit the file
-./scripts/rotate-pcr0.sh <service|all>                   # the PCR0 of a build and the published one
+./scripts/rotate-pcr0.sh <service|all>                   # the PCR0 of a build, the record's verdict and SSM's pin (writes nothing)
 ./scripts/build-eif.sh <enclave> <out-dir>               # its EIF + measurements, written only if it is the record
 EIF_SIGNING_KEY=key.pem EIF_SIGNING_CERT=cert.pem \
   ./scripts/build-eif.sh <enclave> <out-dir>             # the same EIF, signed: it adds PCR8
@@ -98,7 +99,7 @@ See [MANIFESTS.md](MANIFESTS.md) for the manifest framework — canonical query 
 
 ## Verification
 
-See [VERIFICATION.md](VERIFICATION.md) for how to reproduce PCR0 and verify attestations: who gets which attestation document, and which checks each allows. The `verify/` CLI runs every check end to end; it is not on npm yet, so build it from `verify/` (`npm ci && npm run build`, then `node dist/cli.js`).
+See [VERIFICATION.md](VERIFICATION.md) for how to reproduce PCR0 and verify attestations: who gets which attestation document, which checks each allows, and which fields are signed (`attestationId`, `requestHash` and `apiMethod` are not). The `verify/` CLI runs every check end to end and prints the signed values a pass vouches for; it is not on npm yet, so build it from `verify/` (`npm ci && npm run build`, then `node dist/cli.js`).
 
 ## Security
 

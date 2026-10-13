@@ -6,14 +6,20 @@
  * 2. Verify COSE_Sign1 signature + certificate chain at the signed time (establishes trusted PCR0); a debug-mode
  *    enclave (PCR0 all zeroes) fails
  * 3. Verify nonce binding (application nonce == COSE payload nonce; a payload without one fails), the nonce for
- *    the version the document says it signed, and that the document's time agrees with the signed time
+ *    the version the document says it signed, that the document's time agrees with the signed time, and that the
+ *    signed time is at most a year old and at most 5 minutes ahead of this clock (the main repo verifier's bounds)
  * 4. Verify the data binding: COSE user_data == bn254Hash; with --bn254, the vector's hashes
  * 5. Fetch PCR0 + commit from public API (uses trusted PCR0 for history lookup)
  * 6. Compare PCR0 against API
  * 7. The operator binding: with --signing-cert, PCR8 must be that certificate's (the EIF was signed with it); without
  *    it, PCR8 is reported (lib/signing.ts)
- * 8. Reproduce Docker build (unless --skip-build), always from the repository below
+ * 8. Reproduce Docker build, always from the repository below, only for a commit whose build recipe and nitro-cli
+ *    helper are this CLI's; with --skip-build the report marks it SKIP, never PASS
  * 9. Extract PCR0 from reproduced build + compare
+ *
+ * Before the report it prints what a pass vouches for: the values the NSM signs, itself or through the nonce. The
+ * document's attestationId, requestHash and apiMethod are not among them (nothing signs them): they are printed as
+ * not signed, and no check needs them (enclave review 2026-10-09, E2b F-8).
  */
 
 import { readFileSync, existsSync } from 'node:fs';
@@ -33,7 +39,7 @@ import {
 } from '../lib/docker.js';
 import { extractPcr0 } from '../lib/nitroCli.js';
 import * as report from '../lib/report.js';
-import { printReport } from '../lib/report.js';
+import { ageOf, isoTime, printCoverage, printReport, quoted } from '../lib/report.js';
 import { isEmptyPcr, pcr8OfCertificate } from '../lib/signing.js';
 import { validateSigningCertFile } from '../lib/validation.js';
 
@@ -64,8 +70,20 @@ export const REPO_URL = 'https://github.com/app-partou/tytle-enclaves';
  */
 const MAX_TIME_DRIFT_MS = 10 * 60 * 1000;
 
-/** SHA-256 (hex) of a BN254 vector, as the enclave puts it in user_data. */
+/**
+ * Freshness: the main repo's verifier's bounds (packages/attestation-core nsmVerification.ts, MAX_FUTURE_DRIFT_MS and
+ * MAX_AGE_MS). A signed time more than 5 minutes ahead of this computer's clock, or more than a year old, fails. The
+ * chain is judged at the signed time, so without an age bound a key of a since-retired AWS CA, if it ever leaked,
+ * would sign backdated documents this CLI accepted forever (enclave review 2026-10-09, E2b F-9).
+ */
+const MAX_FUTURE_DRIFT_MS = 5 * 60 * 1000;
+const MAX_AGE_MS = 365 * 24 * 60 * 60 * 1000;
+
+/** A SHA-256 in hex: a BN254 vector's, as the enclave puts it in user_data, and the responseHash. */
 const HEX64 = /^[0-9a-f]{64}$/i;
+
+/** The document's fields nothing signs (see AttestationDocument): printed as not signed, never relied on. */
+const UNSIGNED_FIELDS = ['attestationId', 'requestHash', 'apiMethod'] as const;
 
 export async function runVerification(options: VerifyOptions): Promise<boolean> {
   const checks: CheckResult[] = [];
@@ -84,11 +102,7 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
     report.step(1, 'Parsing attestation document');
 
     const attestation = readAttestation(options.attestation);
-    report.info(`Attestation ID: ${attestation.attestationId}`);
-    report.info(`API endpoint: ${attestation.apiEndpoint}`);
-    report.info(
-      `Timestamp: ${new Date(attestation.timestamp * 1000).toISOString()}`,
-    );
+    report.info('Read the attestation. What a pass vouches for, and what it does not, is printed before the report.');
 
     // --- Step 2: Verify COSE_Sign1 signature + certificate chain ---
     // This MUST happen before the API lookup so we have a trusted PCR0.
@@ -156,7 +170,7 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
     // The nonce in the COSE payload (hardware-signed) must match the
     // application-level nonce. This proves the application didn't
     // swap the envelope around a different NSM document.
-    report.step(4, 'Verifying nonce');
+    report.step(4, 'Verifying the nonce and the signed time');
 
     const version = attestation.nonceVersion ?? 1;
     const nonceResult = verifyNonce(attestation);
@@ -206,10 +220,30 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
         ? undefined
         : coseResult.payloadTimestampMs === null
           ? 'The NSM payload carries no valid signed time'
-          : `Attestation: ${new Date(attestation.timestamp * 1000).toISOString()}, signed: ${new Date(coseResult.payloadTimestampMs).toISOString()} (at most ${MAX_TIME_DRIFT_MS / 60_000} minutes apart)`,
+          : `Attestation: ${isoTime(attestation.timestamp * 1000)}, signed: ${isoTime(coseResult.payloadTimestampMs)} (at most ${MAX_TIME_DRIFT_MS / 60_000} minutes apart)`,
     });
     if (timeAgrees) report.pass('Attestation time agrees with the signed NSM time');
     else report.fail('Attestation time does not agree with the signed NSM time');
+
+    // Freshness of the signed time, with the main repo verifier's bounds.
+    const now = Date.now();
+    const signedMs = coseResult.payloadTimestampMs;
+    const ahead = signedMs !== null && signedMs > now + MAX_FUTURE_DRIFT_MS;
+    const tooOld = signedMs !== null && now - signedMs > MAX_AGE_MS;
+    const fresh = signedMs !== null && !ahead && !tooOld;
+    checks.push({
+      name: 'Signed time is under a year old, not in the future',
+      passed: fresh,
+      detail: signedMs === null
+        ? 'The NSM payload carries no valid signed time'
+        : ahead
+          ? `Signed ${isoTime(signedMs)}: more than ${MAX_FUTURE_DRIFT_MS / 60_000} minutes ahead of this computer's clock`
+          : tooOld
+            ? `Signed ${isoTime(signedMs)}: more than a year ago`
+            : undefined,
+    });
+    if (fresh) report.pass(`The signed time is fresh: ${ageOf(signedMs, now)}`);
+    else report.fail('The signed time is not fresh: more than a year old, ahead of this clock, or absent');
 
     // --- Step 5: Verify the data binding ---
     // The enclave puts the SHA-256 of its BN254 vector in user_data: what the data holder received is what was signed.
@@ -436,18 +470,37 @@ export async function runVerification(options: VerifyOptions): Promise<boolean> 
         }
       }
     } else {
+      // Skipped is never a pass: code identity then rests on the published PCR0 alone (E2b F-9).
       checks.push({
         name: 'Reproducible build verification',
-        passed: true,
-        detail: 'Skipped (--skip-build)',
+        passed: false,
+        skipped: 'the build was not reproduced',
+        detail: 'Not run (--skip-build): PCR0 is compared with the published value only',
       });
-      report.info('Skipping Docker build (--skip-build)');
+      report.warn('Skipping Docker build (--skip-build): the build is not reproduced');
     }
 
-    // --- Final Report ---
+    // --- What a pass vouches for, then the final report ---
+    const challenge = attestation.challenge;
+    printCoverage(
+      [
+        ['apiEndpoint', quoted(attestation.apiEndpoint)],
+        ['responseHash', quoted(attestation.responseHash)],
+        ['signed time', signedMs === null ? 'none' : `${isoTime(signedMs)} (${ageOf(signedMs, now)})`],
+        ['challenge', challenge === undefined
+          ? 'none'
+          : `${quoted(challenge)} (only the caller who chose it can tell the document answers its request)`],
+        ['PCR0', trustedPcr0 === '' ? 'none' : trustedPcr0],
+        ['user_data', coseResult.payloadUserData ?? 'none'],
+      ],
+      UNSIGNED_FIELDS.map((field) => {
+        const value = attestation[field];
+        return [field, value === undefined ? 'absent' : quoted(value)] as const;
+      }),
+    );
     printReport(options.service, commit, checks);
 
-    return checks.every((c) => c.passed);
+    return checks.every((c) => c.passed || c.skipped !== undefined);
   } finally {
     process.removeListener('SIGINT', cleanup);
     process.removeListener('SIGTERM', cleanup);
@@ -494,13 +547,11 @@ function readAttestation(filePath: string): AttestationDocument {
 
   const doc = parsed as Record<string, unknown>;
 
-  // Validate required fields with type checks
+  // The fields the checks need: each one is signed itself or bound by the nonce. Nothing signs attestationId,
+  // requestHash or apiMethod, so none is required (E2b F-8).
   const stringFields = [
-    'attestationId',
     'responseHash',
-    'requestHash',
     'apiEndpoint',
-    'apiMethod',
     'nsmDocument',
     'nonce',
   ] as const;
@@ -510,6 +561,17 @@ function readAttestation(filePath: string): AttestationDocument {
       throw new Error(
         `Attestation document missing or invalid field: ${field} (expected non-empty string)`,
       );
+    }
+  }
+
+  // The enclave writes a SHA-256 in hex: anything else is refused, so the report never prints free text as a hash.
+  if (!HEX64.test(doc.responseHash as string)) {
+    throw new Error('Attestation field responseHash must be 64 hex characters');
+  }
+
+  for (const field of UNSIGNED_FIELDS) {
+    if (doc[field] !== undefined && typeof doc[field] !== 'string') {
+      throw new Error(`Attestation field ${field} must be a string when present (it is not signed)`);
     }
   }
 

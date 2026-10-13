@@ -58,6 +58,22 @@ describe('the CI workflow', () => {
       + '  bash "$REPO_DIR/scripts/build-eif.sh" "$ENCLAVE" "$WORK/eif"');
   });
 
+  it('a push to main never cancels the main run before it; a pull request cancels its own older run (red)', () => {
+    // With one group for main and cancel-in-progress on, a second push cancelled the first push's run and nothing ran
+    // it again: a commit could sit on main with no finished gate (enclave review 2026-10-09, E2b F-6).
+    expect(read(WORKFLOW)).toMatch(
+      /^concurrency:\n {2}group: ci-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}\n {2}cancel-in-progress: \$\{\{ github\.event_name == 'pull_request' \}\}\n/m,
+    );
+  });
+
+  it('compiles the verify CLI, as its guide tells a third party to build it (red)', () => {
+    // vitest runs the CLI's sources without its compiler, so a type error in it passed CI and failed only for the
+    // third party who builds it (enclave review 2026-10-09, E2b F-7).
+    const script = read('scripts/ci/test-package.sh');
+    expect(script).toContain('if [ "$PACKAGE" = verify ]; then\n  npm run build\nfi\nnpm test\n');
+    expect(read('VERIFICATION.md')).toContain('npm run build');
+  });
+
   it('builds the parent image as the deploy builds it (red)', () => {
     expect(read(WORKFLOW)).toContain('run: bash scripts/build-service.sh parent ci');
   });

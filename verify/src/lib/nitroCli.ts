@@ -16,7 +16,7 @@
 
 import { execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { BUILD_RECIPE } from './buildRecipe.js';
@@ -24,6 +24,31 @@ import * as report from './report.js';
 
 /** The pinned helper Dockerfile: the package root's Dockerfile.nitro-cli (from src/lib or dist/lib alike). */
 export const NITRO_CLI_DOCKERFILE = readFileSync(new URL('../../Dockerfile.nitro-cli', import.meta.url), 'utf-8');
+
+/** Line endings aside (a checkout on Windows may write CRLF), the helper file as written. */
+const sameHelper = (a: string, b: string): boolean => a.replace(/\r\n/g, '\n') === b.replace(/\r\n/g, '\n');
+
+/**
+ * Throws unless the checked-out commit in repoDir measures with THIS CLI's helper: its verify/Dockerfile.nitro-cli is
+ * NITRO_CLI_DOCKERFILE. nitro-cli's kernel and init blobs are in every PCR0, so a commit pinned to another helper
+ * measures another PCR0 with this one: a false "mismatch". It is refused instead, as for another build recipe
+ * (enclave review 2026-10-09, E2b F-10).
+ */
+export function assertCommitHelper(repoDir: string, commit: string): void {
+  const file = path.join(repoDir, 'verify', 'Dockerfile.nitro-cli');
+  if (!existsSync(file)) {
+    throw new Error(
+      `Commit ${commit} has no verify/Dockerfile.nitro-cli: this CLI cannot tell which nitro-cli measured it. ` +
+      'Use --skip-build for the other checks.',
+    );
+  }
+  if (!sameHelper(readFileSync(file, 'utf-8'), NITRO_CLI_DOCKERFILE)) {
+    throw new Error(
+      `Commit ${commit} measures with another nitro-cli helper than this CLI (its verify/Dockerfile.nitro-cli differs): ` +
+      'rebuild it with the CLI of that commit.',
+    );
+  }
+}
 
 /** The helper image's tag: the first 16 hex of the SHA-256 of `<platform>\n<the pinned Dockerfile>`. */
 export const HELPER_IMAGE = `tytle-verify-nitro-cli:${crypto.createHash('sha256')

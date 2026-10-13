@@ -27,7 +27,10 @@
  *   [160..191] dataHash     sha256      (combined order + RPC response)
  *
  * Only Monerium's and the chain's own answers are signed (enclave audit 2026-10, P1.4): the order asked (its id is
- * the orderId), a 404 only as Monerium's error body, a balance only from the JSON-RPC answer to this call.
+ * the orderId) and a balance only from the JSON-RPC answer to this call. A 404 is never signed (enclave review
+ * 2026-10-09, E-5): whose view of Monerium answered is not signed, and another valid token gets Monerium's "no such
+ * order" for an order it cannot see, byte for byte the answer for an order that does not exist. It is passed on as
+ * Monerium sent it, like every other error.
  */
 
 import crypto from 'node:crypto';
@@ -58,9 +61,11 @@ const VALID_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 /**
  * A Monerium order id is a UUID (docs.monerium.com/api, read 2026-10-07: the Order object's id is "string, UUID", and
  * the order's payments call answers 400 "the order ID is not a valid UUID"). Any version: the docs' own examples are
- * version-1 UUIDs.
+ * version-1 UUIDs. In lower case only (enclave review 2026-10-09, E2a F-15): a UUID is written in lower case (RFC 9562
+ * section 4), so are Monerium's ids, and the answered id must be the one asked, letter for letter. The same id in upper
+ * case was asked as given: an answer for it was an error, or a "no such order" for an order that exists.
  */
-const ORDER_ID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const ORDER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** The JSON-RPC id of the one call this handler makes (a JSON-RPC answer carries the id of the call it answers). */
 const RPC_CALL_ID = 1;
@@ -105,16 +110,6 @@ function jsonObjectOf(body: string, service: string): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
-/** The `code` of Monerium's error body ({code, status, message, errors}), or undefined when the body is not one. */
-function moneriumErrorCodeOf(body: string): unknown {
-  try {
-    const parsed: unknown = JSON.parse(body);
-    return typeof parsed === 'object' && parsed !== null ? (parsed as { code?: unknown }).code : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 /** A field that must be non-empty text, else the answer is no answer. */
 function requiredText(data: Record<string, unknown>, field: string): string {
   const value = data[field];
@@ -156,7 +151,7 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
     }
     // Checked before the fetch: a value that is not an order id is never asked (audit 2026-10, caller inputs).
     if (typeof orderId !== 'string' || !ORDER_ID_RE.test(orderId)) {
-      throw new Error('Invalid orderId: a Monerium order id is a UUID');
+      throw new Error('Invalid orderId: a Monerium order id is a UUID in lower case');
     }
 
     return { operation, accessToken, orderId };
@@ -180,10 +175,11 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
       },
     );
 
-    // Skip attestation for transient errors (rate limits, auth errors, server errors).
-    // BUT attest definitive responses like 404 (order not found is a valid answer).
-    if (orderResponse.status >= 400 && orderResponse.status !== 404) {
-      ctx.log.warn('Monerium transient error, skipping attestation', { status: orderResponse.status, orderId });
+    // Every error is passed on unsigned, as it was sent: a rate limit, an auth error, a server error, and a 404 (enclave
+    // review 2026-10-09, E-5). A 404 is never signed: another valid token gets Monerium's "no such order" for an order
+    // it cannot see, and nothing signed names whose view answered. A found order is bound by its id (asked, answered).
+    if (orderResponse.status >= 400) {
+      ctx.log.warn('Monerium answered an error, passed on unsigned', { status: orderResponse.status, orderId });
       return {
         values: {},
         apiEndpoint,
@@ -199,45 +195,8 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
       };
     }
 
-    if (orderResponse.status !== 200 && orderResponse.status !== 404) {
+    if (orderResponse.status !== 200) {
       throw new Error(`Monerium API returned unexpected status ${orderResponse.status}`);
-    }
-
-    // 404 = order not found - a valid, definitive answer, signed. Monerium documents no 404 for this call; its error
-    // body is {code, status, message, errors} (docs.monerium.com/api). Only that body with code 404 is Monerium's own
-    // answer; any other 404 (a proxy's page, another shape) is an error, never signed.
-    if (orderResponse.status === 404) {
-      if (moneriumErrorCodeOf(orderResponse.body) !== 404) {
-        throw new Error('Monerium answered 404 without its error body (code 404)');
-      }
-      const dataHash = crypto.createHash('sha256').update(orderResponse.body, 'utf8').digest('hex');
-
-      return {
-        values: {
-          orderId,
-          state: 'not_found',
-          orderAmount: null,
-          currency: null,
-          balance: 0,
-          dataHash,
-        },
-        apiEndpoint,
-        method: 'GET',
-        url: `https://${moneriumHost.hostname}${orderPath}`,
-        requestHeaders: {
-          'Accept': 'application/vnd.monerium.api-v2+json',
-        },
-        responseHeaders: {
-          'x-monerium-order-id': orderId,
-          'x-monerium-state': 'not_found',
-          'x-monerium-order-amount': '',
-          'x-monerium-currency': '',
-          'x-monerium-balance': '0',
-          'x-monerium-data-hash': dataHash,
-        },
-        status: 404,
-        bn254Headers: {},
-      };
     }
 
     // Parse order response
@@ -321,6 +280,9 @@ export const moneriumPaymentHandlerDef: HandlerDef<MoneriumPaymentParams> = {
       bn254Headers: {
         'x-monerium-data-hash': dataHash,
       },
+      // The text dataHash commits to (the order body, a line break, the balance answer), beside the answer and never
+      // signed: a reader uses it only when its SHA-256 is the signed dataHash (enclave review 2026-10-09, E-4).
+      upstreamBody: combinedBody,
     };
   },
 };

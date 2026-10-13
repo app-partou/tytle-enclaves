@@ -1,5 +1,7 @@
 /**
  * SICAE Portuguese CAE Code Handler Manifest
+ *
+ * Its status rules are run against the handler by the package's tests (sicaeHandler.factory.test.ts).
  */
 
 import {
@@ -10,7 +12,8 @@ import type { HandlerManifest } from '@tytle-enclaves/shared';
 const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.0.0',
+  // 1.0.0 was kept across vector version 2 (the 2026-10-09 release); 1.1.0 is the second enclave release (R4)
+  version: '1.1.0',
 
   queries: [
     {
@@ -60,7 +63,12 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     {
       id: 'nif_format',
       check: { type: 'field_matches', path: 'nif', pattern: '^\\d{9}$' },
-      reason: 'NIF must be exactly 9 digits',
+      reason: 'NIF must be text of exactly 9 digits (a number or an array is a 400)',
+    },
+    {
+      id: 'nif_check_digit',
+      check: { type: 'behavioral', description: 'The NIF\'s mod-11 check digit (weights 9 to 2 over the first eight digits; a remainder of 0 or 1 gives 0) is checked before any fetch: a wrong one is a 400' },
+      reason: 'SICAE refuses such a number, and that refusal read as "not found", the same signed answer as "SICAE holds nothing for this number" (enclave review 2026-10-09, E2a F-7)',
     },
     {
       id: 'asp_tokens_required',
@@ -69,8 +77,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'session_cookie_forwarding',
-      check: { type: 'behavioral', description: 'ASP.NET_SessionId cookie from GET is forwarded to POST if present' },
-      reason: 'SICAE requires session continuity between GET and POST',
+      check: { type: 'behavioral', description: 'The ASP.NET_SessionId cookie, among every Set-Cookie the GET answered, is forwarded to the POST if present' },
+      reason: 'SICAE requires session continuity between GET and POST; a cookie after the session one used to drop it (enclave review 2026-10-09, E1 F-1)',
     },
     {
       id: 'form_variant_fallback',
@@ -78,24 +86,34 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       reason: 'SICAE has changed form field names over time; handler supports both variants',
     },
     {
+      id: 'status',
+      check: { type: 'behavioral', description: 'A search page (GET) other than 200 throws 502; a form post other than 200 tries the next form variant, and when SICAE refused every one the answer is a 502. Nothing is passed on unsigned' },
+      reason: 'Only SICAE\'s own page is read',
+    },
+    {
       id: 'not_found',
-      check: { type: 'status_attest', code: 404, overrides: {} },
-      reason: 'SICAE\'s own "no data" row or its "NIPC not valid" refusal is a definitive answer, attested (success: true, status: 404; nif set, every other field null)',
+      check: { type: 'behavioral', description: 'SICAE\'s own "no data" row, or its "NIPC not valid" refusal of a number whose check digit is right, is signed as not found: the enclave answers status 404 (success: true), nif set, every other field null. SICAE itself answers these with a 200 page' },
+      reason: 'A definitive answer is signed like any other; SICAE never answers a 404, so this is no rule on an upstream status (enclave review 2026-10-09, E2a F-17)',
     },
     {
       id: 'no_data_row',
-      check: { type: 'field_matches', path: 'responseBody', pattern: 'Não existem dados para o critério de pesquisa indicado\\.' },
-      reason: 'The results grid\'s only row, with this exact text as its only text, is SICAE saying it holds nothing for the number (not_found)',
+      check: { type: 'behavioral', description: 'The results grid\'s only row, with "Não existem dados para o critério de pesquisa indicado." as its only text, is not_found; the same text anywhere else on the page is not' },
+      reason: 'SICAE saying it holds nothing for the number; a substring of the whole page would accept pages the enclave refuses',
     },
     {
       id: 'html_error_detection',
-      check: { type: 'field_matches', path: 'responseBody', pattern: "O campo 'NIPC' não é válido" },
-      reason: 'Only this exact text in SICAE\'s error label (class ClassErro), with no results grid, is not_found; any other error text throws 502',
+      check: { type: 'behavioral', description: 'SICAE\'s error label (class ClassErro), with "O campo \'NIPC\' não é válido" as its only text and no results grid, is not_found; any other error text throws 502' },
+      reason: 'SICAE refusing a number whose check digit is right; a substring of the whole page would accept pages the enclave refuses',
     },
     {
       id: 'parse_miss_is_error',
-      check: { type: 'behavioral', description: 'A results grid or error label the handler cannot read, a results row for another NIPC, or no form variant processed throws 502 - never not_found' },
+      check: { type: 'behavioral', description: 'A results grid or error label the handler cannot read, a results row for another NIPC or without its NIPC, or no form variant processed throws 502 - never not_found' },
       reason: 'A page that is not one of SICAE\'s known answers is no answer (audit 2026-10 P1.4)',
+    },
+    {
+      id: 'one_strict_row_reader',
+      check: { type: 'behavioral', description: 'One reader for the results row: SICAE\'s five column names in order; a code is the text its cell shows (a primary CAE, then secondary ones each with a description); the name\'s shown text is its title; character references decoded, an unknown one unreadable; a double quote that cuts a title unreadable. No looser reader answers when this one does not' },
+      reason: 'The looser reader signed the first five-digit number of the row as the primary CAE and every secondary CAE without its description (enclave review 2026-10-09, E-2, E2a F-6)',
     },
     {
       id: 'http_transport',

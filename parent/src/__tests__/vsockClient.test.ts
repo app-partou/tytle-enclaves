@@ -9,14 +9,14 @@ function enclaveAnswering(bytes: Buffer, perRead: number, onRead: () => void = (
   return {
     written: [] as Buffer[],
     closed: false,
-    read(size: number): Buffer {
+    readWithin(size: number, _timeoutMs: number): Buffer | null {
       onRead();
       const n = Math.min(size, perRead, bytes.length - offset);
       const out = bytes.subarray(offset, offset + n);
       offset += n;
       return out;
     },
-    write(data: Buffer): number {
+    writeWithin(data: Buffer, _timeoutMs: number): number {
       this.written.push(Buffer.from(data));
       return data.length;
     },

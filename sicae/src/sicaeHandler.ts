@@ -104,10 +104,10 @@ function readSicaePage(html: string, nif: string): PageOutcome {
     return { kind: 'unreadable', detail: table ? `an error label beside a results grid: ${said}` : `an error label this handler does not know: ${said}` };
   }
   if (!table) return { kind: 'not_processed' };
-  const parsed = parseSicaeResults(html);
+  const parsed = parseResultsRow(html);
   if (parsed) {
     // The row names the number it answers for: another number's row is never signed under this one.
-    if (parsed.rowNipc !== null && parsed.rowNipc !== nif) {
+    if (parsed.rowNipc !== nif) {
       return { kind: 'unreadable', detail: `the results row is for another NIPC (${parsed.rowNipc})` };
     }
     return { kind: 'found', result: parsed.result };
@@ -117,115 +117,134 @@ function readSicaePage(html: string, nif: string): PageOutcome {
 }
 
 // =============================================================================
-// HTML Parsing (ported from ai-agent-server/src/invoicing/services/sicaeLookup.ts)
+// The results row (enclave review 2026-10-09, E-2 and E2a F-6, F-8)
 // =============================================================================
 
-function detectNameColumnOffset(cells: string[]): number {
-  const firstCellText = cells[0].replace(/<[^>]*>/g, '').trim();
-  return /^\d{9}$/.test(firstCellText) ? 1 : 0;
+/** SICAE's own words in the results grid's header row, in order (www.sicae.pt/Consulta.aspx, read live 2026-10-07). */
+export const SICAE_GRID_HEADER = ['NIPC', 'Denominação Social/Firma', 'CAE Principal', 'CAEs Secundários', 'Mais CAE'];
+
+/** The named character references SICAE's markup can hold; any other is not guessed. */
+const NAMED_REFERENCES: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+
+/** A text's character references decoded (named and numeric), or null when one is not a reference this reader knows. */
+function decodeHtml(text: string): string | null {
+  let unknown = false;
+  const decoded = text.replace(/&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[A-Za-z][A-Za-z0-9]*);/g, (whole, ref: string) => {
+    const point = ref.startsWith('#x') || ref.startsWith('#X') ? parseInt(ref.slice(2), 16)
+      : ref.startsWith('#') ? parseInt(ref.slice(1), 10) : null;
+    if (point === null) {
+      const named = NAMED_REFERENCES[ref];
+      if (named === undefined) unknown = true;
+      return named ?? whole;
+    }
+    if (point < 1 || point > 0x10ffff || (point >= 0xd800 && point <= 0xdfff)) {
+      unknown = true;
+      return whole;
+    }
+    return String.fromCodePoint(point);
+  });
+  return unknown ? null : decoded;
 }
 
-/** The row's NIPC (its first cell, when the grid has the NIPC column), or null. */
-function rowNipcOf(cells: string[], off: number): string | null {
-  return off === 1 ? cells[0].replace(/<[^>]*>/g, '').trim() : null;
+/** One `<div ... title="...">...</div>` of a grid cell: its title and the text it shows, both decoded and trimmed. */
+interface GridDiv {
+  title: string;
+  text: string;
+}
+
+/**
+ * Every div of a grid cell, or null when one cannot be read. A double quote inside a title (SICAE's template does not
+ * encode one) ends the attribute early, so its tag no longer matches and the cell is unreadable: the name was signed
+ * cut short at the quote (F-6). A nested div, or a reference this reader does not know, is unreadable too.
+ */
+function divsOf(cell: string): GridDiv[] | null {
+  const opened = cell.match(/<div\b/g)?.length ?? 0;
+  const divs: GridDiv[] = [];
+  for (const m of cell.matchAll(/<div\b[^>]*?\btitle="([^"]*)"\s*>([\s\S]*?)<\/div>/g)) {
+    const title = decodeHtml(m[1]);
+    const text = decodeHtml(textOf(m[2]));
+    if (title === null || text === null) return null;
+    divs.push({ title: title.trim(), text: text.trim() });
+  }
+  return divs.length === opened ? divs : null;
 }
 
 interface ParsedRow {
   result: SicaeResult;
-  rowNipc: string | null;
+  /** The NIPC the row names (its first cell). */
+  rowNipc: string;
 }
 
-function parsePrimaryStrategy(html: string): ParsedRow | null {
-  // The header row, then the first data row's cells. The data row's own <tr> stays out of the capture: left in,
-  // it became cells[0], the NIPC column was never seen, and this strategy failed on every real page (the
-  // fallback answered, without the secondary CAE's description).
-  const gridMatch = html.match(/class="gridHeader"[\s\S]*?<\/tr>\s*<tr[^>]*>([\s\S]*?)<\/tr>/);
-  if (!gridMatch) return null;
+/**
+ * The results row, read by ONE rule: the header row (class gridHeader) with SICAE's five column names, then the
+ * first data row's five cells - NIPC, name, primary CAE, secondary CAEs, "Mais CAE". A code is the text a cell SHOWS,
+ * never a number in a title or in another cell; the name's shown text must be its title; every div of the CAE cells
+ * is read, or none. Any other shape is null, and the page is unreadable (502).
+ *
+ * The looser rule that answered when this one did not is gone (E-2). It took the FIRST five-digit number anywhere in
+ * the row as the primary CAE - a company named "CLINICA 24500 SAUDE" was signed with CAE 24500 - and signed every
+ * secondary CAE without its description; nothing said it had answered, and it read SICAE's real pages for months
+ * while this rule failed on all of them.
+ */
+function parseResultsRow(html: string): ParsedRow | null {
+  const grid = html.match(/<tr[^>]*class="gridHeader"[^>]*>([\s\S]*?)<\/tr>\s*<tr[^>]*>([\s\S]*?)<\/tr>/);
+  if (!grid) return null;
+  const cellsOf = (row: string) => [...row.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map((m) => m[1]);
+  const header = cellsOf(grid[1]).map(textOf);
+  if (header.length !== SICAE_GRID_HEADER.length || header.some((text, i) => text !== SICAE_GRID_HEADER[i])) return null;
+  const cells = cellsOf(grid[2]);
+  if (cells.length !== SICAE_GRID_HEADER.length) return null;
 
-  const dataRow = gridMatch[1];
-  const cells = dataRow.split(/<td[^>]*>/).filter(c => c.trim());
-  if (cells.length < 3) return null;
+  // The row names its number (F-8: a grid without the NIPC column was signed under the number asked).
+  const rowNipc = textOf(cells[0]);
+  if (!/^\d{9}$/.test(rowNipc)) return null;
 
-  const off = detectNameColumnOffset(cells);
+  const name = divsOf(cells[1]);
+  if (!name || name.length !== 1 || name[0].title === '' || name[0].title !== name[0].text) return null;
 
-  const nameMatch = cells[off]?.match(/title="([^"]+)"/);
-  const officialName = nameMatch ? nameMatch[1].trim() : '';
-  if (!officialName) return null;
+  const primary = divsOf(cells[2]);
+  if (!primary || primary.length !== 1 || !/^\d{5}$/.test(primary[0].text) || primary[0].title === '') return null;
 
-  const caeCell = cells[off + 1];
-  if (!caeCell) return null;
-  const primaryCodeMatch = caeCell.match(/\b(\d{5})\b/);
-  const primaryDescMatch = caeCell.match(/title="([^"]+)"/);
-  const caePrimary = primaryCodeMatch ? primaryCodeMatch[1] : '';
-  const caePrimaryDescription = primaryDescMatch ? primaryDescMatch[1].trim() : '';
-
-  if (!/^\d{5}$/.test(caePrimary)) return null;
-
-  const secondaryCell = cells[off + 2];
+  const secondaryDivs = divsOf(cells[3]);
+  if (!secondaryDivs) return null;
   const caeSecondary: Array<{ code: string; description: string }> = [];
-  const secondaryDivs = secondaryCell?.match(/<div[^>]*title="([^"]*)"[^>]*>([\s\S]*?)<\/div>/g) || [];
-  const seenCodes = new Set<string>();
-
   for (const div of secondaryDivs) {
-    const descMatch = div.match(/title="([^"]+)"/);
-    const codeMatch = div.match(/\b(\d{5})\b/);
-    if (descMatch && codeMatch) {
-      const code = codeMatch[1].replace(/,$/, '');
-      const description = descMatch[1].trim();
-      if (/^\d{5}$/.test(code) && description && !seenCodes.has(code)) {
-        seenCodes.add(code);
-        caeSecondary.push({ code, description });
-      }
-    }
+    if (div.title === '' && div.text === '') continue; // SICAE's empty last div
+    const code = /^(\d{5}),?$/.exec(div.text)?.[1];
+    if (code === undefined || div.title === '') return null;
+    if (!caeSecondary.some((cae) => cae.code === code)) caeSecondary.push({ code, description: div.title });
   }
 
-  return { result: { officialName, caePrimary, caePrimaryDescription, caeSecondary }, rowNipc: rowNipcOf(cells, off) };
+  return {
+    result: { officialName: name[0].title, caePrimary: primary[0].text, caePrimaryDescription: primary[0].title, caeSecondary },
+    rowNipc,
+  };
 }
 
-function parseFallbackStrategy(html: string): ParsedRow | null {
-  const tableMatch = html.match(/class="gridMain"[\s\S]*?<\/table>/) || html.match(/id="[^"]*ConsultaDataGrid"[\s\S]*?<\/table>/);
-  if (!tableMatch) return null;
-
-  const table = tableMatch[0];
-  const rows = table.split(/<tr[^>]*>/).slice(2);
-  if (rows.length === 0) return null;
-
-  const dataRow = rows[0];
-  const cells = dataRow.split(/<td[^>]*>/).filter(c => c.trim());
-  if (cells.length < 3) return null;
-
-  const off = detectNameColumnOffset(cells);
-
-  const nameMatch = cells[off]?.match(/title="([^"]+)"/) || cells[off]?.match(/>([^<]+)</);
-  const officialName = nameMatch ? nameMatch[1].trim() : '';
-  if (!officialName) return null;
-
-  const allCodes = dataRow.match(/\b\d{5}\b/g) || [];
-  const validCodes = [...new Set(allCodes)].filter(c => /^\d{5}$/.test(c));
-  if (validCodes.length === 0) return null;
-
-  const caePrimary = validCodes[0];
-  const caeSecondary = validCodes.slice(1).map(code => ({ code, description: '' }));
-
-  const primaryDescMatch = cells[off + 1]?.match(/title="([^"]+)"/);
-  const caePrimaryDescription = primaryDescMatch ? primaryDescMatch[1].trim() : '';
-
-  return { result: { officialName, caePrimary, caePrimaryDescription, caeSecondary }, rowNipc: rowNipcOf(cells, off) };
+/**
+ * The check digit of a Portuguese NIF or NIPC: mod 11, weights 9 to 2 over the first eight digits, a remainder of 0
+ * or 1 giving 0. SICAE refuses a number that fails it ("O campo 'NIPC' não é válido"), and that refusal was fetched
+ * and signed as "not found" - the same signed answer as "SICAE holds nothing for this number", so a typo read as a
+ * fact (E2a F-7). It is now a 400, before any fetch.
+ */
+export function hasValidNifCheckDigit(nif: string): boolean {
+  const digits = [...nif].map(Number);
+  const remainder = digits.slice(0, 8).reduce((sum, digit, i) => sum + digit * (9 - i), 0) % 11;
+  return digits[8] === (remainder < 2 ? 0 : 11 - remainder);
 }
 
-/** A results row read by the primary strategy, else the fallback one; null when neither reads it. */
-function parseSicaeResults(html: string): ParsedRow | null {
-  try {
-    const result = parsePrimaryStrategy(html);
-    if (result) return result;
-  } catch { /* fall through */ }
-
-  try {
-    const result = parseFallbackStrategy(html);
-    if (result) return result;
-  } catch { /* fall through */ }
-
-  return null;
+/**
+ * `ASP.NET_SessionId=<value>` from a reply's Set-Cookie values (one per line: shared/src/httpParse.ts), or '' when none
+ * names it. Each value is read by its name, before its first ';' - wherever it comes among the others (E1 F-1: the
+ * last Set-Cookie was the only one kept, so a balancer cookie after the session one dropped it).
+ */
+function sessionCookieOf(setCookie: string): string {
+  for (const line of setCookie.split('\n')) {
+    const pair = line.split(';', 1)[0];
+    const eq = pair.indexOf('=');
+    if (eq > 0 && pair.slice(0, eq).trim() === 'ASP.NET_SessionId') return `ASP.NET_SessionId=${pair.slice(eq + 1).trim()}`;
+  }
+  return '';
 }
 
 // =============================================================================
@@ -267,10 +286,18 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
 
   parseParams(body: unknown): SicaeParams {
     const b = body as Record<string, unknown>;
-    const nif = b.nif as string | undefined;
+    const nif: unknown = b.nif;
 
+    // A number or an array passed the 9-digit rule (RegExp.test stringifies it), and then a found page failed the
+    // row's NIPC check while a no-data page was signed (E2a F-8).
+    if (nif !== undefined && typeof nif !== 'string') {
+      throw new Error(`Invalid NIF: must be text, not ${Array.isArray(nif) ? 'an array' : typeof nif}`);
+    }
     if (!nif || !/^\d{9}$/.test(nif)) {
       throw new Error(`Invalid NIF: "${nif ?? ''}" - must be exactly 9 digits`);
+    }
+    if (!hasValidNifCheckDigit(nif)) {
+      throw new Error(`Invalid NIF: "${nif}" fails its check digit`);
     }
 
     return { nif };
@@ -310,10 +337,8 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
       throw new Error('Could not extract __EVENTVALIDATION');
     }
 
-    // Extract session cookie
-    const cookieHeader = getResponse.headers['set-cookie'] || '';
-    const cookieMatch = cookieHeader.match(/ASP\.NET_SessionId=([^;]+)/);
-    const sessionCookie = cookieMatch ? `ASP.NET_SessionId=${cookieMatch[1]}` : '';
+    // The session cookie, among every Set-Cookie the GET answered
+    const sessionCookie = sessionCookieOf(getResponse.headers['set-cookie'] ?? '');
 
     const viewState = vsMatch[1];
     const eventValidation = evMatch[1];
@@ -381,6 +406,7 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
         requestHeaders: { nif },
         responseHeaders: { 'x-sicae-nif': nif, 'x-sicae-not-found': outcome.why, 'x-sicae-data-hash': dataHash, 'x-sicae-transport': transport },
         bn254Headers: { 'x-sicae-data-hash': dataHash },
+        upstreamBody: answeredPage,
         status: 404,
       };
     }
@@ -421,6 +447,9 @@ export const sicaeHandlerDef: HandlerDef<SicaeParams> = {
         'x-sicae-cae2-desc': cae2Desc || '',
         'x-sicae-data-hash': dataHash,
       },
+      // The page dataHash commits to, beside the answer and never signed: a reader uses it only when its SHA-256 is the
+      // signed dataHash, so the commitment can be opened (enclave review 2026-10-09, E-4).
+      upstreamBody: answeredPage,
     };
   },
 };

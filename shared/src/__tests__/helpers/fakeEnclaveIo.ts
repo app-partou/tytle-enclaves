@@ -17,6 +17,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { createFakeNsm } from './fakeNsm.js';
+import { blockFor } from './blockingVsock.js';
 
 interface Exchange {
   port: number;
@@ -33,6 +34,8 @@ const exchanges: Exchange[] = [];
 let nsm = createFakeNsm();
 /** Raw CBOR the NSM answers with ONCE instead of a document (an NSM error, say). */
 let nsmNext: Buffer | null = null;
+/** How long each NSM answer takes, the thread blocked meanwhile as the ioctl blocks it: 0 = at once. */
+let nsmTakesMs = 0;
 
 function nextReply(port: number): ScriptedReply {
   const queue = queues.get(port);
@@ -51,7 +54,7 @@ class FakeVsock {
   private reply: Buffer | null = null;
   private offset = 0;
   constructor(private readonly exchange: Exchange, private readonly scripted: ScriptedReply, private readonly plain: boolean) {}
-  read(size: number): Buffer {
+  readWithin(size: number, _timeoutMs: number): Buffer | null {
     // Under TLS the vsock leg carries only TLS records: the reply arrives through the fake TLS socket instead.
     // Plain HTTP: the request is written before the first read, so a function reply sees all of it.
     this.reply ??= this.plain ? Buffer.from(replyText(this.scripted, this.exchange), 'utf-8') : Buffer.alloc(0);
@@ -59,7 +62,7 @@ class FakeVsock {
     this.offset += out.length;
     return out;
   }
-  write(data: Buffer): number {
+  writeWithin(data: Buffer, _timeoutMs: number): number {
     if (this.plain) this.exchange.written.push(Buffer.from(data));
     return data.length;
   }
@@ -73,6 +76,7 @@ const pendingTlsReply = new WeakMap<object, { exchange: Exchange; raw: ScriptedR
 
 export const nativeModule = {
   nsmRequest: (request: Buffer): Buffer => {
+    blockFor(nsmTakesMs);
     if (nsmNext === null) return nsm.nsmRequest(request);
     const raw = nsmNext;
     nsmNext = null;
@@ -152,6 +156,10 @@ export const fakeIo = {
   nsmAnswersNext(raw: Buffer): void {
     nsmNext = raw;
   },
+  /** Each NSM answer from now on takes `ms`, the thread blocked meanwhile (the ioctl is synchronous). */
+  nsmTakes(ms: number): void {
+    nsmTakesMs = ms;
+  },
   /** Ports still holding scripted replies nobody fetched. */
   unusedReplies(): number[] {
     return [...queues.entries()].filter(([, q]) => q.length > 0).map(([p]) => p);
@@ -161,6 +169,7 @@ export const fakeIo = {
     exchanges.length = 0;
     nsm = createFakeNsm();
     nsmNext = null;
+    nsmTakesMs = 0;
   },
 };
 

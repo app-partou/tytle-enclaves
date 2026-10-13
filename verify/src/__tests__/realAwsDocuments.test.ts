@@ -9,6 +9,9 @@
  *   main repository's verifier tests. Each suite is skipped until its file exists.
  *
  * Until 2026-10 the CLI walked the cabundle backwards and judged it at "now": every one of these failed.
+ *
+ * A document more than a year old fails the freshness check (enclave review 2026-10-09, E2b F-9), so each run below
+ * pins the clock a minute after its document was signed - but one, which runs at the real time.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -36,13 +39,20 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
-/** Run the CLI's verification with --skip-build; returns the names of the checks that failed. */
-async function failedChecks(document: unknown, options: Partial<VerifyOptions> = {}): Promise<string[]> {
+const FRESH = 'Signed time is under a year old, not in the future';
+
+/**
+ * Run the CLI's verification with --skip-build, the clock a minute after `signedMs` (or at the real time when it is
+ * null); returns the names of the checks that failed.
+ */
+async function failedChecks(document: unknown, signedMs: number | null, options: Partial<VerifyOptions> = {}): Promise<string[]> {
   const file = path.join(dir, 'attestation.json');
   writeFileSync(file, JSON.stringify(document));
+  if (signedMs !== null) vi.useFakeTimers({ toFake: ['Date'], now: signedMs + 60_000 });
   const lines: string[] = [];
   const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
     lines.push(args.map(String).join(' ').replace(/\x1b\[[0-9;]*m/g, ''));
@@ -51,6 +61,7 @@ async function failedChecks(document: unknown, options: Partial<VerifyOptions> =
     await runVerification({ service: 'vies', attestation: file, skipBuild: true, ...options });
   } finally {
     spy.mockRestore();
+    vi.useRealTimers();
   }
   return lines.flatMap((line) => {
     const m = /^║  \[FAIL\] (.+?) *║$/.exec(line);
@@ -115,7 +126,13 @@ describe('real AWS documents published by another project', () => {
   });
 
   it('through runVerification, only the Tytle bindings fail (red)', async () => {
-    expect(await failedChecks(release.document(), { pcr0: release.pcr0 })).toEqual(NOT_TYTLE);
+    expect(await failedChecks(release.document(), release.signedMs, { pcr0: release.pcr0 })).toEqual(NOT_TYTLE);
+  });
+
+  it('at the real time, a document signed in 2023 also fails freshness: it is more than a year old (red)', async () => {
+    expect(Date.now() - release.signedMs).toBeGreaterThan(365 * 86_400_000);
+    expect(await failedChecks(release.document(), null, { pcr0: release.pcr0 }))
+      .toEqual(['Nonce matches recomputed value', FRESH, 'COSE user_data equals bn254Hash']);
   });
 
   it('one flipped bit in the signature fails the signature, not the chain (red)', async () => {
@@ -124,7 +141,7 @@ describe('real AWS documents published by another project', () => {
     const result = verifyCoseSignature(tampered.toString('base64'));
     expect(result.signatureValid).toBe(false);
     expect(result.certChainValid).toBe(true);
-    expect(await failedChecks(release.document(tampered.toString('base64')), { pcr0: release.pcr0 }))
+    expect(await failedChecks(release.document(tampered.toString('base64')), release.signedMs, { pcr0: release.pcr0 }))
       .toEqual(['COSE_Sign1 signature valid', ...NOT_TYTLE]);
   });
 
@@ -133,7 +150,7 @@ describe('real AWS documents published by another project', () => {
     const result = verifyCoseSignature(debug.f.documentBase64);
     expect(result.signatureValid).toBe(true);
     expect(result.certChainValid).toBe(true);
-    expect(await failedChecks(debug.document(), { pcr0: debug.pcr0 }))
+    expect(await failedChecks(debug.document(), debug.signedMs, { pcr0: debug.pcr0 }))
       .toEqual(['Enclave ran in release mode (PCR0 not all zeroes)', ...NOT_TYTLE]);
   });
 });
@@ -178,8 +195,8 @@ for (const [fixture, service] of CAPTURES) {
       const bn254 = row.bn254_data ? path.join(dir, 'vector.b64') : undefined;
       if (bn254 && row.bn254_data) writeFileSync(bn254, row.bn254_data);
       // --pcr0 is the row's own copy: this proves the signed PCR0 is the one stored. The release's published PCR0
-      // is the rebuild's question, which these tests skip.
-      expect(await failedChecks(document, { service, pcr0: row.pcr0, bn254 })).toEqual([]);
+      // is the rebuild's question, which these tests skip. The clock: a minute after the row was signed.
+      expect(await failedChecks(document, row.attestation_timestamp * 1000, { service, pcr0: row.pcr0, bn254 })).toEqual([]);
     });
   });
 }

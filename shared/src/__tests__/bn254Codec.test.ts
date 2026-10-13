@@ -205,8 +205,9 @@ describe('schemaByteLength', () => {
     ]);
   });
 
-  it('STRIPE_PAYMENT_SCHEMA = 6 * 32 = 192', () => {
-    expect(schemaByteLength(STRIPE_PAYMENT_SCHEMA)).toBe(192);
+  it('STRIPE_PAYMENT_SCHEMA = 7 * 32 = 224 (version 2: livemode appended)', () => {
+    expect(schemaByteLength(STRIPE_PAYMENT_SCHEMA)).toBe(224);
+    expect(STRIPE_PAYMENT_SCHEMA.at(-1)).toEqual({ name: 'livemode', encoding: 'uint', jsType: 'boolean' });
   });
 
   it('empty schema = 0', () => {
@@ -799,10 +800,11 @@ describe('STRIPE_PAYMENT_SCHEMA encode/decode roundtrip', () => {
       dataHash,
       totalCount: 2,
       hasMore: 1,
+      livemode: 1,
     };
 
     const encoded = encodeFieldElements(STRIPE_PAYMENT_SCHEMA, values);
-    expect(encoded.length).toBe(192);
+    expect(encoded.length).toBe(224);
 
     const decoded = decodeFieldElements(STRIPE_PAYMENT_SCHEMA, encoded);
     expect(decoded.operation.value).toBe('list_charges');
@@ -810,6 +812,7 @@ describe('STRIPE_PAYMENT_SCHEMA encode/decode roundtrip', () => {
     expect(decoded.objectType.value).toBe('list');
     expect(decoded.totalCount.value).toBe('2');
     expect(decoded.hasMore.value).toBe('1');
+    expect(decoded.livemode.value).toBe('1');
   });
 
   it('encodes list operation without connected account (null accountId)', () => {
@@ -1290,9 +1293,10 @@ describe('cross-repo consistency: known test vectors', () => {
       dataHash: 'a]fixed test data for hashing[z',
       totalCount: 5,
       hasMore: 1,
+      livemode: 1,
     });
 
-    expect(encoded.length).toBe(192);
+    expect(encoded.length).toBe(224);
 
     // Snapshot base64
     const b64 = encoded.toString('base64');
@@ -1304,6 +1308,7 @@ describe('cross-repo consistency: known test vectors', () => {
       dataHash: 'a]fixed test data for hashing[z',
       totalCount: 5,
       hasMore: 1,
+      livemode: 1,
     }).toString('base64')).toBe(b64);
 
     const decoded = decodeFieldElements(STRIPE_PAYMENT_SCHEMA, encoded);
@@ -1312,6 +1317,7 @@ describe('cross-repo consistency: known test vectors', () => {
     expect(decoded.objectType.value).toBe('list');
     expect(decoded.totalCount.value).toBe('5');
     expect(decoded.hasMore.value).toBe('1');
+    expect(decoded.livemode.value).toBe('1');
   });
 
   it('all schemas produce stable base64 that data-bridge can decode', () => {
@@ -1342,12 +1348,13 @@ describe('cross-repo consistency: known test vectors', () => {
       dataHash: 'test body',
       totalCount: 3,
       hasMore: 1,
+      livemode: 0,
     });
 
     // All must be deterministic
     expect(viesEncoded.length).toBe(192);
     expect(sicaeEncoded.length).toBe(256);
-    expect(stripeEncoded.length).toBe(192);
+    expect(stripeEncoded.length).toBe(224);
 
     // Re-encode and verify
     expect(encodeFieldElements(VIES_SCHEMA, {

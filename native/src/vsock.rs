@@ -13,12 +13,95 @@ const CLOSED_FD: i32 = -1;
 /// Read/write timeout of a socket from `VsockStream::connect` when the caller gives none.
 const DEFAULT_IO_TIMEOUT_SECS: u32 = 30;
 
-/// Read/write timeout of an accepted connection. The parent writes its whole request at once and
-/// reads the answer at once, so a peer that goes quiet for this long is gone or hostile. Every read
-/// and write is a blocking libc call on the Node.js event loop: while one waits, the enclave serves
-/// nothing else, so this bounds the longest freeze a peer can cause per call. The JS side adds a
-/// deadline over the whole message (shared/src/protocol.ts), which bounds a peer that trickles bytes.
+/// Read/write timeout of an accepted connection. A backstop only: `read_within` and `write_within` wait in
+/// poll(2) for at most the time their caller gives, and their recv/send never block (MSG_DONTWAIT), so these
+/// socket timeouts no longer bound anything they do.
 const ACCEPTED_IO_TIMEOUT_SECS: u32 = 10;
+
+/// The wall clock in milliseconds since the epoch: what JavaScript's `Date.now()` reads (both read CLOCK_REALTIME).
+fn now_epoch_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// An I/O error as the JS side sees it: "<what> failed: <the OS's reason>".
+fn io_error(what: &str, e: std::io::Error) -> Error {
+    Error::from_reason(format!("{} failed: {}", what, e))
+}
+
+/// Wait until `fd` is ready for `events` (POLLIN or POLLOUT), for at most `timeout_ms`. A signal does not end the
+/// wait early: poll is asked again for the time left (enclave review 2026-10-09, E1 F-11: with a socket timeout set,
+/// the kernel answers EINTR instead of restarting the call). `Ok(true)`: ready, or an error or hang-up that the next
+/// call reports; `Ok(false)`: the time ran out.
+fn wait_ready(fd: i32, events: i16, timeout_ms: u32) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    loop {
+        let left_ms = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd { fd, events, revents: 0 };
+        let ret = unsafe { libc::poll(&mut pfd, 1, left_ms) };
+        if ret > 0 {
+            return Ok(true);
+        }
+        if ret == 0 {
+            return Ok(false);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err);
+        }
+    }
+}
+
+/// Read up to `size` bytes from `fd`, waiting at most `timeout_ms` for the peer: the bytes (empty at the end of the
+/// stream), or None when nothing came in time. The read itself never blocks (MSG_DONTWAIT); a signal does not end it.
+/// Plain Rust, no Node values: its tests run without Node.
+fn recv_within(fd: i32, size: usize, timeout_ms: u32) -> Result<Option<Vec<u8>>> {
+    if !wait_ready(fd, libc::POLLIN, timeout_ms).map_err(|e| io_error("poll() before a read", e))? {
+        return Ok(None);
+    }
+    let mut buf = vec![0u8; size];
+    loop {
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+        if n >= 0 {
+            buf.truncate(n as usize);
+            return Ok(Some(buf));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return Ok(None),
+            _ => return Err(io_error("read()", err)),
+        }
+    }
+}
+
+/// Write as much of `data` to `fd` as the peer takes, waiting at most `timeout_ms` for room: the number of bytes
+/// written, 0 when the peer took nothing in time. The write itself never blocks (MSG_DONTWAIT) and never raises
+/// SIGPIPE (MSG_NOSIGNAL); a signal does not end it. Plain Rust, no Node values: its tests run without Node.
+fn send_within(fd: i32, data: &[u8], timeout_ms: u32) -> Result<u32> {
+    if !wait_ready(fd, libc::POLLOUT, timeout_ms).map_err(|e| io_error("poll() before a write", e))? {
+        return Ok(0);
+    }
+    loop {
+        let n = unsafe {
+            libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+        };
+        if n >= 0 {
+            return Ok(n as u32);
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EAGAIN) => return Ok(0),
+            _ => return Err(io_error("write()", err)),
+        }
+    }
+}
 
 /// Set SO_RCVTIMEO and SO_SNDTIMEO on `fd`, so a blocking read or write returns EAGAIN after `secs`
 /// instead of waiting forever (0 would mean "no timeout" to the kernel, so it is raised to 1).
@@ -184,6 +267,7 @@ impl VsockListener {
                 fd: AtomicI32::new(client_fd),
                 peer_cid: addr.svm_cid,
                 peer_port: addr.svm_port,
+                opened_at_ms: now_epoch_ms(),
             })
         }
     }
@@ -214,7 +298,7 @@ pub struct AcceptTask {
 }
 
 impl Task for AcceptTask {
-    type Output = (i32, u32, u32);
+    type Output = (i32, u32, u32, f64);
     type JsValue = VsockStream;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -237,40 +321,45 @@ impl Task for AcceptTask {
                 )));
             }
 
-            // Timeouts on both directions, so libc::read / libc::write in readMessage / writeMessage
-            // return EAGAIN instead of blocking forever when the peer connects and goes quiet or
-            // stops reading. A stuck call freezes the Node.js event loop: withTimeout's setTimeout
-            // cannot fire while it blocks.
+            // The time the connection arrived, taken here, on the thread pool: the request's budget starts now, not
+            // when the event loop gets to it (enclave review 2026-10-09, E-1).
+            let accepted_at_ms = now_epoch_ms();
+
+            // Socket timeouts on both directions, a backstop (ACCEPTED_IO_TIMEOUT_SECS).
             configure_accepted(client_fd)?;
 
-            Ok((client_fd, addr.svm_cid, addr.svm_port))
+            Ok((client_fd, addr.svm_cid, addr.svm_port, accepted_at_ms))
         }
     }
 
-    fn resolve(&mut self, _env: Env, (fd, cid, port): Self::Output) -> Result<Self::JsValue> {
+    fn resolve(&mut self, _env: Env, (fd, cid, port, opened_at_ms): Self::Output) -> Result<Self::JsValue> {
         Ok(VsockStream {
             fd: AtomicI32::new(fd),
             peer_cid: cid,
             peer_port: port,
+            opened_at_ms,
         })
     }
 }
 
 /// A connected vsock stream (either from accept() or connect()).
-/// Supports binary read/write for use as a Node.js Duplex transport.
+/// Supports binary reads and writes, each waiting at most the time its caller gives, for use as a Node.js Duplex
+/// transport and by the message framing (shared/src/vsockWait.ts).
 #[napi]
 pub struct VsockStream {
     fd: AtomicI32,
     peer_cid: u32,
     peer_port: u32,
+    /// Epoch ms when the call that opened the stream returned (accept or connect)
+    opened_at_ms: f64,
 }
 
 #[napi]
 impl VsockStream {
     /// Connect to a vsock endpoint at the given CID and port.
     /// CID 3 = host (parent) from inside the enclave.
-    /// Every read and write on the stream gives up after `timeout_secs` (default 30): without it a
-    /// host proxy that accepts and goes silent would block libc::read on the event loop forever.
+    /// `timeout_secs` (default 30) sets the socket's read and write timeouts, a backstop: `read_within` and
+    /// `write_within` wait only the time their caller gives.
     #[napi(factory)]
     pub fn connect(cid: u32, port: u32, timeout_secs: Option<u32>) -> Result<Self> {
         unsafe {
@@ -310,57 +399,31 @@ impl VsockStream {
                 fd: AtomicI32::new(fd),
                 peer_cid: cid,
                 peer_port: port,
+                opened_at_ms: now_epoch_ms(),
             })
         }
     }
 
-    /// Read up to `size` bytes from the stream.
-    /// Returns a Buffer with the bytes read (may be fewer than `size`).
-    /// Note: this is a blocking call (libc::read).
+    /// Read up to `size` bytes (at least 1), waiting at most `timeout_ms` for the peer.
+    /// Returns the bytes read (maybe fewer than `size`), an empty Buffer at the end of the stream (or once the
+    /// stream is closed), or null when nothing came in time.
+    /// The wait is a poll(2) of at most `timeout_ms`, and the read itself never blocks (MSG_DONTWAIT). The event
+    /// loop runs while a caller waits between calls: a read used to block it until the peer answered or the
+    /// socket's timeout ran out, and no timer could stop it (enclave review 2026-10-09, E-1).
     #[napi]
-    pub fn read(&self, size: u32) -> Result<Buffer> {
-        let fd = self.fd.load(Ordering::Acquire);
-        if fd == CLOSED_FD {
-            return Ok(Buffer::from(Vec::<u8>::new()));
-        }
-        let mut buf = vec![0u8; size as usize];
-        unsafe {
-            let n = libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len());
-            if n < 0 {
-                return Err(Error::from_reason(format!(
-                    "read() failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            if n == 0 {
-                return Ok(Buffer::from(Vec::<u8>::new()));
-            }
-            buf.truncate(n as usize);
-            Ok(Buffer::from(buf))
-        }
+    pub fn read_within(&self, size: u32, timeout_ms: u32) -> Result<Option<Buffer>> {
+        Ok(self.read_bytes_within(size, timeout_ms)?.map(Buffer::from))
     }
 
-    /// Write bytes to the stream. Returns number of bytes written.
+    /// Write as much of `data` as the peer takes, waiting at most `timeout_ms` for room.
+    /// Returns the number of bytes written: 0 when the peer took nothing in time.
+    /// The wait is a poll(2) of at most `timeout_ms`; the write itself never blocks (MSG_DONTWAIT) and never raises
+    /// SIGPIPE (MSG_NOSIGNAL): a peer that has gone is an error. A write used to block until the peer made room or
+    /// the socket's timeout ran out, again and again for a peer that drains slowly (enclave review 2026-10-09,
+    /// E1 F-10).
     #[napi]
-    pub fn write(&self, data: Buffer) -> Result<u32> {
-        let fd = self.fd.load(Ordering::Acquire);
-        if fd == CLOSED_FD {
-            return Err(Error::from_reason("Stream already closed"));
-        }
-        unsafe {
-            let n = libc::write(
-                fd,
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-            );
-            if n < 0 {
-                return Err(Error::from_reason(format!(
-                    "write() failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            Ok(n as u32)
-        }
+    pub fn write_within(&self, data: Buffer, timeout_ms: u32) -> Result<u32> {
+        self.write_bytes_within(&data, timeout_ms)
     }
 
     /// Close the stream. Safe to call multiple times.
@@ -390,6 +453,38 @@ impl VsockStream {
     pub fn peer_port(&self) -> u32 {
         self.peer_port
     }
+
+    /// Epoch ms when the call that opened the stream returned: for an accepted connection, the moment it arrived
+    /// (taken on the thread pool, before the event loop gets to it).
+    #[napi(getter)]
+    pub fn opened_at_ms(&self) -> f64 {
+        self.opened_at_ms
+    }
+}
+
+/// The plain-Rust cores of `read_within` and `write_within` (no Node values, so their tests run without Node).
+impl VsockStream {
+    fn read_bytes_within(&self, size: u32, timeout_ms: u32) -> Result<Option<Vec<u8>>> {
+        if size == 0 {
+            return Err(Error::from_reason("read_within needs a size of at least 1 byte"));
+        }
+        let fd = self.fd.load(Ordering::Acquire);
+        if fd == CLOSED_FD {
+            return Ok(Some(Vec::new()));
+        }
+        recv_within(fd, size as usize, timeout_ms)
+    }
+
+    fn write_bytes_within(&self, data: &[u8], timeout_ms: u32) -> Result<u32> {
+        let fd = self.fd.load(Ordering::Acquire);
+        if fd == CLOSED_FD {
+            return Err(Error::from_reason("Stream already closed"));
+        }
+        if data.is_empty() {
+            return Ok(0);
+        }
+        send_within(fd, data, timeout_ms)
+    }
 }
 
 /// Connect to a vsock endpoint asynchronously with a kernel-level timeout.
@@ -410,7 +505,7 @@ pub struct ConnectTask {
 }
 
 impl Task for ConnectTask {
-    type Output = (i32, u32, u32);
+    type Output = (i32, u32, u32, f64);
     type JsValue = VsockStream;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -536,18 +631,19 @@ impl Task for ConnectTask {
                 )));
             }
 
-            // Set I/O timeouts for subsequent read/write operations
+            // Socket timeouts for reads and writes, a backstop (read_within / write_within wait as asked)
             configure_connected(fd, Some(self.timeout_secs))?;
 
-            Ok((fd, self.cid, self.port))
+            Ok((fd, self.cid, self.port, now_epoch_ms()))
         }
     }
 
-    fn resolve(&mut self, _env: Env, (fd, cid, port): Self::Output) -> Result<Self::JsValue> {
+    fn resolve(&mut self, _env: Env, (fd, cid, port, opened_at_ms): Self::Output) -> Result<Self::JsValue> {
         Ok(VsockStream {
             fd: AtomicI32::new(fd),
             peer_cid: cid,
             peer_port: port,
+            opened_at_ms,
         })
     }
 }
@@ -856,6 +952,215 @@ mod tests {
         assert!(result.is_err());
         assert!(!has_reader(w), "the fd must be closed");
         unsafe { libc::close(w); }
+    }
+
+    // -------------------------------------------------------------------------
+    // read_within / write_within: every wait is the caller's (enclave review 2026-10-09, E-1, E1 F-10, F-11)
+    // -------------------------------------------------------------------------
+
+    fn stream_on(fd: i32) -> VsockStream {
+        VsockStream { fd: AtomicI32::new(fd), peer_cid: 0, peer_port: 0, opened_at_ms: 0.0 }
+    }
+
+    fn bytes_of(read: Result<Option<Vec<u8>>>) -> Option<Vec<u8>> {
+        read.expect("read_within")
+    }
+
+    /// Fill `fd`'s send buffer until the peer takes no more; returns how many bytes went in.
+    fn fill(fd: i32) -> usize {
+        let chunk = [0u8; 65536];
+        let mut total = 0;
+        loop {
+            let n = unsafe { libc::send(fd, chunk.as_ptr() as *const libc::c_void, chunk.len(), libc::MSG_DONTWAIT) };
+            if n <= 0 {
+                return total;
+            }
+            total += n as usize;
+        }
+    }
+
+    extern "C" fn ignore_signal(_: i32) {}
+
+    /// SIGUSR1 handled with SA_RESTART, as Node's handlers are: a call with a socket timeout set still ends with EINTR.
+    fn handle_sigusr1() {
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore_signal as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
+        }
+    }
+
+    /// Send SIGUSR1 to the calling thread after `after_ms`.
+    fn signal_me_after(after_ms: u64) -> std::thread::JoinHandle<()> {
+        let me = unsafe { libc::pthread_self() } as usize;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(after_ms));
+            unsafe { libc::pthread_kill(me as libc::pthread_t, libc::SIGUSR1) };
+        })
+    }
+
+    #[test]
+    fn read_within_returns_what_is_there_at_once() {
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        assert_eq!(unsafe { libc::write(b, b"hello".as_ptr() as *const libc::c_void, 5) }, 5);
+        let start = std::time::Instant::now();
+        assert_eq!(bytes_of(s.read_bytes_within(64, 5_000)), Some(b"hello".to_vec()));
+        assert!(start.elapsed().as_millis() < 500, "waited although the bytes were there: {:?}", start.elapsed());
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn read_within_gives_null_once_its_time_is_up_and_never_waits_for_the_socket_timeout() {
+        // The socket's own timeout is 10 s (a backstop); the caller gives 300 ms, and 300 ms is what it waits.
+        let (a, b) = socketpair();
+        unsafe { set_io_timeouts(a, 10) }.expect("set_io_timeouts");
+        let s = stream_on(a);
+        let start = std::time::Instant::now();
+        assert_eq!(bytes_of(s.read_bytes_within(64, 300)), None);
+        let waited = start.elapsed().as_millis();
+        assert!((250..2_000).contains(&waited), "waited {} ms for a 300 ms read", waited);
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn read_within_gives_an_empty_buffer_at_the_end_of_the_stream() {
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        unsafe { libc::close(b); }
+        assert_eq!(bytes_of(s.read_bytes_within(64, 1_000)), Some(Vec::new()));
+    }
+
+    #[test]
+    fn read_within_on_a_closed_stream_is_the_end_of_the_stream_and_touches_no_fd() {
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        s.close().expect("close");
+        assert_eq!(bytes_of(s.read_bytes_within(64, 1_000)), Some(Vec::new()));
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn read_within_refuses_a_size_of_zero() {
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        assert!(s.read_bytes_within(0, 100).is_err());
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn read_within_is_not_ended_by_a_signal() {
+        // E1 F-11: with a socket timeout set, a blocking read ended with EINTR at the signal (a failed request).
+        handle_sigusr1();
+        let (a, b) = socketpair();
+        unsafe { set_io_timeouts(a, 10) }.expect("set_io_timeouts");
+        let s = stream_on(a);
+        let signaller = signal_me_after(100);
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            unsafe { libc::write(b, b"late".as_ptr() as *const libc::c_void, 4) };
+            b
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(bytes_of(s.read_bytes_within(64, 3_000)), Some(b"late".to_vec()));
+        assert!(start.elapsed().as_millis() >= 250, "returned before the bytes came: {:?}", start.elapsed());
+        signaller.join().unwrap();
+        let b = writer.join().unwrap();
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn read_within_still_ends_on_time_when_a_signal_comes_while_it_waits() {
+        handle_sigusr1();
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        let signaller = signal_me_after(100);
+        let start = std::time::Instant::now();
+        assert_eq!(bytes_of(s.read_bytes_within(64, 400)), None);
+        let waited = start.elapsed().as_millis();
+        assert!((350..2_000).contains(&waited), "waited {} ms for a 400 ms read with a signal at 100 ms", waited);
+        signaller.join().unwrap();
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn write_within_writes_what_the_peer_takes() {
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        assert_eq!(s.write_bytes_within(b"ping", 1_000).expect("write_within"), 4);
+        let mut buf = [0u8; 8];
+        assert_eq!(unsafe { libc::read(b, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) }, 4);
+        assert_eq!(&buf[..4], b"ping");
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn write_within_gives_zero_once_its_time_is_up_for_a_peer_that_does_not_read() {
+        let (a, b) = socketpair();
+        unsafe { set_io_timeouts(a, 10) }.expect("set_io_timeouts");
+        let s = stream_on(a);
+        assert!(fill(a) > 0);
+        let start = std::time::Instant::now();
+        assert_eq!(s.write_bytes_within(&[1u8; 1024], 300).expect("write_within"), 0);
+        let waited = start.elapsed().as_millis();
+        assert!((250..2_000).contains(&waited), "waited {} ms for a 300 ms write", waited);
+        unsafe { libc::close(b); }
+    }
+
+    #[test]
+    fn write_within_to_a_peer_that_has_gone_is_an_error_not_a_signal() {
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        unsafe { libc::close(b); }
+        let result = s.write_bytes_within(b"x", 1_000);
+        assert!(result.is_err(), "a write to a closed peer must fail");
+        assert!(result.unwrap_err().reason.contains("write() failed"));
+    }
+
+    #[test]
+    fn write_within_on_a_closed_stream_is_an_error() {
+        let (a, b) = socketpair();
+        let s = stream_on(a);
+        s.close().expect("close");
+        assert!(s.write_bytes_within(b"x", 100).is_err());
+        unsafe { libc::close(b); }
+    }
+
+    // -------------------------------------------------------------------------
+    // The time a connection arrived (enclave review 2026-10-09, E-1: the budget starts at the native accept)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn accept_task_takes_the_time_the_connection_arrived() {
+        // An AF_UNIX listener stands in for AF_VSOCK: accept(2) and the timeouts behave the same.
+        unsafe {
+            let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(listener >= 0);
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let path = format!("/tmp/vsock-test-{}-{}.sock", std::process::id(), listener);
+            for (i, byte) in path.as_bytes().iter().enumerate() {
+                addr.sun_path[i] = *byte as libc::c_char;
+            }
+            let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            assert_eq!(libc::bind(listener, &addr as *const _ as *const libc::sockaddr, len), 0);
+            assert_eq!(libc::listen(listener, 1), 0);
+            let client = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert_eq!(libc::connect(client, &addr as *const _ as *const libc::sockaddr, len), 0);
+
+            let before = now_epoch_ms();
+            let (fd, _, _, accepted_at_ms) = AcceptTask { fd: listener }.compute().expect("accept");
+            let after = now_epoch_ms();
+            assert!(accepted_at_ms >= before && accepted_at_ms <= after, "{} not in [{}, {}]", accepted_at_ms, before, after);
+
+            libc::close(fd);
+            libc::close(client);
+            libc::close(listener);
+            let c_path = std::ffi::CString::new(path).unwrap();
+            libc::unlink(c_path.as_ptr());
+        }
     }
 
     // -------------------------------------------------------------------------

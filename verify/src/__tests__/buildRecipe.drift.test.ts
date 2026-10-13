@@ -100,6 +100,37 @@ describe('one build recipe', () => {
     }
   });
 
+  it("an enclave image does not depend on the builder's umask: every file copied from the checkout has mode 0644, and a directory goes only into a builder stage (red)", () => {
+    // Git keeps only a file's executable bit, so a checked-out file's other mode bits are 0666 minus the umask: 0644
+    // under umask 022 (the CI runner, a Mac), 0664 under umask 002 (a default user account on Ubuntu, Debian or
+    // Fedora). COPY keeps the mode, and the mode is in the layer, so the image and its PCR0 followed the umask of
+    // whoever checked out the repository: an honest verifier could get another PCR0 (enclave review 2026-10-09, E-7;
+    // measured: vies at 718b999 from a umask-002 checkout, sha256:942615c1..., the record sha256:d914d922...).
+    // `--chmod=0644` fixes a file's mode. A directory's files are only compiled (tsc, cargo), so they stay in a
+    // builder stage, where their modes reach nothing the final image keeps.
+    for (const enclave of ENCLAVES) {
+      const lines = read(`${enclave}/Dockerfile`).replace(/\\\n/g, ' ').split('\n');
+      let stage = '';
+      const wrong: string[] = [];
+      for (const line of lines) {
+        const from = /^FROM\s+\S+(?:\s+AS\s+(\S+))?\s*$/i.exec(line);
+        if (from) stage = from[1] ?? '(the final stage)';
+        const copy = /^COPY\s+(.*)$/.exec(line);
+        if (!copy) continue;
+        const words = copy[1].trim().split(/\s+/);
+        const flags = words.filter((word) => word.startsWith('--'));
+        if (flags.some((flag) => flag.startsWith('--from='))) continue;
+        const sources = words.filter((word) => !word.startsWith('--')).slice(0, -1);
+        for (const source of sources) {
+          const isDirectory = source.endsWith('/');
+          if (isDirectory && !stage.endsWith('-builder')) wrong.push(`${line}  (a directory into ${stage})`);
+          if (!isDirectory && !flags.includes('--chmod=0644')) wrong.push(`${line}  (no --chmod=0644)`);
+        }
+      }
+      expect(wrong, `${enclave}/Dockerfile`).toEqual([]);
+    }
+  });
+
   it('scripts/expected-digests.json records the committed build of every enclave (red)', async () => {
     expect(Object.keys((await scripts()).readExpected()).sort()).toEqual(ENCLAVES);
   });

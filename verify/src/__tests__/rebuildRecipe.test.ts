@@ -29,18 +29,26 @@ vi.mock('node:child_process', () => ({
 
 import { reproduceBuild } from '../lib/docker.js';
 import { BUILD_RECIPE, BUILDER_NAME } from '../lib/buildRecipe.js';
+import { NITRO_CLI_DOCKERFILE } from '../lib/nitroCli.js';
 import { REPO_URL } from '../commands/verify.js';
 
 const COMMIT = 'a'.repeat(40);
 let repoDir = '';
 
-/** A checked-out commit: vies/Dockerfile and, unless null, scripts/build-recipe.json. */
-function checkout(recipe: unknown): void {
+/**
+ * A checked-out commit: vies/Dockerfile and, unless null, scripts/build-recipe.json and verify/Dockerfile.nitro-cli
+ * (by default this CLI's own helper).
+ */
+function checkout(recipe: unknown, helper: string | null = NITRO_CLI_DOCKERFILE): void {
   mkdirSync(path.join(repoDir, 'vies'), { recursive: true });
   writeFileSync(path.join(repoDir, 'vies', 'Dockerfile'), 'FROM scratch\n');
   if (recipe !== null) {
     mkdirSync(path.join(repoDir, 'scripts'), { recursive: true });
     writeFileSync(path.join(repoDir, 'scripts', 'build-recipe.json'), JSON.stringify(recipe));
+  }
+  if (helper !== null) {
+    mkdirSync(path.join(repoDir, 'verify'), { recursive: true });
+    writeFileSync(path.join(repoDir, 'verify', 'Dockerfile.nitro-cli'), helper);
   }
 }
 
@@ -109,5 +117,29 @@ describe("the CLI's rebuild", () => {
     checkout({ ...BUILD_RECIPE, sourceDateEpoch: BUILD_RECIPE.sourceDateEpoch + 1 });
     expect(() => reproduceBuild('vies', COMMIT, REPO_URL, repoDir)).toThrow(/another recipe/);
     expect(docker('buildx', 'build')).toEqual([]);
+  });
+
+  // Enclave review 2026-10-09, E2b F-10: nitro-cli's kernel and init are in every PCR0, and the CLI measures with its
+  // own helper. A commit pinned to another helper would get a false "Reproduced PCR0 mismatch"; it is refused instead.
+  it('refuses a commit whose nitro-cli helper is another than this CLI\'s, before anything is built (red)', () => {
+    const olderPin = NITRO_CLI_DOCKERFILE.replaceAll('1.4.4-0.amzn2023', '1.4.3-0.amzn2023');
+    expect(olderPin).not.toBe(NITRO_CLI_DOCKERFILE);
+    checkout(BUILD_RECIPE, olderPin);
+    expect(() => reproduceBuild('vies', COMMIT, REPO_URL, repoDir)).toThrow(
+      `Commit ${COMMIT} measures with another nitro-cli helper than this CLI (its verify/Dockerfile.nitro-cli differs): ` +
+      'rebuild it with the CLI of that commit.');
+    expect(docker('buildx', 'build')).toEqual([]);
+  });
+
+  it('refuses a commit without verify/Dockerfile.nitro-cli before anything is built (red)', () => {
+    checkout(BUILD_RECIPE, null);
+    expect(() => reproduceBuild('vies', COMMIT, REPO_URL, repoDir)).toThrow(/has no verify\/Dockerfile\.nitro-cli/);
+    expect(docker('buildx', 'build')).toEqual([]);
+  });
+
+  it('a helper that differs only in line endings is the same helper (lock)', () => {
+    checkout(BUILD_RECIPE, NITRO_CLI_DOCKERFILE.replace(/\n/g, '\r\n'));
+    reproduceBuild('vies', COMMIT, REPO_URL, repoDir);
+    expect(docker('buildx', 'build')).toHaveLength(1);
   });
 });

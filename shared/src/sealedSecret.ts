@@ -14,7 +14,7 @@
  */
 
 import crypto from 'node:crypto';
-import { recipientAttestation } from './attestor.js';
+import { hypervisorNowMs, recipientAttestation } from './attestor.js';
 import { openEnvelopedData } from './cms.js';
 import { proxyFetch } from './httpProxy.js';
 import { timeFor, type RequestBudget } from './requestBudget.js';
@@ -145,9 +145,8 @@ export async function unsealSecret(
   const kept = opened.get(cacheKey);
   if (kept && kept.expiresAt > Date.now()) return kept.secret;
 
-  // The KMS call takes what is left of the request's budget, at most KMS_TIMEOUT_MS (requestBudget.ts); with nothing
-  // left, neither the recipient document nor the call is made
-  const kmsTimeoutMs = budget ? timeFor(budget, 'the KMS call', KMS_TIMEOUT_MS) : KMS_TIMEOUT_MS;
+  // With nothing left of the request's budget, neither the recipient document nor the call is made
+  if (budget) timeFor(budget, 'the KMS call');
   const signer = credentialsOf(credentials);
   const { publicKey, privateKey } = recipientKeyPair();
   const document = recipientAttestation(publicKey.export({ type: 'spki', format: 'der' }));
@@ -164,10 +163,15 @@ export async function unsealSecret(
       headers: { 'content-type': 'application/x-amz-json-1.1', 'x-amz-target': 'TrentService.Decrypt' },
       body,
     },
-    { service: 'kms', region: KMS_REGION, credentials: signer, now: new Date() },
+    // The hypervisor's time, as the attestor keeps it: the enclave's clock runs free, and KMS refuses a signature more
+    // than 5 minutes off its own time (E1 F-9)
+    { service: 'kms', region: KMS_REGION, credentials: signer, now: new Date(hypervisorNowMs()) },
   );
   // proxyFetch writes the Host header itself (the same value): sent twice, it would be a malformed request
   const headers = Object.fromEntries(Object.entries(signed).filter(([name]) => name !== 'host'));
+  // The call takes what is left of the request's budget when it starts, at most KMS_TIMEOUT_MS (requestBudget.ts): the
+  // key pair, the NSM call and the signing before it took their time (E1 F-8)
+  const kmsTimeoutMs = budget ? timeFor(budget, 'the KMS call', KMS_TIMEOUT_MS) : KMS_TIMEOUT_MS;
   const response = await proxyFetch(kms.vsockProxyPort, kms.hostname, 'POST', '/', headers, body, kmsTimeoutMs);
   const secret = secretOf(response.status, response.body, privateKey);
 

@@ -59,14 +59,32 @@ if (process.env.MONERIUM_PAYMENT_CID) {
 }
 
 /**
- * The enclaves that open secrets sealed to them with KMS (enclave audit P1.7): only these get the host role's AWS
- * credentials with a request, to sign their KMS Decrypt. Every other enclave never sees them. Stripe's allowlist names
- * KMS for this; an enclave added here must name it too.
+ * The enclaves that open secrets sealed to them with KMS (enclave audit P1.7), each with the field of its request body
+ * that carries one. Only a request that sends a sealed secret gets the host role's AWS credentials, to sign that
+ * enclave's KMS Decrypt; every other request, and every other enclave, never sees them. They are the whole host role's
+ * credentials, which can also write the PCR0 pins (hostCredentials.ts), and before, they went with every request to the
+ * Stripe enclave (enclave review 2026-10-09, E2b F-12). Stripe's allowlist names KMS for this; an enclave added here
+ * must name it too.
  */
-const SEALED_SECRET_CIDS: ReadonlySet<number> = new Set([STRIPE_PAYMENT_CID]);
+const SEALED_SECRET_FIELDS: ReadonlyMap<number, string> = new Map([[STRIPE_PAYMENT_CID, 'sealedApiKey']]);
 
-export function opensSealedSecrets(route: EnclaveRoute): boolean {
-  return SEALED_SECRET_CIDS.has(route.cid);
+/**
+ * Whether a request to `route` with this body sends a sealed secret: the enclave opens sealed secrets, and the body is
+ * a JSON object whose sealed-secret field is non-empty text. The enclave reads the body with the same JSON.parse, and
+ * takes an empty or missing field for no sealed secret; it checks the value itself.
+ */
+export function sendsSealedSecret(route: EnclaveRoute, body: string | undefined): boolean {
+  const field = SEALED_SECRET_FIELDS.get(route.cid);
+  if (field === undefined || body === undefined) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;                        // an empty body too
+  }
+  if (parsed === null || typeof parsed !== 'object') return false;
+  const value = (parsed as Record<string, unknown>)[field];
+  return typeof value === 'string' && value !== '';
 }
 
 /**

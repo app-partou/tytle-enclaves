@@ -15,6 +15,7 @@
  *                                               ends within 60 days; print the PCR8 an EIF it signs carries
  *   node recipe.mjs pcr8-is <hex>  < json       fail unless the measurements carry that PCR8
  *   node recipe.mjs check  <service> <digest> < measurements    the build against scripts/expected-digests.json
+ *   node recipe.mjs check-digest <service> <digest>             an image (no EIF yet) against the record's config digest
  *   node recipe.mjs record <service> <digest> < measurements    the build INTO scripts/expected-digests.json
  *   node recipe.mjs eif-measurements <service> <digest> < measurements    what build-eif.sh writes next to an EIF
  *
@@ -219,6 +220,19 @@ function main([command, ...args]) {
     case 'check': {
       const [service, digest] = args;
       const found = differences(readExpected()[service], entryOf(digest, stdin()));
+      if (found.length > 0) {
+        throw new Error(`${service} is not the committed build (run scripts/test-determinism.sh --update ${service} `
+          + `and commit scripts/expected-digests.json if the change is meant):\n  ${found.join('\n  ')}`);
+      }
+      return `${service}: the committed build (${digest})`;
+    }
+    case 'check-digest': {
+      // The deploy's build has an image, not an EIF: its config digest is the part of the record it can check
+      // (scripts/build-service.sh; enclave review 2026-10-09, H6).
+      const [service, digest] = args;
+      if (!CONFIG_DIGEST.test(digest ?? '')) throw new Error(`not a config digest: "${digest}"`);
+      const committed = readExpected()[service];
+      const found = differences(committed && { imageConfigDigest: committed.imageConfigDigest }, { imageConfigDigest: digest });
       if (found.length > 0) {
         throw new Error(`${service} is not the committed build (run scripts/test-determinism.sh --update ${service} `
           + `and commit scripts/expected-digests.json if the change is meant):\n  ${found.join('\n  ')}`);

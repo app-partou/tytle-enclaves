@@ -37,8 +37,9 @@ export interface HandlerResult {
   skipAttestation?: boolean;
   rawPassthrough?: { status: number; headers: Record<string, string>; rawBody: string };
   /**
-   * The upstream body the signed `dataHash` commits to, for a handler whose data IS that body (Stripe's JSON): sent
-   * beside the signed answer, never signed itself. A reader uses it only when its SHA-256 is the vector's dataHash.
+   * The upstream body the signed `dataHash` commits to: sent beside the signed answer, never signed itself. A reader
+   * uses it only when its SHA-256 is the vector's dataHash. Every handler with a dataHash sends it (enclave review
+   * 2026-10-09, E-4: VIES, SICAE and Monerium kept theirs inside the enclave, so nobody could open the commitment).
    */
   upstreamBody?: string;
 }

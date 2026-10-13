@@ -1,15 +1,18 @@
 /**
  * Stripe Payment Handler Manifest
+ *
+ * Its status rules are run against the handler by the package's tests (stripePaymentHandler.factory.test.ts).
  */
 
 import {
   computeManifestHash, validateManifest, STRIPE_PAYMENT_SCHEMA,
-  SKIP_TRANSIENT_ERRORS, ATTEST_NOT_FOUND, STRIP_AUTH, REDACT_BEARER,
+  SKIP_TRANSIENT_ERRORS, STRIP_AUTH, REDACT_BEARER,
 } from '@tytle-enclaves/shared';
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
 export const HANDLER_MANIFEST: HandlerManifest = {
-  version: '1.1.0',
+  // 1.1.0 = the 2026-10-09 release; 1.2.0 = the second enclave release (R4)
+  version: '1.2.0',
 
   queries: [
     {
@@ -20,6 +23,21 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       path: '/v1/{resource}/{resourceId?}',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
+        'Stripe-Version': '2025-12-15.clover',
+      },
+      auth: {
+        header: 'Authorization',
+        scheme: 'Bearer',
+        strippedBeforeAttestation: true,
+      },
+    },
+    {
+      id: 'stripe_own_account',
+      description: 'Stripe GET /v1/account with the same key, for an answer to sign when the request named no Stripe-Account: the account the key belongs to is the account signed',
+      method: 'GET',
+      host: 'api.stripe.com',
+      path: '/v1/account',
+      headers: {
         'Stripe-Version': '2025-12-15.clover',
       },
       auth: {
@@ -48,22 +66,27 @@ export const HANDLER_MANIFEST: HandlerManifest = {
 
   schema: {
     name: 'STRIPE_PAYMENT_SCHEMA',
-    outputBytes: 192,
+    outputBytes: 224,
     fields: [
       { name: 'operation',  encoding: 'shortString', source: { from: 'request', param: 'operation' } },
-      { name: 'accountId',  encoding: 'shortString', source: { from: 'request', param: 'stripeAccount' } },
+      { name: 'accountId',  encoding: 'shortString', source: { from: 'response', query: 'stripe_own_account', path: 'id' } },
       { name: 'objectType', encoding: 'shortString', source: { from: 'response', query: 'stripe_api', path: 'object' } },
       { name: 'dataHash',   encoding: 'sha256',      source: { from: 'derived', inputs: ['stripe_api:rawBody'], join: '', transform: 'sha256' } },
       { name: 'totalCount', encoding: 'uint',         source: { from: 'response', query: 'stripe_api', path: 'data.length', transform: 'array_length' } },
       { name: 'hasMore',    encoding: 'uint',         source: { from: 'response', query: 'stripe_api', path: 'has_more', transform: 'boolean_uint' } },
+      { name: 'livemode',   encoding: 'uint',         source: { from: 'api_key', property: 'stripe_livemode' } },
     ],
   },
 
   policies: [
     SKIP_TRANSIENT_ERRORS,
-    ATTEST_NOT_FOUND,
     STRIP_AUTH,
     REDACT_BEARER,
+    {
+      id: 'only_a_200_is_an_answer',
+      check: { type: 'behavioral', description: 'stripe_api: a 200 is read as the answer, a 404 by not_found_is_stripes_own, an error (400 or more) passed on unsigned; any other status (a 201, a 302) throws 502. stripe_own_account: anything but a 200 throws 502' },
+      reason: 'Only Stripe\'s own answer is signed (enclave review 2026-10-09, E2a F-17)',
+    },
     {
       id: 'valid_operations',
       check: { type: 'field_required', paths: ['operation'] },
@@ -71,8 +94,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'api_key_required',
-      check: { type: 'behavioral', description: 'Exactly one of apiKey (the key) or sealedApiKey (the key sealed to this enclave with KMS, encryption context enclave=stripe_payment); a sealed key is opened through KMS with the attestation of this enclave and must be a Stripe sk_ or rk_ key' },
+      check: { type: 'behavioral', description: 'Exactly one of apiKey (the key) or sealedApiKey (the key sealed to this enclave with KMS, encryption context enclave=stripe_payment); a sealed key is opened through KMS with the attestation of this enclave. The key must be a Stripe secret or restricted key that names its mode: sk_live_, sk_test_, rk_live_ or rk_test_. Any other key in clear is a 400 before anything is asked; any other sealed key, once opened, a 502' },
       reason: 'Stripe API key is required for authentication; sealed, it never crosses the host in clear (enclave audit P1.7)',
+    },
+    {
+      id: 'the_key_mode_is_signed',
+      check: { type: 'behavioral', description: 'livemode is 1 when the key Stripe was asked with names live mode (sk_live_, rk_live_) and 0 when it names test mode (sk_test_, rk_test_), on every signed answer, a not_found too' },
+      reason: 'A test key asked about a live object gets Stripe\'s own resource_missing: the signed not_found says that a test key asked (enclave review 2026-10-09, E-3)',
     },
     {
       id: 'resource_id_for_get_ops',
@@ -91,8 +119,8 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'account_is_the_one_asked',
-      check: { type: 'behavioral', description: 'accountId is the Stripe-Account the request named (null when it named none). Stripe refuses a Stripe-Account the API key cannot act as (error code account_invalid): that 4xx is never signed. When the answer names an account in its own Stripe-Account header, it must be the one asked, else the answer is an error' },
-      reason: 'The signed account is the one Stripe acted as, never a value the caller only claimed',
+      check: { type: 'behavioral', description: 'accountId is the Stripe-Account the request named, or, when it named none, the account of the API key itself (GET /v1/account with that key, asked with each such answer; anything but an account object is an error, never a null account). Stripe refuses a Stripe-Account the API key cannot act as (error code account_invalid): that 4xx is never signed. When the answer names an account in its own Stripe-Account header, it must be the one asked, else the answer is an error' },
+      reason: 'The signed account is the one Stripe acted as, never a value the caller only claimed; with no Stripe-Account, another key\'s answer no longer reads as the platform\'s (enclave review 2026-10-09, H5)',
     },
     {
       id: 'single_object_is_the_one_asked',
@@ -101,8 +129,18 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'list_shape',
-      check: { type: 'behavioral', description: 'A list answer must carry its data array and has_more (boolean): totalCount and hasMore are read from them; otherwise the answer is an error' },
-      reason: 'A list the handler cannot read is never signed as an empty one',
+      check: { type: 'behavioral', description: 'A list answer must carry its data array and has_more (boolean), and each item must be the operation\'s object (charge, customer, invoice): totalCount (the length of this page, never a total) and hasMore are read from them; otherwise the answer is an error' },
+      reason: 'A list the handler cannot read is never signed as an empty one, and a list of other objects is never signed as this one (enclave review 2026-10-09, E2a F-12)',
+    },
+    {
+      id: 'the_question_is_signed',
+      check: { type: 'behavioral', description: 'The signed endpoint is the whole question: the path with the object\'s id, and the query with its keys in code-unit order, form-encoded' },
+      reason: 'Two lists of different time windows or pages were the same signed answer (enclave review 2026-10-09, H5)',
+    },
+    {
+      id: 'query_keys',
+      check: { type: 'behavioral', description: 'Query keys are the ones the operation takes - a list: limit (1-100), starting_after, ending_before (object ids), created[gt|gte|lt|lte] (Unix seconds), and for list_invoices status (draft, open, paid, uncollectible, void); a single object: none. Any other key, expand[] first, or another value is a 400' },
+      reason: 'The key reads only what the operation\'s list holds: expand[] read nested objects in full (enclave review 2026-10-09, E2a F-13)',
     },
     {
       id: 'not_found_is_stripes_own',
@@ -119,7 +157,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
   repeatability: {
     hashAlgorithm: 'sha256',
     dataHashInput: 'stripe_api:rawBody',
-    outputFormat: 'BN254 big-endian, 6 × 32 bytes, base64',
+    outputFormat: 'BN254 big-endian, 7 × 32 bytes, base64',
     deterministic: true,
   },
 };

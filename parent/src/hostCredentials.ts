@@ -1,9 +1,17 @@
 /**
  * The host role's temporary AWS credentials, read from IMDSv2, for the enclaves that open secrets sealed to them with
- * KMS (enclave audit P1.7; shared/src/sealedSecret.ts): they sign the enclave's KMS Decrypt, and nothing else. The
- * key policy, not an identity policy, lets this role Decrypt, and only with an attestation document of an enclave
- * image it names, so these credentials alone open nothing. This is the kmstool pattern: the parent reads them and
- * sends them with the request.
+ * KMS (enclave audit P1.7; shared/src/sealedSecret.ts): the enclave signs its KMS Decrypt with them. This is the
+ * kmstool pattern: the parent reads them and sends them with the request.
+ *
+ * For KMS they open nothing alone: the key policy, not an identity policy, lets this role Decrypt, and only with an
+ * attestation document of an enclave image it names. But they are the whole host role's credentials, not a session
+ * scoped to that Decrypt: the same role can write the PCR0 pins data-bridge trusts (ssm:PutParameter on
+ * /tytle/<env>/enclave/*), pull from ECR, write logs and metrics, and use Session Manager (the main repository's
+ * infra/lib/nitro-enclave-stack.ts). So the parent sends them only with a request that sends a sealed secret
+ * (enclaveRouter.ts sendsSealedSecret), never with every request to such an enclave; an enclave bug that echoed its
+ * request would hand out all of it. Credentials scoped to the one call (an STS session with a kms:Decrypt session
+ * policy, or a KMS-only role the parent assumes) need an IAM change outside this repository (enclave review
+ * 2026-10-09, E2b F-12).
  *
  * IMDSv2 (the host requires it): a session token (PUT /latest/api/token), then the role's name and its credentials
  * (GET /latest/meta-data/iam/security-credentials/[<role>]). AWS makes new credentials available at least five

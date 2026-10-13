@@ -46,14 +46,18 @@ PCR0 says which code ran, not who ran it: this repository is public, so anyone c
 
 A provider key (Stripe's platform key) reaches the enclave without crossing the host in clear (`shared/src/sealedSecret.ts`):
 
-1. The deploy role encrypts the key once with the KMS key `alias/tytle-<env>-enclave-secrets` and the encryption context `enclave=<name>` (`stripe_payment`). A caller sends only that ciphertext (`sealedApiKey`). Seal the key's exact bytes: a trailing newline makes it a value the enclave refuses.
+1. The deploy role encrypts the key once with the KMS key `alias/tytle-<env>-enclave-secrets` and the encryption context `enclave=<name>` (`stripe_payment`). A caller sends only that ciphertext (`sealedApiKey`). Seal the key's exact bytes: a trailing newline makes it a value the enclave refuses. The key must name its mode (`sk_live_`, `sk_test_`, `rk_live_` or `rk_test_`): each answer signs it (`livemode`).
 2. To open it, the enclave makes an RSA-2048 key pair in its own memory (once per process), asks the NSM for an attestation document that carries the public key and nothing else, and calls KMS `Decrypt` with that document as the `Recipient` (`RSAES_OAEP_SHA_256`). KMS answers with the key encrypted to that public key (`CiphertextForRecipient`, CMS EnvelopedData: RSAES-OAEP SHA-256, then AES-256-CBC), which only the enclave's private key opens. An answer that carries a `Plaintext` is refused.
-3. The call is signed (SigV4) with the host role's temporary credentials, which the parent reads from IMDSv2 (`parent/src/hostCredentials.ts`) and sends with each request to such an enclave, and to no other (a caller cannot send its own), and it goes through the host's vsock-proxy for KMS (vsock port 8000, `kms.eu-central-1.amazonaws.com:443`), TLS end to end. Only an enclave whose own allowlist names KMS can make it: the Stripe Payment enclave.
+3. The call is signed (SigV4) with the host role's temporary credentials, which the parent reads from IMDSv2 (`parent/src/hostCredentials.ts`) and sends only with a request to such an enclave that sends a sealed secret (a non-empty `sealedApiKey`), and with no other request (a caller cannot send its own); it goes through the host's vsock-proxy for KMS (vsock port 8000, `kms.eu-central-1.amazonaws.com:443`), TLS end to end. Only an enclave whose own allowlist names KMS can make it: the Stripe Payment enclave.
 4. The key policy grants the host role `kms:Decrypt` only with `kms:RecipientAttestation:ImageSha384` equal to the PCR0 of a named image of that enclave (the current one, and the previous one during a rotation) and with that enclave's encryption context. Without a `Recipient`, the condition key is absent, so a plain `Decrypt` by the host role is refused. The key and its policy are made outside this repository.
 
 What this gives: the key is never in clear on the host, in data-bridge, in the parent or in a log. A compromised host can still send requests that make the enclave use the key, but only for the handler's own read-only Stripe calls: it cannot take the key and use it for anything else. Another image (a changed enclave, or one the policy no longer names) gets no `Decrypt`; a new release opens the key only after the policy names its PCR0. An opened key is kept in the enclave's memory for at most an hour; a refusal is never kept.
 
-What it does not give: until every caller sends the sealed key, `apiKey` (the key in clear) is still accepted.
+What it does not give: until every caller sends the sealed key, `apiKey` (the key in clear) is still accepted, so a compromised host can swap it for another key. Each answer signs the account the key belongs to (`accountId`) and the key's mode (`livemode`): a caller that compares them with its own key's can tell such an answer from its own. And the credentials sent with a sealed key are the whole host role's, not a session scoped to the one `Decrypt`: the role can also write the PCR0 pins in SSM. The enclave neither logs nor echoes them, but scoping them to the call (an STS session with a `kms:Decrypt` session policy) needs an IAM change outside this repository.
+
+## Caller Tokens
+
+Two enclaves take a short-lived token from their caller with each request, in clear: Monerium (the caller's OAuth access token) and VIES for a UK number (`hmrcAccessToken`: HMRC's OAuth token for Check a UK VAT number 2.0, scope `read:vat`, valid 4 hours, which data-bridge gets with Tytle's HMRC client credentials; the client secret never reaches the host or the enclave). Each goes to its upstream as `Authorization: Bearer` and nowhere else: no attested value carries it (the manifests' `strip_auth`), no error repeats it (`redact_bearer`, and the input checks never quote it), and no log line names it. A token is checked before it goes into a header line (VIES: RFC 6750's bearer token syntax, at most 4096 characters). Neither is sealed: each lasts hours, reads only what its upstream answers anyone with such a token, and the credentials that make one stay with the caller.
 
 ## The Parent Token
 
@@ -73,7 +77,7 @@ Requests to any other host are rejected with HTTP 403. Since the allowlist is in
 ### Supply chain
 
 - Base images are pinned by digest (not tag)
-- System packages are pinned by version
+- The enclave images install system packages only from vendored `.apk` files, each checked against its `SHASUMS256.txt`, offline. The parent image is the exception: its build stage installs its build tools (`nodejs npm build-essential python3`) from Debian's apt, not pinned by version. The parent is in no PCR0 and outside every enclave's trust boundary, but it holds the host role's credentials and the parent token
 - npm dependencies are locked via `package-lock.json`
 - Rust dependencies are locked via the committed `Cargo.lock`: the build fails when it does not match `Cargo.toml` (`cargo fetch --locked`)
 
@@ -81,8 +85,10 @@ Requests to any other host are rejected with HTTP 403. Since the allowlist is in
 
 - ONE recipe builds every image (`scripts/lib/recipe.sh`, values in `scripts/build-recipe.json`): linux/amd64, and a BuildKit pinned by digest, run as its own builder
 - A fixed `SOURCE_DATE_EPOCH` and BuildKit `rewrite-timestamp=true` give every new file the same time: an image, and its PCR0, changes only when what goes into it changes
-- `scripts/expected-digests.json` records each enclave's image config digest and PCR0; CI builds every enclave twice on each pull request and fails unless both builds are that record
+- `scripts/expected-digests.json` records each enclave's image config digest and PCR0. On each pull request, CI builds every enclave twice and fails unless both builds are that record: a check on the pull request, which a merge waits for only where the main branch's protection requires it (a setting of the repository, not something a commit carries). A verifier's own rebuild is what proves a commit (VERIFICATION.md)
 - `scripts/build-eif.sh` writes an EIF, signed or not, only when its build is that record
+- `scripts/build-service.sh`, the deploy's build, loads and pushes an enclave image only when its config digest is that record's
+- Every file an enclave image keeps from the checkout gets mode 0644 (`COPY --chmod=0644`), and the source folders are only compiled in build stages, so no mode from the checkout reaches an image: git keeps no read and write bits, so before, the image followed the umask of whoever checked out the repository
 - Fixed UID (1000) avoids `/etc/passwd` differences
 
 ## Reporting

@@ -11,20 +11,18 @@ import type { VsockStream } from '@tytle-enclaves/native';
 import { readMessage, writeMessage } from './protocol.js';
 import { createRequestHandler } from './requestHandler.js';
 import { toErrorMessage } from './errorUtils.js';
-import { ANSWER_GRACE_MS, RequestDeadlineError, requestBudget, type RequestBudget } from './requestBudget.js';
+import { ANSWER_GRACE_MS, ANSWER_WRITE_MS, RequestDeadlineError, requestBudget, type RequestBudget } from './requestBudget.js';
 import type { EnclaveConfig, EnclaveRequest, EnclaveResponse } from './types.js';
 
 const VSOCK_PORT = 5000;
 
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '4', 10);
 
-/** The outer bound of the request read (the read's own deadline, REQUEST_READ_DEADLINE_MS, is the one that acts). */
-const CONNECTION_TIMEOUT_MS = 60_000;
-
 /**
- * The whole request (or ping) must arrive within this. The parent writes it in one go right after
- * connecting; a peer that trickles bytes to keep the socket's per-read timeout from firing is cut off
- * here (protocol.ts ReadDeadlineError) instead of holding the connection, and the event loop, open.
+ * The whole request (or ping) must arrive within this of the connection's arrival. The parent writes it in one go
+ * right after connecting; a peer that trickles bytes is cut off here (protocol.ts ReadDeadlineError) instead of
+ * holding the connection open. The bound is exact: no read waits past it (enclave review 2026-10-09, E1 F-6: each
+ * blocking read could wait one more socket timeout, 20 s in all).
  */
 const REQUEST_READ_DEADLINE_MS = 10_000;
 
@@ -40,21 +38,24 @@ const REQUEST_READ_DEADLINE_MS = 10_000;
  * concurrency limit - they read the message, detect { type: 'ping' },
  * respond immediately, and close the connection.
  *
- * readMessage/writeMessage use synchronous libc::read/write (the native
- * addon has no async read variant). They stay inside dispatched handlers
- * so they don't block the accept loop itself. Accepted connections have
- * SO_RCVTIMEO and SO_SNDTIMEO of 10 s set by the Rust addon, so a stuck read
- * or write returns EAGAIN instead of blocking indefinitely, and the request
- * read has a deadline over the whole message (REQUEST_READ_DEADLINE_MS).
+ * readMessage/writeMessage wait in slices (vsockWait.ts): no native read or write waits longer than WAIT_SLICE_MS,
+ * and the event loop runs between them, so a slow peer or a slow upstream never stops the enclave from serving its
+ * other connections (enclave review 2026-10-09, E-1: a blocking read held a ping 23.5 s). The request read has a
+ * deadline over the whole message (REQUEST_READ_DEADLINE_MS), and every write of a connection ends by the answer's
+ * own deadline (the budget, ANSWER_GRACE_MS and ANSWER_WRITE_MS: 34 s, inside the parent's 35 s).
  *
- * A request has one time budget from the moment its connection is accepted (requestBudget.ts, 30 s): the handler's
- * reads, retries and KMS call take what is left of it, and an answer still not given ANSWER_GRACE_MS after it is a
- * 504, inside the parent's 35 s. It was a 60 s timer, longer than the parent's 30 s, that never stopped the handler.
+ * A request has one time budget from the moment its connection arrived (requestBudget.ts, 30 s; the native accept
+ * takes that time): the handler's reads, retries and KMS call take what is left of it, and an answer still not given
+ * ANSWER_GRACE_MS after it is a 504, inside the parent's 35 s. It was a 60 s timer, longer than the parent's 30 s, that
+ * never stopped the handler.
  */
 export function startEnclave(config: EnclaveConfig): void {
   const processRequest = config.customHandler || createRequestHandler(config);
 
   let activeHandlers = 0;
+  const freeSlot = (): void => {
+    activeHandlers--;
+  };
 
   const main = async (): Promise<void> => {
     console.log(`[enclave:${config.name}] Starting on vsock port ${VSOCK_PORT} (max concurrent: ${MAX_CONCURRENT})`);
@@ -95,18 +96,20 @@ export function startEnclave(config: EnclaveConfig): void {
     name: string,
     handler: (req: EnclaveRequest, budget: RequestBudget) => Promise<EnclaveResponse>,
   ): Promise<void> {
-    const budget = requestBudget(Date.now());
+    // From the moment the connection arrived, as the native accept took it: a connection that waited for the event
+    // loop gets no fresh budget (enclave review 2026-10-09, E-1).
+    const budget = requestBudget(conn.openedAtMs);
+    // Every write of this connection ends by then, the answer's own deadline (E1 F-10).
+    const writeBy = { deadlineMs: budget.deadlineMs + ANSWER_GRACE_MS + ANSWER_WRITE_MS };
     try {
-      const message = await withTimeout(
-        () => readMessage<EnclaveRequest | { type: string }>(conn, { deadlineMs: Date.now() + REQUEST_READ_DEADLINE_MS }),
-        CONNECTION_TIMEOUT_MS,
-        () => new Error(`Read timed out after ${CONNECTION_TIMEOUT_MS}ms`),
-      );
+      const message = await readMessage<EnclaveRequest | { type: string }>(conn, {
+        deadlineMs: conn.openedAtMs + REQUEST_READ_DEADLINE_MS,
+      });
 
       if ('type' in message && (message as { type: string }).type === 'ping') {
         // The enclave's own clock: the parent reports how far it drifted (audit §5.1 F1). Diagnostic only - the
         // attestation time follows the hypervisor's signed one (attestor.ts).
-        await writeMessage(conn, { type: 'pong', timestamp: Date.now() });
+        await writeMessage(conn, { type: 'pong', timestamp: Date.now() }, writeBy);
         return;
       }
 
@@ -117,16 +120,17 @@ export function startEnclave(config: EnclaveConfig): void {
           success: false, status: 503, headers: {},
           rawBody: '', error: 'Enclave at capacity',
         };
-        await writeMessage(conn, busyResp);
+        await writeMessage(conn, busyResp, writeBy);
         return;
       }
 
+      // The slot is held until the handler itself stops, not until its answer was written: a 504 ends the answer, not
+      // the handler, which may still hold its upstream socket (enclave review 2026-10-09, E1 F-7). A handler that
+      // throws at once rejects its run, as one that throws later does, so its slot is freed too.
       activeHandlers++;
-      try {
-        await executeRequest(conn, name, handler, request, budget);
-      } finally {
-        activeHandlers--;
-      }
+      const handling = (async () => handler(request, budget))();
+      void handling.then(freeSlot, freeSlot);
+      await executeRequest(conn, name, request, handling, budget, writeBy);
     } catch (err: unknown) {
       const msg = toErrorMessage(err);
       console.error(`[enclave:${name}] Connection error: ${msg}`);
@@ -134,7 +138,7 @@ export function startEnclave(config: EnclaveConfig): void {
         await writeMessage(conn, {
           success: false, status: err instanceof RequestDeadlineError ? 504 : 500, headers: {},
           rawBody: '', error: msg,
-        } satisfies EnclaveResponse);
+        } satisfies EnclaveResponse, writeBy);
       } catch {
         // Can't send error response - connection is broken
       }
@@ -146,18 +150,19 @@ export function startEnclave(config: EnclaveConfig): void {
   async function executeRequest(
     conn: VsockStream,
     name: string,
-    handler: (req: EnclaveRequest, budget: RequestBudget) => Promise<EnclaveResponse>,
     request: EnclaveRequest,
+    handling: Promise<EnclaveResponse>,
     budget: RequestBudget,
+    writeBy: { deadlineMs: number },
   ): Promise<void> {
     console.log(`[enclave:${name}] Request ${request.id}: ${request.method} ${request.url}`);
 
     const response = await withTimeout(
-      () => handler(request, budget),
+      handling,
       budget.deadlineMs + ANSWER_GRACE_MS - Date.now(),
       () => new RequestDeadlineError('the answer'),
     );
-    await writeMessage(conn, response);
+    await writeMessage(conn, response, writeBy);
 
     console.log(
       `[enclave:${name}] Request ${request.id}: ${response.success ? 'OK' : 'FAILED'} (status ${response.status})`,
@@ -170,14 +175,15 @@ export function startEnclave(config: EnclaveConfig): void {
   });
 }
 
+/** What `promise` gives, or `onTimeout()` when `timeoutMs` passes first. The promise's own work goes on: it is not stopped. */
 async function withTimeout<T>(
-  fn: () => Promise<T>,
+  promise: Promise<T>,
   timeoutMs: number,
   onTimeout: () => Error,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(onTimeout()), timeoutMs);
-    fn().then(
+    promise.then(
       (result) => { clearTimeout(timer); resolve(result); },
       (err) => { clearTimeout(timer); reject(err); },
     );

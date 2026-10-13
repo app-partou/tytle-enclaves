@@ -20,12 +20,12 @@ function enclaveConnection(answer: unknown) {
       const all = Buffer.concat(written);
       return JSON.parse(all.subarray(4, 4 + all.readUInt32BE(0)).toString('utf-8')) as Record<string, unknown>;
     },
-    read(size: number): Buffer {
+    readWithin(size: number, _timeoutMs: number): Buffer | null {
       const out = reply.subarray(offset, Math.min(reply.length, offset + size));
       offset += out.length;
       return out;
     },
-    write(data: Buffer): number {
+    writeWithin(data: Buffer, _timeoutMs: number): number {
       written.push(Buffer.from(data));
       return data.length;
     },

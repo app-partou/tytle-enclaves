@@ -3,12 +3,22 @@
  * AttestationDocument is duplicated from shared/src/attestor.ts to keep this package standalone.
  */
 
+/**
+ * What a check may rely on: the fields the NSM signs, itself (nsmDocument) or through the nonce (responseHash,
+ * apiEndpoint, timestamp, challenge), and the bindings to them (nonce, bn254Hash). `attestationId`, `requestHash` and
+ * `apiMethod` are NOT signed: the enclave mints the id and hashes the request, but neither enters the nonce or
+ * user_data, so whoever hands over the JSON can write anything there. The CLI reports them as not signed, and never
+ * requires them (enclave review 2026-10-09, E2b F-8).
+ */
 export interface AttestationDocument {
-  attestationId: string;
+  /** Not signed. */
+  attestationId?: string;
   responseHash: string;
-  requestHash: string;
+  /** Not signed. */
+  requestHash?: string;
   apiEndpoint: string;
-  apiMethod: string;
+  /** Not signed. */
+  apiMethod?: string;
   timestamp: number;
   nsmDocument: string; // Base64 COSE_Sign1
   pcrs: {
@@ -54,6 +64,9 @@ export function apiKeyForService(service: ServiceName): string {
 
 export interface CheckResult {
   name: string;
+  /** False for a check that failed, and for one that did not run (`skipped`). */
   passed: boolean;
+  /** Set when the check did not run: what is therefore not verified, for the result line. Never a pass. */
+  skipped?: string;
   detail?: string;
 }

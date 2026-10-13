@@ -7,7 +7,9 @@
  * payload's timestamp): AWS's leaf lives about three hours, so judging at "now" refuses every stored document. The
  * anchor itself must also be valid now.
  *
- * The same rules as the main repo's verifier (packages/attestation-core nsmVerification.ts verifyCertChain).
+ * The same chain rules as the main repo's verifier (packages/attestation-core nsmVerification.ts verifyCertChain). Its
+ * freshness bound (a signed time at most a year old) is the CLI's own check (commands/verify.ts), because a chain
+ * judged at the signed time accepts an old document by design.
  * Until 2026-10 this file walked [leaf, ROOT, INTERM_1, ...] and judged at "now", so every real document failed.
  */
 
