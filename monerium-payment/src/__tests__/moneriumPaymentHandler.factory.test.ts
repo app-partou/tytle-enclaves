@@ -298,10 +298,12 @@ describe('the manifest says what the handler does (red before part 9)', () => {
 
   /**
    * The manifests the enclave releases shipped, with their versions: a version names one manifest, so a changed manifest
-   * moves its version. 718b999 = the 2026-10-09 release. The next release appends its own.
+   * moves its version. The first entry is the 2026-10-09 release's (718b999), the second the R4 release's. The next
+   * release appends its own.
    */
   const SHIPPED: ReadonlyArray<readonly [version: string, hash: string]> = [
     ['1.1.0', '1e437540b0f6e11bf59f5997d527490c4b2f8f28772f4171b9076f35f92be4ab'],
+    ['1.2.0', 'bd42a6850c11b4deeeadae4a29a3f1b3b33383c026218fa2e7b2a261caaecc50'],
   ];
 
   it('a version names one manifest: a changed manifest moves its version', () => {
