@@ -8,7 +8,8 @@
  * Request body (JSON):
  *   {
  *     "operation": "list_charges" | "list_customers" | "list_invoices" | "get_payment_intent" | "get_account" | "get_charge",
- *     "apiKey": "sk_..."  OR  "sealedApiKey": "<base64>" (exactly one),
+ *     "apiKey": "sk_live_..."  OR  "sealedApiKey": "<base64>" (exactly one; the key names its mode: sk_live_, sk_test_,
+ *               rk_live_ or rk_test_),
  *     "stripeAccount": "acct_..." (optional),
  *     "queryParams": { "limit": "100", "created[gte]": "..." } (optional; the keys the operation takes, QUERY_KEYS),
  *     "resourceId": "pi_..." (optional, for get_* operations)
@@ -21,6 +22,7 @@
  *   [96..127]  dataHash     sha256 (full JSON response)
  *   [128..159] totalCount   uint (the length of this page, never a total)
  *   [160..191] hasMore      uint (1 = true, 0 = false)
+ *   [192..223] livemode     uint (1 = the key asked with is a live key, 0 = a test key)
  *
  * sealedApiKey is the platform key sealed to this enclave with KMS (`aws kms encrypt --encryption-context
  * enclave=stripe_payment`, enclave audit P1.7): only an enclave image the key policy names opens it, with the AWS
@@ -34,6 +36,7 @@
  *
  * The answer signs its question (enclave review 2026-10-09, H5): the endpoint carries the path with the object's id
  * and the query, and accountId names the account that answered - the key's own one when no Stripe-Account is asked.
+ * livemode names the key's mode (E-3): a test key asked about a live object gets Stripe's own "no such object".
  */
 
 import crypto from 'node:crypto';
@@ -145,8 +148,25 @@ const STRIPE_API_VERSION = '2025-12-15.clover';
 /** The encryption context `enclave` of a key sealed for this enclave: the key policy's name for it. */
 export const SEALED_KEY_CONTEXT = 'stripe_payment';
 
-/** A Stripe secret key (sk_) or restricted key (rk_), the two kinds that can make this handler's calls: what a sealed key must open to. */
-const STRIPE_KEY = /^(sk|rk)_[0-9A-Za-z_]+$/;
+/**
+ * A Stripe secret key (sk_) or restricted key (rk_), the two kinds that can make this handler's calls, that names its
+ * mode: live (sk_live_, rk_live_) or test - "Sandbox keys start with pk_test_ for publishable keys, rk_test_ for
+ * restricted keys, and sk_test_ for secret keys" (docs.stripe.com/keys, read 2026-10-10).
+ */
+const STRIPE_KEY = /^(?:sk|rk)_(live|test)_[0-9A-Za-z_]+$/;
+const KEY_PREFIXES = 'sk_live_, sk_test_, rk_live_ or rk_test_';
+
+/**
+ * The mode a Stripe key names, or null for any other value. Every answer signs it (livemode; enclave review 2026-10-09,
+ * E-3): "Objects in one mode aren't accessible to the other" (docs.stripe.com/keys), so Stripe answers a test key asked
+ * about a live object with its own resource_missing, and that "no such object" was signed with nothing saying a test
+ * key asked. A key that names no mode is refused: the mode of its answer could not be signed.
+ */
+function keyModeOf(apiKey: string): 'live' | 'test' | null {
+  const match = STRIPE_KEY.exec(apiKey);
+  if (match === null) return null;
+  return match[1] === 'live' ? 'live' : 'test';
+}
 
 /** A Stripe account id (the Stripe-Account header's value): acct_ followed by letters and digits. */
 const STRIPE_ACCOUNT_ID = /^acct_[0-9A-Za-z]+$/;
@@ -171,10 +191,14 @@ function optionalText(value: unknown, name: string): string | undefined {
 /**
  * The API key: in clear (apiKey, as every release before took it, with the same refusal when it is missing), or sealed
  * to this enclave (sealedApiKey, opened in execute). Never both: a caller that sends both does not know which is used.
+ * A key in clear must name its mode before anything is asked; a sealed one, once opened.
  */
 function keyOf(apiKey: unknown, sealedApiKey: unknown): StripeKey {
   if (sealedApiKey === undefined || sealedApiKey === null || sealedApiKey === '') {
     if (typeof apiKey !== 'string' || apiKey === '') throw new Error('apiKey is required');
+    if (keyModeOf(apiKey) === null) {
+      throw new Error(`apiKey must be a Stripe secret or restricted key that names its mode (${KEY_PREFIXES})`);
+    }
     return { apiKey };
   }
   if (apiKey !== undefined && apiKey !== null && apiKey !== '') throw new Error('apiKey and sealedApiKey: send one, not both');
@@ -309,9 +333,12 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
     const { operation, stripeAccount, queryParams, resourceId } = params;
     // A sealed key is opened before anything is asked of Stripe; a failure names no byte of it
     const apiKey = 'apiKey' in params ? params.apiKey : await ctx.unsealSecret(params.sealedApiKey, SEALED_KEY_CONTEXT);
-    if ('sealedApiKey' in params && !STRIPE_KEY.test(apiKey)) {
-      throw new Error('the sealed key is not a Stripe secret or restricted key (sk_ or rk_)');
+    // A key in clear names its mode (keyOf); a sealed one is checked here, once opened
+    const mode = keyModeOf(apiKey);
+    if (mode === null) {
+      throw new Error(`the sealed key is not a Stripe secret or restricted key (sk_ or rk_) that names its mode (${KEY_PREFIXES})`);
     }
+    const livemode = mode === 'live' ? 1 : 0;
 
     const stripeHost = ctx.hosts.find((h: { hostname: string }) => h.hostname === 'api.stripe.com')!;
 
@@ -381,6 +408,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
           dataHash,
           totalCount: 0,
           hasMore: 0,
+          livemode,
         },
         apiEndpoint,
         method: 'GET',
@@ -393,6 +421,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
           'x-stripe-data-hash': dataHash,
           'x-stripe-total-count': '0',
           'x-stripe-has-more': '0',
+          'x-stripe-livemode': String(livemode),
         },
         status: 404,
         bn254Headers: {
@@ -456,6 +485,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
         dataHash,
         totalCount,
         hasMore,
+        livemode,
       },
       apiEndpoint,
       method: 'GET',
@@ -468,6 +498,7 @@ export const stripePaymentHandlerDef: HandlerDef<StripeParams> = {
         'x-stripe-data-hash': dataHash,
         'x-stripe-total-count': String(totalCount),
         'x-stripe-has-more': String(hasMore),
+        'x-stripe-livemode': String(livemode),
       },
       bn254Headers: {
         'x-stripe-data-hash': dataHash,

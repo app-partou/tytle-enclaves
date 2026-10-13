@@ -99,6 +99,17 @@ export interface HostSource {
   property: 'tls';
 }
 
+/**
+ * A property of the API key the handler asked with, never the key itself. `stripe_livemode`: 1 when the Stripe key
+ * names live mode (sk_live_, rk_live_), 0 when it names test mode (sk_test_, rk_test_), read after a sealed key is
+ * opened. The handler refuses a key that names neither, so the signed mode is always the one of the key it used.
+ */
+export interface ApiKeySource {
+  from: 'api_key';
+  /** The property read. */
+  property: 'stripe_livemode';
+}
+
 /** Where a BN254 field's value comes from. Discriminated by `from`. */
 export type FieldSource =
   | ResponseFieldSource
@@ -106,7 +117,8 @@ export type FieldSource =
   | RequestHeaderSource
   | ParsedSource
   | DerivedSource
-  | HostSource;
+  | HostSource
+  | ApiKeySource;
 
 /** Maps a BN254 schema field to its data origin and transformation. */
 export interface FieldProvenance {

@@ -70,6 +70,13 @@ function signed(values: Record<string, string | number | null>) {
   return { base64: vector.toString('base64'), hash: hashFieldElements(vector) };
 }
 
+/** The key mode a vector signs: its seventh field, livemode (1 = a live key, 0 = a test key). */
+function signedLivemode(base64: string): number {
+  const vector = Buffer.from(base64, 'base64');
+  expect(vector.length, 'the vector holds seven fields').toBe(7 * 32);
+  return Number(BigInt(`0x${vector.subarray(6 * 32).toString('hex')}`));
+}
+
 async function expectError(body: unknown, error: RegExp) {
   const res = await call(body);
   expect(res).toMatchObject({ success: false, status: 502 });
@@ -334,6 +341,70 @@ describe('the account the answer belongs to', () => {
   });
 });
 
+describe('the answer signs the mode of the key it asked with (enclave review 2026-10-09, E-3; red: the vector named no mode)', () => {
+  const LIVE_KEY = 'sk_live_51Example00000000000000';
+  /**
+   * What a test key gets for a live object: Stripe's own resource_missing (docs.stripe.com/keys: "Objects in one mode
+   * aren't accessible to the other"). The wording is illustrative: the handler reads only the code.
+   */
+  const NO_SUCH_LIVE_CHARGE = JSON.stringify({ error: { code: 'resource_missing', message: "No such charge: 'ch_3Plive1'; a similar object exists in live mode, but a test mode key was used to make this request.", param: 'id', type: 'invalid_request_error' } });
+
+  it('a live key: livemode 1, in the vector the NSM signs and in its header', async () => {
+    fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
+    const res = await call({ operation: 'list_charges', apiKey: LIVE_KEY, stripeAccount: ACCT });
+    const want = signed({ operation: 'list_charges', accountId: ACCT, objectType: 'list', dataHash: sha256(LIST_CHARGES), totalCount: 2, hasMore: 1, livemode: 1 });
+    expect(res).toMatchObject({ success: true, status: 200, rawBody: want.base64 });
+    expect(signedLivemode(res.rawBody)).toBe(1);
+    expect(res.headers['x-stripe-livemode']).toBe('1');
+    expect(fakeIo.nsmAsks.map((a) => a.userData?.toString('hex'))).toEqual([want.hash]);
+  });
+
+  it.each([
+    ['a live secret key', 1, 'sk_live_51Example00000000000000'],
+    ['a live restricted key', 1, 'rk_live_51Example00000000000000'],
+    ['a test secret key', 0, 'sk_test_51Example00000000000000'],
+    ['a test restricted key', 0, 'rk_test_51Example00000000000000'],
+  ])('%s: livemode %i', async (_label, livemode, apiKey) => {
+    fakeIo.reply(STRIPE_PORT, json(200, ONE_CHARGE));
+    const res = await call({ operation: 'get_charge', apiKey, stripeAccount: ACCT, resourceId: CHARGE.id });
+    expect(res).toMatchObject({ success: true, status: 200 });
+    expect(signedLivemode(res.rawBody)).toBe(livemode);
+    expect(res.headers['x-stripe-livemode']).toBe(String(livemode));
+  });
+
+  it('a test key asked about a live charge: Stripe\'s own "no such object", signed not_found with livemode 0 - the mode says a test key asked', async () => {
+    fakeIo.reply(STRIPE_PORT, json(404, NO_SUCH_LIVE_CHARGE));
+    const res = await call({ operation: 'get_charge', apiKey: API_KEY, stripeAccount: ACCT, resourceId: 'ch_3Plive1' });
+    const want = signed({ operation: 'get_charge', accountId: ACCT, objectType: 'not_found', dataHash: sha256(NO_SUCH_LIVE_CHARGE), totalCount: 0, hasMore: 0, livemode: 0 });
+    expect(res).toMatchObject({ success: true, status: 404, rawBody: want.base64 });
+    expect(signedLivemode(res.rawBody)).toBe(0);
+    expect(res.headers).toMatchObject({ 'x-stripe-object-type': 'not_found', 'x-stripe-livemode': '0' });
+  });
+
+  it('a live key\'s "no such object": not_found with livemode 1', async () => {
+    fakeIo.reply(STRIPE_PORT, json(404, NO_SUCH_CHARGE));
+    const res = await call({ operation: 'get_charge', apiKey: LIVE_KEY, stripeAccount: ACCT, resourceId: 'ch_missing' });
+    expect(res).toMatchObject({ success: true, status: 404 });
+    expect(signedLivemode(res.rawBody)).toBe(1);
+    expect(res.headers['x-stripe-livemode']).toBe('1');
+  });
+
+  it.each([
+    ['names no mode', 'sk_51Example0NoMode0000000000'],
+    ['names its mode in capitals', 'sk_LIVE_51Example00000000000000'],
+    ['has another word where the mode goes', 'rk_prod_51Example00000000000000'],
+    ['is a publishable key', 'pk_live_51Example00000000000000'],
+    ['has something before it', 'Bearer sk_live_51Example00000000000000'],
+    ['carries a line break', `${API_KEY}\r\nX-Other: 1`],
+  ])('a key in clear that %s is a 400 that names no byte of it, and nothing is fetched', async (_label, apiKey) => {
+    const res = await call({ operation: 'list_charges', apiKey, stripeAccount: ACCT });
+    expect(res).toMatchObject({ success: false, status: 400 });
+    expect(res.error).toBe('Invalid request: apiKey must be a Stripe secret or restricted key that names its mode (sk_live_, sk_test_, rk_live_ or rk_test_)');
+    expect(fakeIo.requests(STRIPE_PORT)).toEqual([]);
+    expect(fakeIo.nsmAsks).toHaveLength(0);
+  });
+});
+
 describe('404', () => {
   it('Stripe\'s own "no such object" (resource_missing) is signed as not_found (lock)', async () => {
     fakeIo.reply(STRIPE_PORT, json(404, NO_SUCH_CHARGE, { 'Stripe-Account': ACCT }));
@@ -492,8 +563,20 @@ describe('a key sealed to this enclave (sealedApiKey, enclave audit P1.7) (red)'
   });
 
   it.each([
+    ['a live key', 1, 'rk_live_51Example00000000000000'],
+    ['a test key', 0, API_KEY],
+  ])('the mode of a sealed key is signed once it is opened: %s, livemode %i (red)', async (_label, livemode, key) => {
+    fakeIo.reply(KMS_PORT, fakeKms({ sealed: key }).reply);
+    fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
+    const res = await callWithCredentials({ operation: 'list_charges', sealedApiKey: sealedOnce(), stripeAccount: ACCT });
+    expect(res).toMatchObject({ success: true, status: 200 });
+    expect(signedLivemode(res.rawBody)).toBe(livemode);
+  });
+
+  it.each([
     ['not a Stripe key', 'pk_live_publishable_not_secret'],
     ['a key with a line break (sealed from a file that ends in one)', `${API_KEY}\n`],
+    ['a key that names no mode (red: it was opened and used)', 'sk_51Example0NoMode0000000000'],
   ])('a sealed value that is %s: an error that names no byte of it, and Stripe is never asked', async (_label, value) => {
     fakeIo.reply(KMS_PORT, fakeKms({ sealed: value }).reply);
     const res = await callWithCredentials({ operation: 'list_charges', sealedApiKey: sealedOnce() });

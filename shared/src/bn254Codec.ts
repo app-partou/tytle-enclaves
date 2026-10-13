@@ -44,6 +44,11 @@ export interface FieldDef {
 // upstream body the answer was read from) is appended to both, and SICAE's `transport` ('http' / 'https', from the
 // host's allowlist entry) after it. Version 1 (VIES 5 fields, SICAE 6) is what earlier releases signed; data-bridge
 // decodes a vector by its length (packages/attestation-core schemaForVector), so stored version-1 rows keep decoding.
+//
+// Version 2 of the STRIPE_PAYMENT vector (the R4 release, enclave review 2026-10-09, E-3): `livemode` (1 = the key the
+// enclave asked Stripe with is a live key, 0 = a test key) is appended. Version 1 (6 fields) is what earlier releases
+// signed: nothing in it said that a test key answered, and Stripe answers a test key asked about a live object with its
+// own resource_missing, which was signed "not found".
 
 export const SICAE_SCHEMA: FieldDef[] = [
   { name: 'nif',       encoding: 'shortString', jsType: 'string' },
@@ -72,6 +77,7 @@ export const STRIPE_PAYMENT_SCHEMA: FieldDef[] = [
   { name: 'dataHash',   encoding: 'sha256',      jsType: 'string' },
   { name: 'totalCount', encoding: 'uint',        jsType: 'number' },
   { name: 'hasMore',    encoding: 'uint',        jsType: 'boolean' },
+  { name: 'livemode',   encoding: 'uint',        jsType: 'boolean' },
 ];
 
 export const MONERIUM_PAYMENT_SCHEMA: FieldDef[] = [

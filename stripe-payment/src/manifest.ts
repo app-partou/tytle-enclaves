@@ -66,7 +66,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
 
   schema: {
     name: 'STRIPE_PAYMENT_SCHEMA',
-    outputBytes: 192,
+    outputBytes: 224,
     fields: [
       { name: 'operation',  encoding: 'shortString', source: { from: 'request', param: 'operation' } },
       { name: 'accountId',  encoding: 'shortString', source: { from: 'response', query: 'stripe_own_account', path: 'id' } },
@@ -74,6 +74,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       { name: 'dataHash',   encoding: 'sha256',      source: { from: 'derived', inputs: ['stripe_api:rawBody'], join: '', transform: 'sha256' } },
       { name: 'totalCount', encoding: 'uint',         source: { from: 'response', query: 'stripe_api', path: 'data.length', transform: 'array_length' } },
       { name: 'hasMore',    encoding: 'uint',         source: { from: 'response', query: 'stripe_api', path: 'has_more', transform: 'boolean_uint' } },
+      { name: 'livemode',   encoding: 'uint',         source: { from: 'api_key', property: 'stripe_livemode' } },
     ],
   },
 
@@ -93,8 +94,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'api_key_required',
-      check: { type: 'behavioral', description: 'Exactly one of apiKey (the key) or sealedApiKey (the key sealed to this enclave with KMS, encryption context enclave=stripe_payment); a sealed key is opened through KMS with the attestation of this enclave and must be a Stripe sk_ or rk_ key' },
+      check: { type: 'behavioral', description: 'Exactly one of apiKey (the key) or sealedApiKey (the key sealed to this enclave with KMS, encryption context enclave=stripe_payment); a sealed key is opened through KMS with the attestation of this enclave. The key must be a Stripe secret or restricted key that names its mode: sk_live_, sk_test_, rk_live_ or rk_test_. Any other key in clear is a 400 before anything is asked; any other sealed key, once opened, a 502' },
       reason: 'Stripe API key is required for authentication; sealed, it never crosses the host in clear (enclave audit P1.7)',
+    },
+    {
+      id: 'the_key_mode_is_signed',
+      check: { type: 'behavioral', description: 'livemode is 1 when the key Stripe was asked with names live mode (sk_live_, rk_live_) and 0 when it names test mode (sk_test_, rk_test_), on every signed answer, a not_found too' },
+      reason: 'A test key asked about a live object gets Stripe\'s own resource_missing: the signed not_found says that a test key asked (enclave review 2026-10-09, E-3)',
     },
     {
       id: 'resource_id_for_get_ops',
@@ -151,7 +157,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
   repeatability: {
     hashAlgorithm: 'sha256',
     dataHashInput: 'stripe_api:rawBody',
-    outputFormat: 'BN254 big-endian, 6 × 32 bytes, base64',
+    outputFormat: 'BN254 big-endian, 7 × 32 bytes, base64',
     deterministic: true,
   },
 };
