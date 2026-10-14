@@ -321,9 +321,20 @@ describe('the logs: a caller value never starts a line of its own', () => {
     expect(io.vsockConnectAsync).not.toHaveBeenCalled();
   });
 
-  it('the routing line names the URL JSON-encoded (red)', async () => {
+  it('the routing line names the host JSON-encoded, never the path or the query (red)', async () => {
     await forward(request());
-    expect(logs[0]).toBe(`[parent] ${ID}: Routing POST "https://ec.europa.eu/x" -> CID 16:5000`);
+    expect(logs[0]).toBe(`[parent] ${ID}: Routing POST "ec.europa.eu" -> CID 16:5000`);
+  });
+
+  // The host's journal ships to CloudWatch, kept 90 days in production: a lookup's path or query holds a NIF, a NIPC or
+  // a VRN, and a sole trader's NIF is personal data (enclave review 2026-10-09, M3 F-11, the log part).
+  it.each([
+    ['SICAE, the NIF in the query', 'https://www.sicae.pt/Consulta.aspx?nif=509178944', '509178944', '"www.sicae.pt" -> CID 17:5000'],
+    ['HMRC, the VRN in the path', 'https://api.service.hmrc.gov.uk/organisations/vat/check-vat-number/lookup/123456789', '123456789', '"api.service.hmrc.gov.uk" -> CID 16:5000'],
+  ])('%s: no log line names the number (red)', async (_lookup, url, number, routed) => {
+    await forward(request({ url, method: 'GET', body: undefined }));
+    expect([...logs, ...errors].join('\n')).not.toContain(number);
+    expect(logs[0]).toBe(`[parent] ${ID}: Routing GET ${routed}`);
   });
 
   it('an enclave error that holds a newline is logged on one line (red)', async () => {

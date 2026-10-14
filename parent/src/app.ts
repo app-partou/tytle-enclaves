@@ -191,7 +191,11 @@ export function createApp(options: ParentOptions = {}): express.Express {
       return;
     }
 
-    console.log(`[parent] ${requestId}: Routing ${method} ${JSON.stringify(url)} -> CID ${route.cid}:${route.port}`);
+    // The host the request goes to, never its path or query: a SICAE or HMRC lookup carries a NIF, a NIPC or a VRN there
+    // (a sole trader's NIF is personal data), and the host's journal ships to CloudWatch, kept 90 days in production
+    // (enclave review 2026-10-09, M3 F-11, the log part). findRoute read the same URL, so it parses.
+    const host = new URL(url).host;
+    console.log(`[parent] ${requestId}: Routing ${method} ${JSON.stringify(host)} -> CID ${route.cid}:${route.port}`);
 
     const start = Date.now();
     try {
