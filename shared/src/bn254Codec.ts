@@ -85,7 +85,9 @@ export const MONERIUM_PAYMENT_SCHEMA: FieldDef[] = [
   { name: 'state',       encoding: 'shortString', jsType: 'string' },
   { name: 'orderAmount', encoding: 'shortString', jsType: 'string' },
   { name: 'currency',    encoding: 'shortString', jsType: 'string' },
-  { name: 'balance',     encoding: 'uint',        jsType: 'number' },
+  // Text: an 18-decimal EURe amount (one EURe is 10^18) is past Number.MAX_SAFE_INTEGER from about 0.009 EURe. The
+  // encoding is the same uint, so every vector decodes as before (enclave review 2026-10-09, M2 F-4).
+  { name: 'balance',     encoding: 'uint',        jsType: 'string' },
   { name: 'dataHash',    encoding: 'sha256',      jsType: 'string' },
 ];
 
