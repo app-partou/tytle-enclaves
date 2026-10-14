@@ -12,8 +12,8 @@
 
 import crypto from 'node:crypto';
 import { VIES_SCHEMA } from '@tytle-enclaves/shared';
-import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost } from '@tytle-enclaves/shared';
-import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
+import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost, HttpResponse } from '@tytle-enclaves/shared';
+import { HANDLER_MANIFEST, MANIFEST_HASH, PASSED_ON_STATUSES } from './manifest.js';
 
 /** The enclave's allowlist: VIES and HMRC, each over its own host vsock-proxy port, both HTTPS. */
 export const VIES_HOSTS: AllowedHost[] = [
@@ -208,6 +208,28 @@ interface ViesParams {
   hmrcAccessToken?: string;
 }
 
+/**
+ * The register's refusal or rate limit, passed on unsigned as it was sent (manifest.ts PASSED_ON_STATUSES): its status
+ * and body, and only its Content-Type of its headers. No value is signed and no x-vies header is set, so nothing reads
+ * it as a verdict. The token went in the request only: no register answer repeats it.
+ */
+function passedOn(response: HttpResponse, apiEndpoint: string, method: string, url: string): HandlerResult {
+  const contentType = Object.entries(response.headers).find(([name]) => name.toLowerCase() === 'content-type')?.[1];
+  return {
+    values: {},
+    apiEndpoint,
+    method,
+    url,
+    requestHeaders: {},
+    responseHeaders: {},
+    rawPassthrough: {
+      status: response.status,
+      headers: contentType === undefined ? {} : { 'content-type': contentType },
+      rawBody: response.body,
+    },
+  };
+}
+
 export const viesHandlerDef: HandlerDef<ViesParams> = {
   name: 'vies',
   schema: VIES_SCHEMA,
@@ -280,6 +302,9 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
         hmrcHost, 'GET', path,
         { 'Accept': 'application/vnd.hmrc.2.0+json', 'Authorization': `Bearer ${hmrcAccessToken}` },
       );
+      if (PASSED_ON_STATUSES.includes(response.status)) {
+        return passedOn(response, apiEndpoint, 'GET', `https://${hmrcHost.hostname}${path}`);
+      }
 
       const parsed = parseHmrcResponse(response.body, response.status, vatNumber);
       upstreamBody = response.body;
@@ -296,6 +321,9 @@ export const viesHandlerDef: HandlerDef<ViesParams> = {
         { 'Content-Type': 'text/xml;charset=UTF-8', 'SOAPAction': '' },
         soapBody,
       );
+      if (PASSED_ON_STATUSES.includes(response.status)) {
+        return passedOn(response, apiEndpoint, 'POST', `https://${viesHost.hostname}${path}`);
+      }
 
       const hasSoapFault = /<(?:\w+:)?Fault[\s>\/]/.test(response.body);
       if (hasSoapFault || response.status !== 200) {

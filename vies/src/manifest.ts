@@ -9,9 +9,19 @@ import {
 } from '@tytle-enclaves/shared';
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
+/**
+ * The register's statuses passed on unsigned, as they were sent: a refused token (401), forbidden (403), a version not
+ * acceptable (406) and a rate limit (429). Each is a hint for the caller's retries, never a verdict. Through the
+ * enclave each was a 502, so data-bridge read HMRC's rate limit as an outage and asked the enclave again, each try one
+ * more HMRC request on the rate limit (OPEN_ISSUES 9 item 2, the third release's part 2). Every other status but the
+ * answers the handler reads is a 502, as before.
+ */
+export const PASSED_ON_STATUSES: readonly number[] = [401, 403, 406, 429];
+
 export const HANDLER_MANIFEST: HandlerManifest = {
-  // 1.0.0 was kept across vector version 2 (the 2026-10-09 release); 1.1.0 is the second enclave release (R4)
-  version: '1.1.0',
+  // 1.0.0 was kept across vector version 2 (the 2026-10-09 release); 1.1.0 is the second enclave release (R4); 1.2.0
+  // the third (R5: the register's refusals and rate limit passed on)
+  version: '1.2.0',
 
   queries: [
     {
@@ -104,8 +114,13 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       reason: 'A 200 that names no company, or another company, is no answer (enclave review 2026-10-09, E2a F-3)',
     },
     {
+      id: 'register_refusal_passed_on',
+      check: { type: 'status_skip', codes: [...PASSED_ON_STATUSES] },
+      reason: 'A refused token, forbidden, a version not acceptable or a rate limit of HMRC or VIES is no answer and no outage: it is passed on unsigned, with the register\'s body, so the caller does not ask the enclave again and keeps HMRC\'s rate limit (OPEN_ISSUES 9 item 2)',
+    },
+    {
       id: 'hmrc_non_200_error',
-      check: { type: 'behavioral', description: 'HMRC: a status other than 200 or 404 throws 502; nothing is passed on unsigned' },
+      check: { type: 'behavioral', description: 'HMRC: a status other than 200, 404 and the four passed on (401, 403, 406, 429) throws 502' },
       reason: 'Only HMRC\'s own answer is read',
     },
     {
@@ -130,7 +145,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
     },
     {
       id: 'vies_non_200_error',
-      check: { type: 'behavioral', description: 'VIES: a status other than 200 throws 502; nothing is passed on unsigned' },
+      check: { type: 'behavioral', description: 'VIES: a status other than 200 and the four passed on (401, 403, 406, 429) throws 502' },
       reason: 'Only VIES\'s own answer is read',
     },
   ],

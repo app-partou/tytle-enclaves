@@ -24,7 +24,7 @@ import type { EnclaveResponse } from '@tytle-enclaves/shared';
 import { encodeFieldElements, hashFieldElements, VIES_SCHEMA } from '../../../shared/src/bn254Codec.js';
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
 import { viesHandlerDef, VIES_HOSTS } from '../viesHandler.js';
-import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
+import { HANDLER_MANIFEST, MANIFEST_HASH, PASSED_ON_STATUSES } from '../manifest.js';
 
 const recorded = (name: string) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf-8');
 const VIES_VALID = recorded('checkvat-valid-PT503504564.xml');
@@ -161,6 +161,32 @@ describe('HMRC', () => {
   });
 });
 
+// OPEN_ISSUES 9 item 2 (R5 part 2): a refusal or a rate limit of the register was a 502, so data-bridge read HMRC's rate
+// limit as an outage and asked the enclave again, each try one more HMRC request on the rate limit. Passed on unsigned
+// as it was sent, it is a hint for the caller's retries, never a verdict: no value is signed and no x-vies header set.
+describe('a refusal or a rate limit of the register is passed on unsigned, as it was sent (red before R5)', () => {
+  const THROTTLED = JSON.stringify({ code: 'MESSAGE_THROTTLED_OUT', message: 'The application has exceeded its request rate limit' });
+
+  it.each([403, 406, 429])('HMRC answering %i', async (status) => {
+    fakeIo.reply(HMRC_PORT, json(status, THROTTLED));
+    const res = await check(gb('123456789'));
+    expect(res).toEqual({ success: true, status, headers: { 'content-type': 'application/json' }, rawBody: THROTTLED });
+    expect(fakeIo.nsmAsks).toHaveLength(0);
+  });
+
+  it.each([401, 403, 406, 429])('VIES answering %i', async (status) => {
+    fakeIo.reply(VIES_PORT, httpReply(status, '<html>slow down</html>', { 'Content-Type': 'text/html' }));
+    const res = await check({ countryCode: 'PT', vatNumber: '503504564' });
+    expect(res).toEqual({ success: true, status, headers: { 'content-type': 'text/html' }, rawBody: '<html>slow down</html>' });
+    expect(fakeIo.nsmAsks).toHaveLength(0);
+  });
+
+  it('the four are the manifest\'s status_skip, and nothing else is passed on', () => {
+    expect(PASSED_ON_STATUSES).toEqual([401, 403, 406, 429]);
+    for (const status of [200, 400, 404, 500, 502, 503]) expect(shouldSkipAttestation(HANDLER_MANIFEST.policies, status)).toBe(false);
+  });
+});
+
 // D-P1-9 (LJ "A", 2026-10-12): HMRC removed version 1.0 of Check a UK VAT number on 17 February 2025, and version 2.0
 // is application-restricted - an OAuth 2.0 bearer token with the read:vat scope (hmrc/vat-registered-companies-api,
 // public/api/conf/2.0/application.yaml). data-bridge gets the token and passes it with each UK lookup; the enclave
@@ -221,10 +247,11 @@ describe('HMRC Check a UK VAT number 2.0: the caller\'s OAuth token goes to HMRC
     expect(fakeIo.requests(VIES_PORT)).toEqual([]);
   });
 
-  it('HMRC refusing the token (401) is an error, never signed, and nothing answered carries the token (lock)', async () => {
-    fakeIo.reply(HMRC_PORT, json(401, JSON.stringify({ code: 'INVALID_CREDENTIALS', message: 'Invalid Authentication information provided' })));
+  it('HMRC refusing the token (401) is passed on unsigned with HMRC\'s body, and nothing answered carries the token (red before R5)', async () => {
+    const refused = JSON.stringify({ code: 'INVALID_CREDENTIALS', message: 'Invalid Authentication information provided' });
+    fakeIo.reply(HMRC_PORT, json(401, refused));
     const res = await check(gb('123456789'));
-    expect(res).toMatchObject({ success: false, status: 502 });
+    expect(res).toEqual({ success: true, status: 401, headers: { 'content-type': 'application/json' }, rawBody: refused });
     expect(fakeIo.nsmAsks).toHaveLength(0);
     expect(JSON.stringify(res)).not.toContain(HMRC_TOKEN);
   });
@@ -447,7 +474,7 @@ describe('an HMRC 200 is signed valid only for a target that names the VRN asked
 // E2a F-17: the manifest's status rules described other code than the handler's (status_skip codes the handler turns
 // into a 502, status_attest for every HMRC 404), and VIES kept version 1.0.0 across vector version 2.
 describe('the manifest says what the handler does (red before part 9)', () => {
-  const STATUSES = [201, 301, 400, 401, 402, 403, 404, 409, 422, 429, 500, 502, 503, 504];
+  const STATUSES = [201, 301, 400, 401, 402, 403, 404, 406, 409, 422, 429, 500, 502, 503, 504];
 
   // Each status, answered by the register with a body that is no answer: the handler passes it on unsigned exactly
   // when a status_skip policy of the manifest names it, and signs it exactly when a status_attest policy does.
