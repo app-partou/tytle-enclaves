@@ -31,6 +31,7 @@ vi.mock('node:fs/promises', async (importOriginal) => ({
 import { createApp, listenParent } from '../app.js';
 import { getAllRoutes } from '../enclaveRouter.js';
 import { startFakeImds, imdsCredentials } from './helpers/fakeImds.js';
+import { startFakeSts, stsSession } from './helpers/fakeSts.js';
 
 /** The bytes the shared protocol writes for `message`: what an enclave sends. */
 async function frame(message: unknown): Promise<Buffer> {
@@ -652,6 +653,13 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
   const STRIPE = 'https://api.stripe.com/v1/charges';
   const EXPIRES = Date.now() + 6 * 3600_000;
   const CREDS = { accessKeyId: 'ASIATESTONLY00000001', secretAccessKey: 'testonly-secret-access-key-1', sessionToken: 'testonly-session-token-1' };
+  /** The narrow role (the parent unit's ENCLAVE_KMS_ROLE_ARN) and its first session, as the fake STS gives it. */
+  const ROLE_ARN = 'arn:aws:iam::123456789012:role/tytle-staging-enclave-kms-decrypt';
+  const SESSION_EXPIRES = Date.now() + 15 * 60_000;
+  const firstSession = () => {
+    const s = stsSession(1, SESSION_EXPIRES);
+    return { accessKeyId: s.accessKeyId, secretAccessKey: s.secretAccessKey, sessionToken: s.sessionToken };
+  };
   /** A Stripe request that sends its key sealed: the one kind that needs the credentials (enclave review E2b F-12). */
   const sealed = (over: Record<string, unknown> = {}) =>
     request({ url: STRIPE, body: JSON.stringify({ operation: 'list_charges', sealedApiKey: 'dGVzdG9ubHktc2VhbGVkLWtleQ==' }), ...over });
@@ -661,16 +669,20 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
   });
 
   /**
-   * The parent with the real IMDSv2 reader over a fake IMDS. The reader is loaded here, not at the top: on the release
+   * The parent with the real reader over a fake IMDS and a fake STS: the host role's credentials from IMDSv2 ask STS for
+   * a session of the narrow role (KMS_ALARM_PLAN.md part 4). The reader is loaded here, not at the top: on the release
    * before this one the module does not exist, and only the tests that use it may fail for it.
    */
   async function withImds(failing = false) {
     const imds = await startFakeImds({ answer: (read) => imdsCredentials(read, EXPIRES) });
     if (failing) imds.failWith(500);
+    const sts = await startFakeSts((n) => stsSession(n, SESSION_EXPIRES));
     const { createHostCredentials } = await import('../hostCredentials.js');
-    const app = await listen(createApp({ hostCredentials: createHostCredentials({ endpoint: imds.url }) }));
-    opened.push(app, imds);
-    return { imds, url: app.url };
+    const app = await listen(createApp({
+      hostCredentials: createHostCredentials({ roleArn: ROLE_ARN, endpoint: imds.url, stsEndpoint: sts.url }),
+    }));
+    opened.push(app, imds, sts);
+    return { imds, sts, url: app.url };
   }
 
   /** The parent with a stand-in reader that gives CREDS and counts its calls. */
@@ -689,21 +701,24 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
     return { res, framed: await framedRequest(conn) };
   }
 
-  it('a request to the Stripe enclave that sends a sealed key carries them, read from IMDSv2 (red)', async () => {
-    const { imds, url } = await withImds();
+  it('a request to the Stripe enclave that sends a sealed key carries a session of the narrow role, never the host role\'s credentials (red)', async () => {
+    const { imds, sts, url } = await withImds();
     const { res, framed } = await forwardTo(url, sealed());
     expect(res.status).toBe(200);
     expect(io.vsockConnectAsync).toHaveBeenCalledWith(18, 5000, expect.any(Number));
-    expect(framed).toEqual({ ...sealed(), awsCredentials: CREDS });
+    expect(framed).toEqual({ ...sealed(), awsCredentials: firstSession() });
+    expect(JSON.stringify(framed)).not.toContain(CREDS.secretAccessKey);
     expect(imds.calls).toContain('GET /latest/meta-data/iam/security-credentials/tytle-staging-enclave-host token');
+    expect(sts.requests.map((r) => r.form.RoleArn)).toEqual([ROLE_ARN]);
   });
 
-  it('they are kept: the next Stripe requests do not read IMDS again (red)', async () => {
-    const { imds, url } = await withImds();
+  it('it is kept: the next Stripe requests ask neither IMDS nor STS again (red)', async () => {
+    const { imds, sts, url } = await withImds();
     await forwardTo(url, sealed());
     await forwardTo(url, sealed());
     await forwardTo(url, sealed());
     expect(imds.reads()).toBe(1);
+    expect(sts.requests).toHaveLength(1);
   });
 
   // Enclave review 2026-10-09, E2b F-12: they are the whole host role's credentials, which can also write the PCR0 pins
@@ -760,13 +775,14 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
     expect((await forwardTo(url, { ...sealed(), awsCredentials: forged })).framed.awsCredentials).toEqual(CREDS);
   });
 
-  it('they never reach a log line (red)', async () => {
+  it('no credentials reach a log line (red)', async () => {
     const { url } = await withImds();
     const { framed } = await forwardTo(url, sealed());
-    expect(framed.awsCredentials).toEqual(CREDS);
+    expect(framed.awsCredentials).toEqual(firstSession());
     const all = [...logs, ...errors].join('\n');
-    expect(all).not.toContain(CREDS.secretAccessKey);
-    expect(all).not.toContain(CREDS.sessionToken);
+    for (const secret of [CREDS.secretAccessKey, CREDS.sessionToken, firstSession().secretAccessKey, firstSession().sessionToken]) {
+      expect(all).not.toContain(secret);
+    }
   });
 
   it('IMDS down: the Stripe request still goes, without them (only a sealed key then fails, in the enclave) (red)', async () => {
@@ -774,7 +790,7 @@ describe('the host role\'s credentials go only to an enclave that opens sealed s
     const { res, framed } = await forwardTo(url, sealed());
     expect(res.status).toBe(200);
     expect(framed).toEqual(sealed());
-    expect(errors).toEqual(['[parent] IMDSv2: no host role credentials: "IMDS answered 500 to PUT /latest/api/token"']);
+    expect(errors).toEqual(['[parent] no AWS credentials for the enclaves: "IMDS answered 500 to PUT /latest/api/token"']);
   });
 });
 
@@ -798,8 +814,13 @@ describe('a caller that has gone (enclave review 2026-10-09, E2b F-1, item 2)', 
         return imdsCredentials(read, Date.now() + 6 * 3600_000);
       },
     });
+    const sts = await startFakeSts((n) => stsSession(n, Date.now() + 15 * 60_000));
     const { createHostCredentials } = await import('../hostCredentials.js');
-    const parent = createApp({ hostCredentials: createHostCredentials({ endpoint: imds.url }) }).listen(0, '127.0.0.1');
+    const parent = createApp({
+      hostCredentials: createHostCredentials({
+        roleArn: 'arn:aws:iam::123456789012:role/tytle-staging-enclave-kms-decrypt', endpoint: imds.url, stsEndpoint: sts.url,
+      }),
+    }).listen(0, '127.0.0.1');
     await once(parent, 'listening');
     try {
       const caller = http.request({
@@ -825,6 +846,7 @@ describe('a caller that has gone (enclave review 2026-10-09, E2b F-1, item 2)', 
       release();
       await new Promise<void>((resolve) => parent.close(() => resolve()));
       await imds.close();
+      await sts.close();
     }
   });
 });
