@@ -8,6 +8,7 @@ import {
   SICAE_SCHEMA,
   VIES_SCHEMA,
   STRIPE_PAYMENT_SCHEMA,
+  MONERIUM_PAYMENT_SCHEMA,
 } from '../bn254Codec.js';
 import type { FieldDef } from '../bn254Codec.js';
 
@@ -1089,6 +1090,19 @@ describe('decodeToTyped', () => {
     const result = decodeToTyped<{ count: string }>(schema, encoded);
     expect(result.count).toBe('42');
     expect(typeof result.count).toBe('string');
+  });
+
+  // Enclave review 2026-10-09, M2 F-4 (R5 part 3): the Monerium balance is an 18-decimal EURe amount, so one EURe is
+  // 10^18 - past Number.MAX_SAFE_INTEGER from about 0.009 EURe. Declared a number, a typed decode lost its digits (or,
+  // in data-bridge's decoder, threw). Declared text, it keeps every digit. The encoding is the same uint: old vectors
+  // decode as before.
+  it('the Monerium balance decodes as the exact text of its 18-decimal amount (red before R5)', () => {
+    const values = {
+      orderId: '8c0fd7b1-01da-11ed-89c1-52c47a86c354', state: 'processed', orderAmount: '12.50', currency: 'eur',
+      balance: '12345678901234567891', dataHash: 'ab'.repeat(32),
+    };
+    const result = decodeToTyped<{ balance: unknown }>(MONERIUM_PAYMENT_SCHEMA, encodeFieldElements(MONERIUM_PAYMENT_SCHEMA, values));
+    expect(result.balance).toBe('12345678901234567891');
   });
 });
 

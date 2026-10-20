@@ -59,14 +59,21 @@ async function start(): Promise<void> {
 }
 
 describe('server.ts (red)', () => {
-  it('gives the app ENCLAVE_PARENT_AUTH_TOKEN and a reader of the real IMDS', async () => {
+  it('gives the app ENCLAVE_PARENT_AUTH_TOKEN and a reader of the real IMDS and STS for the narrow role, ENCLAVE_KMS_ROLE_ARN', async () => {
     vi.stubEnv('ENCLAVE_PARENT_AUTH_TOKEN', 'testonly-parent-token');
+    vi.stubEnv('ENCLAVE_KMS_ROLE_ARN', 'arn:aws:iam::123456789012:role/tytle-staging-enclave-kms-decrypt');
     await start();
     expect(seen.appOptions).toEqual([{ authToken: 'testonly-parent-token', hostCredentials: expect.objectContaining({ reader: 'imds' }) }]);
-    // No endpoint: the real instance metadata service (hostCredentials.ts IMDS_ENDPOINT)
-    expect(seen.credentialOptions).toEqual([[]]);
+    // No endpoints: the real instance metadata service and STS (hostCredentials.ts IMDS_ENDPOINT, STS_ENDPOINT)
+    expect(seen.credentialOptions).toEqual([[{ roleArn: 'arn:aws:iam::123456789012:role/tytle-staging-enclave-kms-decrypt' }]]);
     expect(logs.join('\n')).not.toContain('testonly-parent-token');
     expect(logs.join('\n')).not.toContain('is not set');
+  });
+
+  it('without ENCLAVE_KMS_ROLE_ARN: the reader gets no role, so it gives no credentials (red)', async () => {
+    vi.stubEnv('ENCLAVE_KMS_ROLE_ARN', '');
+    await start();
+    expect(seen.credentialOptions).toEqual([[{ roleArn: undefined }]]);
   });
 
   it('without the token: the app gets none, and the start says the guarded routes are open', async () => {
