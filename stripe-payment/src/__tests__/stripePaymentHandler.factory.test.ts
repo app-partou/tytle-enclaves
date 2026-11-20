@@ -26,7 +26,7 @@ import { encodeFieldElements, hashFieldElements, STRIPE_PAYMENT_SCHEMA } from '.
 import { fakeIo, httpReply } from '../../../shared/src/__tests__/helpers/fakeEnclaveIo.js';
 import { fakeKms } from '../../../shared/src/__tests__/helpers/fakeKms.js';
 import { stripePaymentHandlerDef, STRIPE_HOSTS, SEALED_KEY_CONTEXT } from '../stripePaymentHandler.js';
-import { HANDLER_MANIFEST, MANIFEST_HASH } from '../manifest.js';
+import { HANDLER_MANIFEST, MANIFEST_HASH, STRIPE_API_VERSION } from '../manifest.js';
 
 /**
  * Stripe's answers, shaped after its API reference (docs.stripe.com/api: the list object, the Charge, PaymentIntent and
@@ -144,14 +144,14 @@ describe('lists', () => {
     const [request] = fakeIo.requests(STRIPE_PORT);
     expect(request).toMatch(/^GET \/v1\/charges\?created%5Bgte%5D=1700000000&limit=2 HTTP\/1\.1\r\n/);
     expect(request).toContain(`Authorization: Bearer ${API_KEY}\r\n`);
-    expect(request).toContain('Stripe-Version: 2025-12-15.clover\r\n');
+    expect(request).toContain('Stripe-Version: 2026-05-27.dahlia\r\n');
     expect(request).toContain(`Stripe-Account: ${ACCT}\r\n`);
   });
 
   it('the attested request names the call and the manifest, never the API key (lock)', async () => {
     fakeIo.reply(STRIPE_PORT, json(200, LIST_CHARGES));
     const res = await call({ operation: 'list_charges', apiKey: API_KEY, stripeAccount: ACCT });
-    const requestHeaders = { 'Content-Type': 'application/x-www-form-urlencoded', 'Stripe-Version': '2025-12-15.clover', 'Stripe-Account': ACCT, 'x-manifest-hash': MANIFEST_HASH };
+    const requestHeaders = { 'Content-Type': 'application/x-www-form-urlencoded', 'Stripe-Version': '2026-05-27.dahlia', 'Stripe-Account': ACCT, 'x-manifest-hash': MANIFEST_HASH };
     const requestConfig = `https://api.stripe.com/v1/charges|GET|${JSON.stringify(requestHeaders)}`;
     expect(res.attestation?.requestHash).toBe(createHash('sha256').update(requestConfig).digest('hex'));
     expect(res.attestation?.apiEndpoint).toBe('api.stripe.com/v1/charges');
@@ -664,17 +664,28 @@ describe('the manifest says what the handler does (red before part 9)', () => {
 
   /**
    * The manifests the enclave releases shipped, with their versions: a version names one manifest, so a changed manifest
-   * moves its version. The first entry is the 2026-10-09 release's (718b999), the second the R4 release's. The next
-   * release appends its own.
+   * moves its version. The first entry is the 2026-10-09 release's (718b999), the second the R4 release's, the third
+   * the one that asks Stripe with API version 2026-05-27.dahlia. The next release appends its own.
    */
   const SHIPPED: ReadonlyArray<readonly [version: string, hash: string]> = [
     ['1.1.0', '89dfb85f0a9d971738e96f6fb5e5ab1c28dd887318d72d785674a33c68a06e09'],
     ['1.2.0', '81de8accf0dd9672dda7a4913a061a10689a0c99d696de67e88b27b4d7bc8ed2'],
+    ['1.3.0', '29343e4379318080f92869eabaf9624e56ef5365777c47240d8afabde38ac7c4'],
   ];
 
   it('a version names one manifest: a changed manifest moves its version', () => {
     for (const [version, hash] of SHIPPED) {
-      expect(HANDLER_MANIFEST.version === version, `shipped ${version}`).toBe(MANIFEST_HASH === hash);
+      expect(
+        HANDLER_MANIFEST.version === version,
+        `shipped ${version} (this manifest is ${HANDLER_MANIFEST.version}, hash ${MANIFEST_HASH})`,
+      ).toBe(MANIFEST_HASH === hash);
     }
+  });
+
+  it('every request to Stripe names the one API version the manifest declares', () => {
+    const stripeQueries = HANDLER_MANIFEST.queries.filter((q) => q.host === 'api.stripe.com');
+    expect(stripeQueries.map((q) => q.id)).toEqual(['stripe_api', 'stripe_own_account']);
+    for (const q of stripeQueries) expect(q.headers?.['Stripe-Version'], q.id).toBe(STRIPE_API_VERSION);
+    expect(STRIPE_API_VERSION).toBe('2026-05-27.dahlia');
   });
 });

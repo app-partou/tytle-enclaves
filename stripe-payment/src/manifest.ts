@@ -10,9 +10,17 @@ import {
 } from '@tytle-enclaves/shared';
 import type { HandlerManifest } from '@tytle-enclaves/shared';
 
+/**
+ * The Stripe API version every request to Stripe names, and so the shape of every answer this enclave signs. It is the
+ * version the platform's own Stripe SDK is built for, so a signed answer has the shape its reader's types describe.
+ * Manifest 1.2.0 and before asked with 2025-12-15.clover.
+ */
+export const STRIPE_API_VERSION = '2026-05-27.dahlia';
+
 export const HANDLER_MANIFEST: HandlerManifest = {
-  // 1.1.0 = the 2026-10-09 release; 1.2.0 = the second enclave release (R4)
-  version: '1.2.0',
+  // 1.1.0 = the 2026-10-09 release; 1.2.0 = the second enclave release (R4); 1.3.0 = Stripe API version
+  // 2026-05-27.dahlia (was 2025-12-15.clover)
+  version: '1.3.0',
 
   queries: [
     {
@@ -23,7 +31,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       path: '/v1/{resource}/{resourceId?}',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Stripe-Version': '2025-12-15.clover',
+        'Stripe-Version': STRIPE_API_VERSION,
       },
       auth: {
         header: 'Authorization',
@@ -38,7 +46,7 @@ export const HANDLER_MANIFEST: HandlerManifest = {
       host: 'api.stripe.com',
       path: '/v1/account',
       headers: {
-        'Stripe-Version': '2025-12-15.clover',
+        'Stripe-Version': STRIPE_API_VERSION,
       },
       auth: {
         header: 'Authorization',
