@@ -42,7 +42,7 @@
 import crypto from 'node:crypto';
 import { STRIPE_PAYMENT_SCHEMA, isSealedSecretText, SEALED_SECRET_MAX_BYTES } from '@tytle-enclaves/shared';
 import type { HandlerDef, HandlerResult, HandlerContext, AllowedHost } from '@tytle-enclaves/shared';
-import { HANDLER_MANIFEST, MANIFEST_HASH } from './manifest.js';
+import { HANDLER_MANIFEST, MANIFEST_HASH, STRIPE_API_VERSION } from './manifest.js';
 
 /**
  * The enclave's allowlist, each over its host vsock-proxy port, HTTPS: Stripe's API, and KMS to open a sealed key
@@ -142,8 +142,6 @@ const QUERY_VALUE: Record<string, RegExp> = {
 };
 
 const VALID_OPERATIONS = new Set<string>(Object.keys(OPERATION_PATH_MAP));
-
-const STRIPE_API_VERSION = '2025-12-15.clover';
 
 /** The encryption context `enclave` of a key sealed for this enclave: the key policy's name for it. */
 export const SEALED_KEY_CONTEXT = 'stripe_payment';
